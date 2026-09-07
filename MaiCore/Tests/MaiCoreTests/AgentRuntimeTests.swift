@@ -256,7 +256,7 @@ func repeatedCallWithdrawsTools() async throws {
   #expect(result.transcript.contains { $0.toolResults.contains { $0.text.contains("already run 3 times") } })
 }
 
-@Test("Tool result previews bound lines, line length, and terminal control characters")
+@Test("Tool result previews show the text first, bound lines and length, and strip control characters")
 func toolResultPreview() {
   let result = ToolResult(
     callID: "preview",
@@ -264,13 +264,13 @@ func toolResultPreview() {
 
   #expect(
     ToolResultPreview.render(result, maxLines: 2, maxLineLength: 12)
-      == "← tool result\n  first line\n  second [31m …\n  … 2 more lines")
-  #expect(ToolResultPreview.render(result, maxLines: 0) == "← tool done")
+      == "← first line\n  second [31m …\n  … 2 more lines")
+  #expect(ToolResultPreview.render(result, maxLines: 0) == "← done")
   let longLine = String(repeating: "x", count: 300)
   #expect(
     ToolResultPreview.render(
       ToolResult(callID: "complete", text: "one\ntwo\n\(longLine)"), maxLines: -1)
-      == "← tool result\n  one\n  two\n  \(longLine)")
+      == "← one\n  two\n  \(longLine)")
   #expect(
     ToolResultPreview.render(
       ToolResult(
@@ -279,7 +279,34 @@ func toolResultPreview() {
         structuredContent: .object(["ok": .bool(true)]),
         isError: true),
       maxLines: 1)
-      == "← tool error\n  {\"ok\":true}")
+      == "← {\"ok\":true}")
+  #expect(ToolResultPreview.render(ToolResult(callID: "e", text: "", isError: true), maxLines: 3) == "← error")
+  #expect(ToolResultPreview.render(ToolResult(callID: "n", text: "  \n"), maxLines: 3) == "← (no output)")
+}
+
+@Test("Tool call previews name the tool and fold the arguments into one readable line")
+func toolCallPreview() {
+  #expect(
+    ToolCallPreview.render(ToolCall(id: "1", name: "files_read", arguments: .object(["path": .string("cli.py")])))
+      == "→ files_read cli.py")
+  #expect(ToolCallPreview.render(ToolCall(id: "2", name: "files_list", arguments: .object([:]))) == "→ files_list")
+  let patch = ToolCall(
+    id: "3", name: "files_patch",
+    arguments: .object([
+      "replace": .string("return 0.5 * base * height"),
+      "path": .string("shapes.py"),
+      "find": .string("def area_of_triangle(base, height):\n    return base * height"),
+    ]))
+  #expect(
+    ToolCallPreview.render(patch)
+      == "→ files_patch path=shapes.py find=\"def area_of_triangle(base, height):\" (+1 lines) replace=\"return 0.5 * base * height\"")
+  let long = ToolCall(
+    id: "4", name: "files_write",
+    arguments: .object(["path": .string("a.py"), "content": .string(String(repeating: "x", count: 200) + "\ny")]))
+  let rendered = ToolCallPreview.render(long)
+  #expect(rendered == "→ files_write path=a.py content=" + String(repeating: "x", count: 60) + "… (+1 lines)")
+  #expect(ToolCallPreview.render(ToolCall(id: "5", name: "run_sh", arguments: .object(["script": .string("make -s && ./app")]))) == "→ run_sh \"make -s && ./app\"")
+  #expect(ToolCallPreview.render(patch, maxLength: 20) == "→ files_patch path=s…")
 }
 
 @Test("Transcripts edit rich messages and preserve valid tool transactions")

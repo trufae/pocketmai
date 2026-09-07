@@ -185,9 +185,9 @@ public final class VisualConversation: Identifiable {
     case .approvalRequested(let context, let request) where context.depth == 0:
       activity.append("? approval requested for \(request.tool.name)")
     case .toolStarted(let context, let call) where context.depth == 0:
-      activity.append("→ tool \(call.name) \(call.arguments.compactJSONString)")
+      activity.append(ToolCallPreview.render(call))
     case .toolFinished(let context, let result) where context.depth == 0:
-      activity.append("← tool \(result.isError ? "error" : "done")")
+      activity.append(ToolResultPreview.render(result, maxLines: 0))
     case .childStarted(_, let child):
       activity.append("↳ child \(child.agentID)")
     case .childFinished(_, let child):

@@ -137,7 +137,7 @@ actor TerminalWriter {
     case .toolStarted(let context, let call) where context.depth == 0:
       finishReply()
       closeRootLine()
-      status("→ tool \(call.name) \(call.arguments.compactJSONString)", color: "green")
+      status(ToolCallPreview.render(call), color: "green")
     case .toolFinished(let context, let result) where context.depth == 0:
       status(
         ToolResultPreview.render(result, maxLines: toolResultLines),
@@ -219,7 +219,7 @@ actor TerminalWriter {
       flushChildText(pid)
       childToolCalls[pid, default: 0] += 1
       guard subagentOutput == .all || subagentOutput == .tools else { return }
-      childBlock(pid, "→ tool \(call.name) \(call.arguments.compactJSONString)", color: "green")
+      childBlock(pid, ToolCallPreview.render(call), color: "green")
     case .toolFinished(let context, let result):
       guard let pid = context.pid, subagentOutput == .all || subagentOutput == .tools else {
         return

@@ -174,13 +174,57 @@ public struct ToolOutput: Codable, Equatable, Sendable {
   }
 }
 
+/// One line for a tool call as a person reads it: the tool name, then the
+/// arguments with the path-like ones first, long values cut and multi-line
+/// values folded to their first line. `→ files_patch shapes.py find="def
+/// area…" replace="def area…"` says what happened; the JSON did not.
+package enum ToolCallPreview {
+  /// Arguments shown first, and shown bare when they are the only one.
+  static let leadingKeys = ["path", "name", "query", "command", "script", "keywords", "task"]
+  static let maximumValueLength = 60
+
+  package static func render(_ call: ToolCall, maxLength: Int = 160) -> String {
+    let arguments = call.arguments.objectValue ?? [:]
+    var line = "→ \(call.name)"
+    guard !arguments.isEmpty else { return line }
+    let ordered = arguments.keys.sorted { a, b in
+      let ia = leadingKeys.firstIndex(of: a) ?? leadingKeys.count
+      let ib = leadingKeys.firstIndex(of: b) ?? leadingKeys.count
+      return ia == ib ? a < b : ia < ib
+    }
+    let parts = ordered.map { key -> String in
+      let value = summary(of: arguments[key] ?? .null)
+      let bare = arguments.count == 1 && leadingKeys.contains(key)
+      return bare ? value : "\(key)=\(value)"
+    }
+    line += " " + parts.joined(separator: " ")
+    return ToolResultPreview.safeLine(line, maximumLength: max(1, maxLength))
+  }
+
+  static func summary(of value: JSONValue) -> String {
+    guard case .string(let text) = value else { return value.compactJSONString }
+    let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+    var first = String(lines.first ?? "")
+    if first.count > maximumValueLength {
+      first = String(first.prefix(maximumValueLength)) + "…"
+    }
+    let quoted = first.isEmpty || first.contains(" ") || first.contains("=")
+    var shown = quoted ? "\"\(first)\"" : first
+    if lines.count > 1 { shown += " (+\(lines.count - 1) lines)" }
+    return shown
+  }
+}
+
+/// The result as the person wants to read it: the text itself, first line
+/// after `←`, the rest indented, cut at `maxLines`. No heading line, because
+/// the result is the point; `← done` only when nothing is to be shown.
 package enum ToolResultPreview {
   package static func render(
     _ result: ToolResult,
     maxLines: Int,
     maxLineLength: Int = .max
   ) -> String {
-    let compactHeading = "← tool \(result.isError ? "error" : "done")"
+    let compactHeading = result.isError ? "← error" : "← done"
     guard maxLines != 0 else { return compactHeading }
     var text = result.text
     if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -189,14 +233,16 @@ package enum ToolResultPreview {
       text = structured.compactJSONString
     }
     text = text.trimmingCharacters(in: .newlines)
-    guard !text.isEmpty else { return compactHeading }
+    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return result.isError ? compactHeading : "← (no output)"
+    }
     let lines = text.components(separatedBy: .newlines)
     let shownCount = maxLines < 0 ? lines.count : min(lines.count, maxLines)
-    var output = ["← tool \(result.isError ? "error" : "result")"]
-    output.append(
-      contentsOf: lines.prefix(shownCount).map {
-        "  \(safeLine($0, maximumLength: max(1, maxLineLength)))"
-      })
+    var output: [String] = []
+    for (index, line) in lines.prefix(shownCount).enumerated() {
+      let safe = safeLine(line, maximumLength: max(1, maxLineLength))
+      output.append(index == 0 ? "← \(safe)" : "  \(safe)")
+    }
     if lines.count > shownCount {
       let remaining = lines.count - shownCount
       output.append("  … \(remaining) more line\(remaining == 1 ? "" : "s")")
@@ -204,7 +250,7 @@ package enum ToolResultPreview {
     return output.joined(separator: "\n")
   }
 
-  private static func safeLine(_ line: String, maximumLength: Int) -> String {
+  static func safeLine(_ line: String, maximumLength: Int) -> String {
     let sanitized = line.unicodeScalars.map { scalar -> String in
       if scalar.value == 9 { return "  " }
       return CharacterSet.controlCharacters.contains(scalar) ? " " : String(scalar)
