@@ -533,10 +533,10 @@ struct SessionProfile {
         MaiWebFetchTool.name,
         MaiMastodonTool.name,
       ] + MaiFileWorkspaceTool.toolNames + MaiRunTool.toolNames + MaiGitHubTool.toolNames
-        + MaiTodoTools.toolNames + MaiContextTools.toolNames)
+        + MaiTodoTools.toolNames)
     toolGroupNames = [
       "echo", "datetime", "calc", "files", "run", "weather", "web", "mastodon", "github", "todo",
-      "context", MaiSkillTools.groupID,
+      MaiSkillTools.groupID,
     ]
     subagentNames = []
     self.stream = stream
@@ -888,9 +888,6 @@ struct MaiCLI {
         environment: environment)
       try await registerMemoryTools(in: runtime, state: memoryState)
       try await registerTodoTools(in: runtime, state: todoState)
-      for tool in MaiContextTools.makeTools(supervisor: runtime.supervisor) {
-        try await runtime.register(tool: tool)
-      }
       try await registerSkillTools(in: runtime, state: skillState)
       try await synchronizeToolGroupSelections(
         configuration: &configuration,
@@ -8021,7 +8018,7 @@ struct MaiCLI {
       groupNames.formUnion(
         [
           "echo", "datetime", "calc", "files", "run", "weather", "web", "mastodon", "github",
-          "todo", "context",
+          "todo",
         ])
     }
     for group in groupNames {
@@ -8186,10 +8183,10 @@ struct MaiCLI {
               MaiWebFetchTool.name,
               MaiMastodonTool.name,
             ] + MaiFileWorkspaceTool.toolNames + MaiRunTool.toolNames + MaiGitHubTool.toolNames
-              + MaiTodoTools.toolNames + MaiContextTools.toolNames),
+              + MaiTodoTools.toolNames),
           toolGroupNames: [
             "echo", "datetime", "calc", "files", "run", "weather", "web", "mastodon",
-            "github", "todo", "context",
+            "github", "todo",
           ],
           subagentNames: ["researcher"],
           limits: AgentRunLimits(maxSubagents: 4),

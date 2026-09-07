@@ -415,25 +415,6 @@ agent use other chats as a source of information. `memory.scope` bounds them:
 crosses working directories. Enable them for an agent with `/tools enable
 chats`; each call asks for approval.
 
-### Context tools
-
-An agent can tidy its own conversation instead of carrying every detour to the
-end. `context_list` numbers the messages with their sizes and a preview;
-`context_remove` drops messages (a tool call and its result always go
-together); `context_rewrite` replaces one message's text, for example a wrong
-instruction or a long tool result reduced to what matters; and
-`context_compact` replaces a stretch with a summary the agent writes. Edits are
-queued while the turn runs and applied before the next model call, so the
-following turn already sees the smaller context; the REPL prints
-`✂ context: removed 3 messages (12.3k → 2.1k chars)`. The system prompt and
-the turn in progress cannot be touched, and a task that should start with no
-history at all belongs in a child agent (`agent_start`). The tools live in
-`MaiCore` (`MaiContextTools`), are part of the default agent's set, and
-`/tools enable context` adds them to another. The three editing tools ask for
-`confirm` approval; `/set yolo on` or `approvals.confirm = allow` lets an agent
-use them freely. The edited conversation is what gets saved, so what an agent
-removes is gone from the chat.
-
 ### Todo list
 
 A task list the agent plans with and ticks off as it works, and that the

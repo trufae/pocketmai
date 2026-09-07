@@ -384,16 +384,6 @@ public actor AgentRuntime {
     while true {
       try Task.checkCancellation()
       try await holdWhilePaused(pid)
-      // Edits the agent asked for with the context tools land first, so the
-      // next turn already runs on the smaller conversation.
-      let edits = await supervisor.drainTranscriptEdits(pid)
-      if !edits.isEmpty {
-        let applied = AgentTranscriptEditor.apply(edits, to: transcript)
-        transcript = applied.messages
-        lastUsage = nil
-        await emit(.transcriptEdited(context, applied.report))
-        await supervisor.note(pid, transcript: transcript)
-      }
       // Anything a person queued for this process since the last turn joins
       // the conversation here, after the tool results the model is about to
       // read, so a running agent can be steered without stopping it.

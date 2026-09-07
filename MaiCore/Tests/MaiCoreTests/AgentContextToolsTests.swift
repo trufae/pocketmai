@@ -33,83 +33,6 @@ func editorRemovesLinkedToolMessages() {
   #expect(compacted.messages[2].id == messages[4].id)
 }
 
-@Test("The context view numbers messages from one and keeps the system prompt and the current turn")
-func contextViewProtectsWhatMustStay() throws {
-  let view = MaiContextTools.ContextView(messages: contextFixture())
-  #expect(view.listing.hasPrefix("Context: 6 messages"))
-  #expect(view.listing.contains("#1 system"))
-  #expect(view.listing.contains("[system prompt, kept]"))
-  #expect(view.listing.contains("#3 assistant"))
-  #expect(view.listing.contains("→ read_file {\"path\":\"a.c\"}"))
-  #expect(view.listing.contains("#6 assistant"))
-  #expect(view.listing.contains("[turn in progress, kept]"))
-
-  #expect(try view.select("2") == [1])
-  #expect(try view.select("2-4") == [1, 2, 3])
-  #expect(try view.select("4, 2") == [1, 3])
-  #expect(try view.select("all") == [1, 2, 3])  // not the system prompt, the latest user message, or the current turn
-  #expect(throws: (any Error).self) { try view.select("1") }
-  #expect(throws: (any Error).self) { try view.select("6") }
-  #expect(throws: (any Error).self) { try view.select("9") }
-  #expect(throws: (any Error).self) { try view.select("x") }
-}
-
-@Test("Context edits queued by a tool are applied before the next model turn")
-func contextEditsApplyBetweenTurns() async throws {
-  let provider = ContextScriptedProvider(responses: [
-    ProviderResponse(
-      message: AgentMessage(
-        role: .assistant,
-        content: [
-          .toolCall(
-            ToolCall(
-              id: "c1", name: MaiContextTools.removeName,
-              arguments: .object(["messages": .string("2")])))
-        ]),
-      stopReason: .toolCall),
-    ProviderResponse(message: .assistant("Done with a smaller context."), stopReason: .stop),
-  ])
-  let recorder = ContextEventRecorder()
-  let runtime = AgentRuntime(approvalHandler: AllowAllContextApprovals())
-  try await runtime.register(provider)
-  for tool in MaiContextTools.makeTools(supervisor: runtime.supervisor) {
-    try await runtime.register(tool: tool)
-  }
-
-  let result = try await runtime.run(
-    AgentRequest(
-      provider: "context-scripted",
-      model: "fixture",
-      messages: [
-        .system("Be brief."),
-        .user("Ignore this aside about the weather."),
-        .user("Now: read the file."),
-      ],
-      toolNames: Set(MaiContextTools.toolNames))
-  ) { event in
-    await recorder.append(event)
-  }
-
-  #expect(result.response.text == "Done with a smaller context.")
-  #expect(!result.transcript.contains { $0.text == "Ignore this aside about the weather." })
-  #expect(result.transcript.first?.text == "Be brief.")
-  let requests = await provider.requests
-  #expect(requests.count == 2)
-  #expect(requests[1].messages.contains { $0.text == "Now: read the file." })
-  #expect(!requests[1].messages.contains { $0.text == "Ignore this aside about the weather." })
-  let toolText = try #require(result.transcript.flatMap(\.toolResults).first?.text)
-  #expect(toolText.hasPrefix("Before your next turn: removed 1 message ("))
-  let reports = await recorder.events.compactMap { event -> AgentTranscriptEditReport? in
-    if case .transcriptEdited(_, let report) = event { return report }
-    return nil
-  }
-  #expect(reports.count == 1)
-  #expect(reports.first?.removed == 1)
-}
-
-// MARK: - Fixtures
-
-/// system, user, assistant(tool call), tool(result), user, assistant(current turn)
 private func contextFixture() -> [AgentMessage] {
   [
     .system("You are terse."),
@@ -121,7 +44,7 @@ private func contextFixture() -> [AgentMessage] {
     .user("Now summarize it."),
     AgentMessage(
       role: .assistant,
-      content: [.toolCall(ToolCall(id: "call-2", name: MaiContextTools.listName, arguments: .object([:])))]),
+      content: [.toolCall(ToolCall(id: "call-2", name: "context_list", arguments: .object([:])))]),
   ]
 }
 
