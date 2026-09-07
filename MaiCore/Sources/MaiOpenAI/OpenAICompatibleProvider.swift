@@ -208,10 +208,23 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     if let maxOutputTokens = request.options.maxOutputTokens {
       body["max_tokens"] = .integer(maxOutputTokens)
     }
-    if let reasoningEffort = request.options.reasoningEffort,
-      !reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    if let reasoningEffort = request.options.reasoningEffort?.trimmingCharacters(
+      in: .whitespacesAndNewlines), !reasoningEffort.isEmpty
     {
-      body["reasoning_effort"] = .string(reasoningEffort)
+      // One of our levels becomes whatever this endpoint's API family takes;
+      // anything else is a value meant for the endpoint and goes as it is.
+      // Fields set through `additional` are the person's own and stay.
+      if let effort = ReasoningEffort(name: reasoningEffort) {
+        let fields = effort.requestFields(
+          model: model,
+          provider: "\(descriptor.id.rawValue) \(descriptor.displayName)",
+          baseURL: configuration.baseURL.absoluteString)
+        for (key, value) in fields where request.options.additional[key] == nil {
+          body[key] = value
+        }
+      } else {
+        body["reasoning_effort"] = .string(reasoningEffort)
+      }
     }
     if let responseFormat = openAIResponseFormat(request.responseFormat) {
       body["response_format"] = responseFormat

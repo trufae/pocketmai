@@ -393,6 +393,21 @@ a server's prompt cache is invalidated from the rewritten message on. `cache`, t
 cache covers every earlier turn and each call pays only for what is new. The
 REPL prints `✂ context: rewrote 1 message (12.3k → 2.1k chars)` when it prunes.
 
+`/effort LEVEL [TEXT]` sets how hard the model thinks, with one scale for every
+provider: `low`, `medium`, `high`, `xhigh`, or `max` (the REPL completes them).
+The level is stored as the agent's `options.reasoningEffort` and
+`ReasoningEffort` (in `MaiCore`) turns it into whatever the endpoint's API
+family takes — `reasoning_effort` for OpenAI (only on models that reason, with
+`xhigh` where it exists) and generic endpoints, `think` for Ollama (`low`,
+`medium`, `high` on gpt-oss, `true` elsewhere), `enable_thinking` and a
+`thinking_budget` for Qwen, `thinking: enabled` for DeepSeek, and the
+`reasoning` object for OpenRouter; a field set in `options.additional` is never
+overridden, and a value that is not one of the levels (`minimal`, say) is sent
+as `reasoning_effort` unchanged. The runtime also adds a system prompt section
+that says how much care the task deserves, followed by `TEXT` when given, so a
+model without a reasoning control hears it too. `/effort` shows the current
+setting, `/effort off` clears it, and both persist on the agent like `/set`.
+
 Native tools are presented as plugin-defined capability groups instead of one
 checkbox per provider-visible function. `/tools` lists the groups, `/tools
 enable|disable GROUP` changes the active agent, and `/tools show GROUP` says

@@ -74,13 +74,14 @@ func inferredGroupSummarizesItsTools() {
   #expect(ToolGroupHelp.firstSentence(of: "No period here") == "No period here")
 }
 
-@Test("The built-in groups cover the runtime tools a host registered, and the catalog infers the rest")
+@Test("Built-in groups cover the registered runtime tools; the catalog infers the rest")
 func builtInGroupsAndCatalog() {
   let tools = [
     ToolDefinition(name: MaiMemoryTools.listName, description: "List.", parameters: []),
     ToolDefinition(name: MaiContextTools.listName, description: "List.", parameters: []),
     ToolDefinition(name: MaiContextTools.removeName, description: "Remove.", parameters: []),
-    ToolDefinition(name: MaiSkillTools.toolName(for: "review"), description: "Review.", parameters: []),
+    ToolDefinition(
+      name: MaiSkillTools.toolName(for: "review"), description: "Review.", parameters: []),
     ToolDefinition(name: "custom_thing", description: "Do a thing.", parameters: []),
   ]
   let builtIn = AgentRuntime.builtInToolGroups(for: tools)
@@ -88,7 +89,8 @@ func builtInGroupsAndCatalog() {
   #expect(
     builtIn.first { $0.id == "context" }?.toolNames
       == [MaiContextTools.listName, MaiContextTools.removeName])
-  #expect(builtIn.first { $0.id == "skills" }?.toolNames == [MaiSkillTools.toolName(for: "review")])
+  #expect(
+    builtIn.first { $0.id == "skills" }?.toolNames == [MaiSkillTools.toolName(for: "review")])
   #expect(builtIn.allSatisfy { !$0.description.isEmpty })
   let catalog = ToolGroupDefinition.catalog(known: builtIn, tools: tools)
   #expect(catalog.map(\.id) == ["agents", "chats", "context", "custom", "skills"])

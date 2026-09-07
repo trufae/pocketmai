@@ -71,7 +71,7 @@ func projectInstructionsReachRuns() async throws {
   #expect(parent.messages[1].text.contains("Run make test"))
   // The child works in the same tree, so it gets the same rules.
   let worker = try #require(
-    requests.first { !$0.tools.contains { $0.name == AgentRuntime.agentStartToolName } })
+    requests.first { $0.messages.contains { $0.text.contains("running as agent '") } })
   #expect(worker.messages.contains { $0.role == .system && $0.text.contains("Run make test") })
 
   await runtime.configureProjectInstructions(nil)

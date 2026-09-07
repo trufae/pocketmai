@@ -1546,7 +1546,7 @@ func subagentRun() async throws {
   #expect(!brief.contains("{{task}}"))
 }
 
-@Test("Agent tools keep a child running across orchestrator turns")
+@Test("A background child reports to the turn that started it, and later turns still own it")
 func launchedSubagentRun() async throws {
   let provider = LaunchedSubagentProvider()
   let recorder = EventRecorder()
@@ -1582,8 +1582,14 @@ func launchedSubagentRun() async throws {
   // child this turn started in the background.
   let orchestrator = try #require(
     await runtime.supervisor.tree().processes.first { $0.runID == launch.runID }?.pid)
-  #expect(launch.response.text == "Launched \(id)")
   #expect(launchResult.structuredContent?.objectValue?["status"] == .string("running"))
+  // The model answered as soon as the child was started; the run held for
+  // the child, took its answer as a message, and asked the model once more.
+  #expect(launch.transcript.contains { $0.role == .assistant && $0.text == "Launched \(id)" })
+  #expect(launch.response.text == "Delivered: Background result")
+  let child = try #require(AgentPID(text: id))
+  #expect(await runtime.supervisor.info(child)?.state == .completed)
+  #expect(await runtime.supervisor.info(child)?.isCollected == true)
 
   let rejected = try await runtime.run(
     AgentRequest(
@@ -1599,12 +1605,13 @@ func launchedSubagentRun() async throws {
         maxSubagents: 1,
         maxSubagentDepth: 1)),
     process: orchestrator)
-  // The only slot is taken, so the second child is queued rather than refused;
-  // it starts by itself once the first one ends.
-  let queuedResult = try #require(rejected.transcript.flatMap(\.toolResults).first)
-  #expect(!queuedResult.isError)
-  #expect(queuedResult.text.hasPrefix("Queued researcher as"))
-  #expect(queuedResult.structuredContent?.objectValue?["status"] == .string("queued"))
+  // The first child ended with its turn, so the only slot is free again and
+  // the second child runs at once, and reports to its own turn the same way.
+  let secondResult = try #require(rejected.transcript.flatMap(\.toolResults).first)
+  #expect(!secondResult.isError)
+  #expect(secondResult.text.hasPrefix("Started researcher as"))
+  #expect(secondResult.structuredContent?.objectValue?["status"] == .string("running"))
+  #expect(rejected.response.text == "Delivered: Background result")
 
   try await Task.sleep(for: .milliseconds(120))
   let collected = try await runtime.run(
@@ -1719,10 +1726,7 @@ func subagentsUseDefaultConcurrencyLimit() async throws {
       subagentNames: ["researcher"]))
 
   let names = Set(try #require(await provider.requests.first).tools.map(\.name))
-  #expect(!names.contains(AgentRuntime.agentStartToolName))
-  #expect(!names.contains(AgentRuntime.agentStatusToolName))
-  #expect(!names.contains(AgentRuntime.agentResultToolName))
-  #expect(!names.contains(AgentRuntime.agentStopToolName))
+  #expect(AgentRuntime.agentToolNames.isSubset(of: names))
 }
 
 @Test("A delegating agent still calls its own tools itself when it wants to")
@@ -1811,11 +1815,13 @@ func toolDelegationRunsToolsInAChild() async throws {
       AgentRuntime.agentStartToolName, AgentRuntime.agentStatusToolName,
       AgentRuntime.agentResultToolName, AgentRuntime.agentStopToolName,
     ])
-  // The derived worker gets the same tool and no way to delegate further.
+  // The derived worker gets the same tool and, as a peer of its parent, the
+  // agent family too: it may hand work down in turn until the depth limit.
   let workerRequest = try #require(
-    requests.first { !$0.tools.contains { $0.name == AgentRuntime.agentStartToolName } })
-  #expect(workerRequest.tools.map(\.name) == ["read_file"])
-  #expect(workerRequest.messages.first?.text.contains("focused worker agent") == true)
+    requests.first { $0.messages.first?.text.contains("focused worker agent") == true })
+  #expect(
+    Set(workerRequest.tools.map(\.name))
+      == Set(["read_file"]).union(AgentRuntime.agentToolNames))
   #expect(workerRequest.messages.last?.text.contains("Read Parser.swift") == true)
   // Only one call and one answer reach the orchestrator: no file contents.
   let parentResults = result.transcript.flatMap(\.toolResults)
@@ -2443,7 +2449,9 @@ private actor DelegatingProvider: ChatProvider {
   ) async throws -> ProviderResponse {
     requests.append(request)
     let results = request.messages.flatMap(\.toolResults)
-    let isWorker = !request.tools.contains { $0.name == AgentRuntime.agentStartToolName }
+    // The worker is a peer with the agent tools of its own; its instructions
+    // are what tell it apart.
+    let isWorker = request.messages.first?.text.contains("focused worker agent") == true
     if isWorker {
       guard results.isEmpty else {
         return ProviderResponse(
@@ -2500,6 +2508,14 @@ private actor LaunchedSubagentProvider: ChatProvider {
     }
 
     let results = request.messages.flatMap(\.toolResults)
+    // A background child's answer arrives as the newest user message.
+    if let delivery = request.messages.last(where: { $0.role == .user }),
+      AgentProcessTools.deliveredChildPID(of: delivery) != nil
+    {
+      return ProviderResponse(
+        message: .assistant("Delivered: \(delivery.text.split(separator: "\n").last ?? "")"),
+        stopReason: .stop)
+    }
     let command = request.messages.last { $0.role == .user }?.text ?? ""
     if ["delegate asynchronously", "launch again"].contains(command), results.isEmpty {
       return ProviderResponse(

@@ -3156,6 +3156,11 @@ struct AppSettings: Codable, Equatable, Sendable {
   /// selected one mirrors the live fields above.
   var agents: [AgentProfile] = [.stock()]
   var selectedAgentID: UUID = AgentProfile.stockID
+  /// Asks an agent that can spawn subagents to open a request of several
+  /// steps with a short numbered plan before its first `agent_start`; a
+  /// single question gets no plan. Carried by the tool's description, so it
+  /// costs nothing for an agent without subagents.
+  var plansBeforeDelegating: Bool = true
 
   static let defaults = AppSettings()
 
@@ -3303,7 +3308,7 @@ struct AppSettings: Codable, Equatable, Sendable {
     case openAPIServer
     case recentChatLanguageIdentifiers
     case conversationFolders, conversationFolderDefaults, selectedConversationFolderID
-    case agents, selectedAgentID
+    case agents, selectedAgentID, plansBeforeDelegating
   }
 
   init(from decoder: Decoder) throws {
@@ -3442,6 +3447,7 @@ struct AppSettings: Codable, Equatable, Sendable {
     agents = (try? c.decode([AgentProfile].self, forKey: .agents)) ?? []
     selectedAgentID =
       (try? c.decode(UUID.self, forKey: .selectedAgentID)) ?? AgentProfile.stockID
+    plansBeforeDelegating = (try? c.decode(Bool.self, forKey: .plansBeforeDelegating)) ?? true
     normalizeAgents()
   }
 }

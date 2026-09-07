@@ -271,6 +271,19 @@ enum AssistantToolLoop {
             assistantMessageID: activeAssistantID)
           continue
         }
+        // A child started without waiting reports into the chat's inbox; the
+        // turn holds for it instead of ending with the work unfinished, and
+        // its answer joins the chat as a message the model answers next.
+        if let nextAssistantID = try await store.awaitAgentDeliveriesAndAppendAssistant(
+          in: conversationID)
+        {
+          activeAssistantID = nextAssistantID
+          state = State()
+          store.clearToolCallingDebugIterations(
+            conversationID: conversationID,
+            assistantMessageID: activeAssistantID)
+          continue
+        }
         store.assistantResponseCompleted()
         didFinish = true
         return
@@ -406,6 +419,13 @@ enum AssistantToolLoop {
         // kept and a fresh assistant turn follows them.
         let injected = await store.agentSupervisor.drainInbox(process).filter { $0.role == .user }
         if !injected.isEmpty {
+          // A child started without waiting reports here too; its answer
+          // counts as taken once it is read.
+          for message in injected {
+            if let child = AgentProcessTools.deliveredChildPID(of: message) {
+              await store.agentSupervisor.collect(child)
+            }
+          }
           conversation.messages.append(
             contentsOf: injected.map { ChatMessage(role: .user, text: $0.text) })
           assistantID = UUID()
@@ -465,6 +485,15 @@ enum AssistantToolLoop {
         state.clearProvisionalText()
         let text = state.append(turnText)
         updateLocalAssistantMessage(id: assistantID, text: text, conversation: &conversation)
+        // A child started without waiting reports into this process's inbox;
+        // the run holds for it and goes round once more, where the drain at
+        // the top of the loop reads its answer under a fresh assistant turn.
+        if let process,
+          try await AgentProcessTools.awaitAnyChild(of: process, supervisor: store.agentSupervisor)
+        {
+          state = State()
+          continue
+        }
         return IsolatedResult(
           text: userVisibleResponseText(from: text),
           toolRuns: toolRuns,
@@ -685,54 +714,83 @@ enum AssistantToolLoop {
         store: store)
     }
 
-    var transcriptText = response
+    // The reply's calls are prepared — normalized, approved, validated — in
+    // order. A call to a concurrent tool, the agent family above all, is then
+    // started and left running while the calls after it go on, so children
+    // started in one reply work side by side; the others run one at a time
+    // in between. The results join the transcript in call order once the
+    // last of them is in.
     var assistantContent = response
-    var appendedRunBlocks: [String] = []
-    var results: [CallResult] = []
-    var completedRuns: [(key: ToolCallKey, result: String)] = []
+    var results = [CallResult?](repeating: nil, count: calls.count)
+    // Calls past the cap: dropped, and taken out of the transcript.
+    var dropped = Set<Int>()
+    var launched = 0
 
-    for call in calls {
-      try Task.checkCancellation()
-      // Feedback queued after this provider response takes precedence over
-      // tool calls that have not started yet. Already-running tools finish,
-      // then the loop injects the feedback before asking the model again.
-      if case .live(_, _, let conversationID) = host,
-        store.hasQueuedUserMessages(in: conversationID)
-      {
-        break
-      }
-      replaceFirstOccurrence(of: call.rawBlock, in: &assistantContent, with: "")
-      guard results.count < remainingToolCalls else {
-        replaceFirstOccurrence(of: call.rawBlock, in: &transcriptText, with: "")
-        continue
-      }
-      let result = try await runToolCall(
-        call,
+    func publishProgress() {
+      guard case .live(let assistantID, let baselineText, _) = host else { return }
+      let assembled = assembleRunBlocks(
+        response: response, calls: calls, results: results, dropped: dropped)
+      let pending = calls.indices
+        .filter { results[$0] == nil && !dropped.contains($0) }
+        .map { calls[$0] }
+      publishToolRunProgress(
+        transcriptText: assembled.text,
+        appendedRunBlocks: assembled.appended,
+        pendingCalls: pending,
+        remainingToolCalls: max(0, remainingToolCalls - launched),
         parseDefinitions: parseDefinitions,
-        mode: mode,
-        host: host,
+        assistantID: assistantID,
+        baselineText: baselineText,
         store: store)
-      let runBlock = AgentTooling.makeRunBlock(call: result.call, result: result.result)
-      if !replaceFirstOccurrence(of: call.rawBlock, in: &transcriptText, with: runBlock) {
-        appendedRunBlocks.append(runBlock)
-      }
-      results.append(result)
-      completedRuns.append((ToolCallKey(result.call), result.result))
-      if case .live(let assistantID, let baselineText, _) = host {
-        publishToolRunProgress(
-          transcriptText: transcriptText,
-          appendedRunBlocks: appendedRunBlocks,
-          pendingCalls: Array(calls.dropFirst(results.count)),
-          remainingToolCalls: max(0, remainingToolCalls - results.count),
+    }
+
+    try await withThrowingTaskGroup(of: (Int, CallResult).self) { group in
+      for (index, call) in calls.enumerated() {
+        try Task.checkCancellation()
+        // Feedback queued after this provider response takes precedence over
+        // tool calls that have not started yet. Already-running tools finish,
+        // then the loop injects the feedback before asking the model again.
+        if case .live(_, _, let conversationID) = host,
+          store.hasQueuedUserMessages(in: conversationID)
+        {
+          break
+        }
+        replaceFirstOccurrence(of: call.rawBlock, in: &assistantContent, with: "")
+        guard launched < remainingToolCalls else {
+          dropped.insert(index)
+          continue
+        }
+        launched += 1
+        switch try await prepareToolCall(
+          call,
           parseDefinitions: parseDefinitions,
-          assistantID: assistantID,
-          baselineText: baselineText,
+          mode: mode,
+          host: host,
           store: store)
+        {
+        case .answered(let result):
+          results[index] = result
+        case .ready(let ready) where ready.concurrent:
+          group.addTask {
+            (index, try await executeToolCall(ready, store: store))
+          }
+        case .ready(let ready):
+          results[index] = try await executeToolCall(ready, store: store)
+        }
+        publishProgress()
+      }
+      for try await (index, result) in group {
+        results[index] = result
+        publishProgress()
       }
     }
 
+    let assembled = assembleRunBlocks(
+      response: response, calls: calls, results: results, dropped: dropped)
+    let ordered = results.compactMap { $0 }
+    let completedRuns = ordered.map { (key: ToolCallKey($0.call), result: $0.result) }
     let text =
-      ([transcriptText.trimmingCharacters(in: .whitespacesAndNewlines)] + appendedRunBlocks)
+      ([assembled.text.trimmingCharacters(in: .whitespacesAndNewlines)] + assembled.appended)
       .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
       .joined(separator: "\n\n")
     let echoReasoningContent: Bool
@@ -750,13 +808,39 @@ enum AssistantToolLoop {
       text: text,
       nativeMessages: nativeMessages(
         assistantContent: assistantContent,
-        results: results,
+        results: ordered,
         definitions: parseDefinitions,
         mode: mode,
         echoReasoningContent: echoReasoningContent),
       completedRuns: completedRuns,
       parsedCalls: calls,
-      results: results)
+      results: ordered)
+  }
+
+  /// The reply with each finished call's block replaced by its run block, in
+  /// call order; blocks the text does not carry (native calls) are returned
+  /// separately to be appended. A dropped call leaves no trace; a call still
+  /// running, or one that never started, keeps its block as it was.
+  private static func assembleRunBlocks(
+    response: String,
+    calls: [ParsedToolCall],
+    results: [CallResult?],
+    dropped: Set<Int>
+  ) -> (text: String, appended: [String]) {
+    var text = response
+    var appended: [String] = []
+    for (index, call) in calls.enumerated() {
+      if dropped.contains(index) {
+        replaceFirstOccurrence(of: call.rawBlock, in: &text, with: "")
+        continue
+      }
+      guard let result = results[index] else { continue }
+      let runBlock = AgentTooling.makeRunBlock(call: result.call, result: result.result)
+      if !replaceFirstOccurrence(of: call.rawBlock, in: &text, with: runBlock) {
+        appended.append(runBlock)
+      }
+    }
+    return (text, appended)
   }
 
   private static func publishPendingToolRuns(
@@ -839,19 +923,39 @@ enum AssistantToolLoop {
       .joined(separator: "\n\n")
   }
 
-  private static func runToolCall(
+  /// A call the host has approved and is about to run: what to run, whether
+  /// it may run alongside the other calls of its reply, and the timeout to
+  /// hold it to.
+  private struct ReadyToolCall: Sendable {
+    let call: ParsedToolCall
+    let concurrent: Bool
+    let context: LongRunningOperationContext
+    let execute: @Sendable () async -> String
+  }
+
+  private enum PreparedToolCall {
+    /// The call is answered without running: unavailable, refused, or invalid.
+    case answered(CallResult)
+    case ready(ReadyToolCall)
+  }
+
+  /// Everything that happens to a call before it runs, in call order for the
+  /// whole reply: the name is resolved against the tools the model may use,
+  /// the person approves it, the arguments are checked.
+  private static func prepareToolCall(
     _ call: ParsedToolCall,
     parseDefinitions: [ToolDefinition],
     mode: ToolCallingMode,
     host: RunHost,
     store: AppStore
-  ) async throws -> CallResult {
+  ) async throws -> PreparedToolCall {
     let currentDefinitions = currentVisibleDefinitions(for: host, store: store)
     let fallbackCall = AgentTooling.normalized(call: call, tools: parseDefinitions)
     guard let normalizedCall = AgentTooling.availableCall(call, tools: currentDefinitions) else {
-      return CallResult(
-        call: fallbackCall,
-        result: AgentTooling.unavailableToolError(name: fallbackCall.name))
+      return .answered(
+        CallResult(
+          call: fallbackCall,
+          result: AgentTooling.unavailableToolError(name: fallbackCall.name)))
     }
 
     let approvedCall: ParsedToolCall
@@ -884,14 +988,16 @@ enum AssistantToolLoop {
 
     try Task.checkCancellation()
     guard shouldExecute else {
-      return CallResult(call: approvedCall, result: "Error: tool call cancelled by user.")
+      return .answered(
+        CallResult(call: approvedCall, result: "Error: tool call cancelled by user."))
     }
     if case .live(_, _, let conversationID) = host,
       store.hasQueuedUserMessages(in: conversationID)
     {
-      return CallResult(
-        call: approvedCall,
-        result: "Error: tool call skipped because the user queued new instructions.")
+      return .answered(
+        CallResult(
+          call: approvedCall,
+          result: "Error: tool call skipped because the user queued new instructions."))
     }
 
     let executionDefinitions = currentVisibleDefinitions(for: host, store: store)
@@ -900,15 +1006,16 @@ enum AssistantToolLoop {
       let unavailableCall = AgentTooling.normalized(
         call: approvedCall,
         tools: currentDefinitions)
-      return CallResult(
-        call: unavailableCall,
-        result: AgentTooling.unavailableToolError(name: unavailableCall.name))
+      return .answered(
+        CallResult(
+          call: unavailableCall,
+          result: AgentTooling.unavailableToolError(name: unavailableCall.name)))
     }
     if let validationError = AgentTooling.requiredArgumentsError(
       call: executableCall,
       tools: executionDefinitions)
     {
-      return CallResult(call: executableCall, result: validationError)
+      return .answered(CallResult(call: executableCall, result: validationError))
     }
 
     let context: LongRunningOperationContext
@@ -952,22 +1059,38 @@ enum AssistantToolLoop {
           store: store)
       }
     }
+    // An asynchronous tool call — one whose definition says it runs
+    // alongside the rest of the reply — is what lets several children start
+    // at once; a legacy spelling of agent_start counts as the tool it names.
+    let canonicalName = AgentProcessTools.canonicalName(executableCall.name)
+    let concurrent = executionDefinitions.contains {
+      $0.name == canonicalName && $0.annotations.concurrent
+    }
+    return .ready(
+      ReadyToolCall(
+        call: executableCall, concurrent: concurrent, context: context, execute: execute))
+  }
+
+  private static func executeToolCall(
+    _ ready: ReadyToolCall,
+    store: AppStore
+  ) async throws -> CallResult {
     // A child agent runs for as long as its own model calls take, each under
     // the same timeout prompt as this one; asking again about the parent's
     // wait for it would only double the questions.
-    if SubagentTool.isAgentTool(executableCall.name) {
-      return CallResult(call: executableCall, result: await execute())
+    if SubagentTool.isAgentTool(ready.call.name) {
+      return CallResult(call: ready.call, result: await ready.execute())
     }
     do {
       let result = try await InteractiveOperationTimeout.run(
-        seconds: context.timeoutInterval,
-        context: context,
+        seconds: ready.context.timeoutInterval,
+        context: ready.context,
         onTimeout: timeoutHandler(store: store),
-        operation: execute)
-      return CallResult(call: executableCall, result: result)
+        operation: ready.execute)
+      return CallResult(call: ready.call, result: result)
     } catch is LongRunningOperationSkipped {
       return CallResult(
-        call: executableCall,
+        call: ready.call,
         result: "Error: tool call skipped by user after timeout.")
     }
   }

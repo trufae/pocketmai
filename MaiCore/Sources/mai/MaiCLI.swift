@@ -982,6 +982,7 @@ struct MaiCLI {
       skillState.focus(project: project)
       await runtime.configureMemory(memoryState.promptSection)
       await runtime.configureProjectInstructions(projectInstructionsSection(configuration))
+      await runtime.configurePlanning(configuration?.use.plan ?? true)
       let store = resolvedChatStore(options: options, home: home, project: project)
       importLegacyChats(into: store, project: project, options: options, environment: environment)
       let providerOverride =
@@ -1597,6 +1598,7 @@ struct MaiCLI {
       visual.todo.focus(project: project)
       await runtime.configureMemory(visual.memory.promptSection)
       await runtime.configureProjectInstructions(Self.projectInstructionsSection(configuration))
+      await runtime.configurePlanning(configuration?.use.plan ?? true)
     }
 
     func statusLine() async -> String {
@@ -2658,9 +2660,11 @@ struct MaiCLI {
         await terminal.line(statsHelp)
       case "skills", "skill", "/skills", "/skill":
         await terminal.line(skillsHelp)
+      case "effort", "/effort":
+        await terminal.line(effortHelp)
       default:
         await terminal.line(
-          "Unknown help topic '\(argument)'. Try /help, or /help set, memory, todo, prompts, agents, chat, edit, tools, skills, queue, export, copy, or stats."
+          "Unknown help topic '\(argument)'. Try /help, or /help set, effort, memory, todo, prompts, agents, chat, edit, tools, skills, queue, export, copy, or stats."
         )
       }
     case "/cwd", "/pwd":
@@ -2673,6 +2677,14 @@ struct MaiCLI {
         session: &session,
         runtime: runtime,
         approvalHandler: visual.approvalHandler,
+        configuration: &configuration,
+        configurationPath: visual.configurationPath,
+        terminal: terminal)
+    case "/effort":
+      await handleEffortCommand(
+        argument,
+        session: &session,
+        runtime: runtime,
         configuration: &configuration,
         configurationPath: visual.configurationPath,
         terminal: terminal)
@@ -5537,6 +5549,63 @@ struct MaiCLI {
     }
   }
 
+  // MARK: Effort
+
+  /// `/effort` shows the reasoning level and guidance of the current agent;
+  /// `/effort LEVEL [TEXT]` sets them and `/effort off` clears them. The level
+  /// reaches the provider as the field its API family takes and, with the
+  /// guidance, the system prompt; both persist on the agent like /set does.
+  private static func handleEffortCommand(
+    _ argument: String,
+    session: inout REPLSession,
+    runtime: AgentRuntime,
+    configuration: inout MaiConfiguration?,
+    configurationPath: String?,
+    terminal: TerminalWriter
+  ) async {
+    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
+      String.init)
+    guard let first = fields.first?.lowercased() else {
+      await terminal.line(effortDescription(session.profile.options))
+      return
+    }
+    let guidance = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+    if ["off", "none", "auto", "default", "clear"].contains(first) {
+      session.profile.options.reasoningEffort = nil
+      session.profile.options.reasoningGuidance = nil
+    } else if let effort = ReasoningEffort(name: first) {
+      session.profile.options.reasoningEffort = effort.rawValue
+      session.profile.options.reasoningGuidance = guidance.isEmpty ? nil : guidance
+    } else {
+      await terminal.line(effortHelp)
+      return
+    }
+    session.touch()
+    let summary = effortDescription(session.profile.options)
+    guard configuration != nil, configurationPath != nil else {
+      await terminal.line("Set \(summary) for this chat.")
+      return
+    }
+    if await persistAgentProfile(
+      session: session,
+      configuration: &configuration,
+      configurationPath: configurationPath,
+      runtime: runtime,
+      terminal: terminal)
+    {
+      await terminal.line("Set \(summary) for agent '\(session.profile.agentID)'.")
+    }
+  }
+
+  /// `effort = high — Check every edge case.`, or `effort = off`.
+  private static func effortDescription(_ options: GenerationOptions) -> String {
+    let level = options.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let guidance = options.reasoningGuidance?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    var text = "effort = \(level.isEmpty ? "off" : level)"
+    if !guidance.isEmpty { text += " — \(guidance)" }
+    return text
+  }
+
   // MARK: Skills
 
   /// Registers a `skills_*` tool for every skill the state can see. Called
@@ -5905,6 +5974,7 @@ struct MaiCLI {
       await listRecoverySettings(session.profile, terminal: terminal)
       await listToolSettings(session.profile, terminal: terminal)
       await terminal.line("delegation = \(session.profile.toolDelegation.rawValue)")
+      await terminal.line(effortDescription(session.profile.options))
       await listUISettings(configuration?.ui ?? .init(), terminal: terminal)
       await listUseSettings(configuration?.use ?? .init(), terminal: terminal)
       return
@@ -5921,6 +5991,15 @@ struct MaiCLI {
     }
     if key == "use.agentsmd" {
       await setAgentsMarkdown(
+        parts: parts,
+        runtime: runtime,
+        configuration: &configuration,
+        configurationPath: configurationPath,
+        terminal: terminal)
+      return
+    }
+    if key == "use.plan" {
+      await setPlanning(
         parts: parts,
         runtime: runtime,
         configuration: &configuration,
@@ -6018,7 +6097,7 @@ struct MaiCLI {
         || levelKeys.contains(key)
     else {
       await terminal.line(
-        "Unknown setting '\(parts[0])'. Available settings: yolo, delegation, tool.calling, tool.proxy, limits.maxToolCalls, limits.maxModelTurns, limits.maxSubagents, limits.maxSubagentDepth, limits.maxTotalTokens, limits.maxSeconds, retry.attempts, retry.delay, autocompact, context, ui.bgline, ui.fgcolor, ui.bgcolor, ui.fgprompt, ui.bgprompt, ui.fgtoolresult, ui.bold, ui.markdown, ui.toolResultLines, ui.subagents, use.agentsmd"
+        "Unknown setting '\(parts[0])'. Available settings: yolo, delegation, tool.calling, tool.proxy, limits.maxToolCalls, limits.maxModelTurns, limits.maxSubagents, limits.maxSubagentDepth, limits.maxTotalTokens, limits.maxSeconds, retry.attempts, retry.delay, autocompact, context, ui.bgline, ui.fgcolor, ui.bgcolor, ui.fgprompt, ui.bgprompt, ui.fgtoolresult, ui.bold, ui.markdown, ui.toolResultLines, ui.subagents, use.agentsmd, use.plan"
       )
       return
     }
@@ -6614,6 +6693,46 @@ struct MaiCLI {
 
   private static func listUseSettings(_ use: ConfiguredUse, terminal: TerminalWriter) async {
     await terminal.line("use.agentsmd = \(use.agentsmd ? "on" : "off")")
+    await terminal.line("use.plan = \(use.plan ? "on" : "off")")
+  }
+
+  /// `/set use.plan [on|off]`: shows or changes whether an agent that can
+  /// start children is asked to open a multi-step request with a plan before
+  /// its first `agent_start`.
+  private static func setPlanning(
+    parts: [String],
+    runtime: AgentRuntime,
+    configuration: inout MaiConfiguration?,
+    configurationPath: String?,
+    terminal: TerminalWriter
+  ) async {
+    let enabled = configuration?.use.plan ?? true
+    guard parts.count > 1 else {
+      await terminal.line("use.plan = \(enabled ? "on" : "off")")
+      return
+    }
+    guard parts.count == 2, let wanted = booleanSetting(parts[1]) else {
+      await terminal.line("Usage: /set use.plan <on|off>")
+      return
+    }
+    guard var draft = configuration, let configurationPath else {
+      await terminal.line("error: No writable configuration is active.", to: .standardError)
+      return
+    }
+    draft.use.plan = wanted
+    do {
+      try draft.save(to: URL(fileURLWithPath: configurationPath))
+      configuration = draft
+    } catch {
+      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
+      return
+    }
+    await runtime.configurePlanning(wanted)
+    await terminal.line(
+      "Set use.plan = \(wanted ? "on" : "off"). "
+        + (wanted
+          ? "An agent with children opens a request of several steps with a numbered plan."
+          : "Agents delegate without planning first."))
   }
 
   /// `/set use.agentsmd [on|off]`: shows or changes whether the working
@@ -8223,7 +8342,8 @@ struct MaiCLI {
     skills: [AgentSkill] = []
   ) -> [String] {
     var values = [
-      "/help", "/help set", "/exit", "/quit", "/set yolo on", "/set yolo off", "/set ui.",
+      "/help", "/help set", "/help effort", "/exit", "/quit", "/set yolo on", "/set yolo off",
+      "/set ui.", "/effort", "/effort off",
       "/btw ",
       "/help memory", "/help agents", "/help chat", "/help edit", "/help tools",
       "/agent acp list", "/agent acp add ", "/agents acp list",
@@ -8242,6 +8362,7 @@ struct MaiCLI {
       "/set ui.bgline rgb:024", "/set ui.bgline none", "/set ui.fgprompt yellow",
       "/set ui.fgcolor none", "/set ui.bgcolor none", "/set ui.bgprompt none",
       "/set ui.fgtoolresult yellow", "/set use.", "/set use.agentsmd on", "/set use.agentsmd off",
+      "/set use.plan on", "/set use.plan off",
       "/set ui.bold on", "/set ui.bold off", "/set ui.markdown on", "/set ui.markdown off",
       "/set ui.toolResultLines all", "/set ui.toolResultLines ",
       "/cwd", "/pwd", "/cd ", "/plugins",
@@ -8321,6 +8442,9 @@ struct MaiCLI {
           "echo", "datetime", "calc", "files", "run", "weather", "web", "mastodon", "github",
           "todo", "context",
         ])
+    }
+    for level in ReasoningEffort.names {
+      values.append("/effort \(level)")
     }
     for group in groupNames {
       values.append("/tools show \(group)")
@@ -8525,6 +8649,7 @@ struct MaiCLI {
 
   private static let replHelp = """
     /set [SETTING VALUE]   Show or change settings; /help set lists them
+    /effort [LEVEL] [TEXT] Show or set how hard the model thinks (low, medium, high, xhigh, max) and extra guidance
     /cwd                  Print the current working directory
     /cd PATH              Change the current working directory
     /plugins            List statically and dynamically loaded plugins
@@ -8583,6 +8708,21 @@ struct MaiCLI {
            Child agents print in blocks prefixed agent#PID; /set ui.subagents picks how much.
     """
 
+  private static let effortHelp = """
+    Reasoning effort:
+      /effort                    Show the current agent's reasoning effort and guidance
+      /effort LEVEL              Set it: low, medium, high, xhigh, or max. The provider gets the
+                                 field its API takes (reasoning_effort, think, enable_thinking,
+                                 thinking…) and the system prompt says how much care to take
+      /effort LEVEL TEXT         The level plus TEXT, added to the system prompt as guidance
+      /effort off                Back to the provider's default, with no guidance
+
+    Examples:
+      /effort high
+      /effort max Check every edge case and verify the result before answering
+      /effort low Keep answers to one paragraph
+    """
+
   private static let setHelp = """
     Settings commands:
       /set                         List current settings and their values
@@ -8614,6 +8754,8 @@ struct MaiCLI {
       /set ui.subagents LEVEL      What child agents print: all, tools, stats, or none
       /set use.agentsmd BOOL       Put the working tree's AGENTS.md files — this directory up to
                                    the repository root — into every run's system prompt (on/off)
+      /set use.plan BOOL           Ask an agent that can start children to open a request of
+                                   several steps with a numbered plan before delegating (on/off)
 
     YOLO, agent, and UI settings are persisted in the active configuration; the -y
     flag turns YOLO on for one run only. COLOR accepts a named ANSI color, rgb:RGB,

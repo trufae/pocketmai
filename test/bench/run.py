@@ -3,7 +3,8 @@
 
 Usage:
   python3 test/bench/run.py [--variant inline|proxy|subagent] [--model NAME]
-                           [--run-id ID] [--timeout SEC] [--system FILE] [case ...]
+                           [--run-id ID] [--timeout SEC] [--system FILE]
+                           [--plan on|off] [--repeat N] [case ...]
 
 Each case lives in test/cases/<case>/ with:
   prompt.txt   the user message
@@ -69,7 +70,7 @@ def wait_port(port, timeout=10):
     return False
 
 
-def make_config(port, model, variant, instructions, strategy="automatic", context="cache"):
+def make_config(port, model, variant, instructions, strategy="automatic", context="cache", plan=True):
     groups = ["files", "run", "todo"]
     agent = {
         "id": "coder",
@@ -121,6 +122,7 @@ def make_config(port, model, variant, instructions, strategy="automatic", contex
         ],
         "agents": [agent],
         "ui": {"markdown": False, "toolResultLines": -1},
+        "use": {"plan": plan},
         "approvals": {"confirm": "allow", "dangerous": "allow", "yolo": True},
         "memory": {"enabled": False, "scope": "project"},
     }
@@ -162,7 +164,8 @@ def run_case(name, args, upstream, key):
         instructions = Path(args.system).read_text().strip()
     port = free_port()
     log = out_dir / "proxy.jsonl"
-    config = make_config(port, args.model, args.variant, instructions, args.strategy, args.context)
+    config = make_config(port, args.model, args.variant, instructions, args.strategy, args.context,
+                         args.plan == "on")
     config_path = out_dir / "pmai.json"
     config_path.write_text(json.dumps(config, indent=2))
 
@@ -215,6 +218,7 @@ def run_case(name, args, upstream, key):
         "variant": args.variant,
         "strategy": args.strategy,
         "context": args.context,
+        "plan": args.plan,
         "model": args.model,
         "prompt": prompt,
         "instructions": instructions,
@@ -244,6 +248,10 @@ def main():
     parser.add_argument("--system", help="file with agent instructions replacing the default")
     parser.add_argument("--context", default="cache", choices=["cache", "size"],
                         help="context mode of the agent: cache keeps every message, size prunes read files")
+    parser.add_argument("--plan", default="on", choices=["on", "off"],
+                        help="use.plan: ask an agent with children to plan a multi-step request first")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="run every case N times, under run ids <run-id>-r1 … <run-id>-rN")
     parser.add_argument("--strategy", default="automatic",
                         choices=["automatic", "native", "text", "xml", "json"],
                         help="toolCallingStrategy of the agent")
@@ -253,15 +261,19 @@ def main():
     upstream = os.environ.get("UPSTREAM") or envfile.get("PMAI_BASE_URL", "https://ollama.com/v1")
     key = os.environ.get("UPSTREAM_KEY") or envfile.get("PMAI_API_KEY", "")
     args.model = args.model or envfile.get("PMAI_MODEL", "gemma4:31b")
-    args.run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S") + f"-{args.variant}-{args.strategy}-{args.model.replace(':', '_').replace('/', '_')}"
+    args.run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S") + f"-{args.variant}-{args.strategy}-plan{args.plan}-{args.model.replace(':', '_').replace('/', '_')}"
     if not PMAI.exists():
         raise SystemExit(f"pmai binary not found at {PMAI}; build with swift build --product pmai")
 
     names = args.cases or sorted(p.name for p in CASES.iterdir() if (p / "prompt.txt").exists())
-    print(f"run {args.run_id}: model={args.model} variant={args.variant} strategy={args.strategy} cases={len(names)}", flush=True)
-    metas = [run_case(name, args, upstream, key) for name in names]
-    (RESULTS / args.run_id / "run.json").write_text(json.dumps(metas, indent=2))
-    print(f"results in {RESULTS / args.run_id}")
+    base_id = args.run_id
+    for round_index in range(1, args.repeat + 1):
+        args.run_id = base_id if args.repeat == 1 else f"{base_id}-r{round_index}"
+        print(f"run {args.run_id}: model={args.model} variant={args.variant} strategy={args.strategy} "
+              f"plan={args.plan} cases={len(names)}", flush=True)
+        metas = [run_case(name, args, upstream, key) for name in names]
+        (RESULTS / args.run_id / "run.json").write_text(json.dumps(metas, indent=2))
+        print(f"results in {RESULTS / args.run_id}")
 
 
 if __name__ == "__main__":

@@ -26,7 +26,24 @@ enum SubagentTool {
   /// out runs a worker with the caller's own model and tools.
   static func definitions(for conversation: Conversation, settings: AppSettings) -> [ToolDefinition] {
     guard conversation.toolsEnabled, settings.selectedAgent.canSpawnSubagents else { return [] }
-    return AgentProcessTools.definitions(offering: offeredAgents(settings: settings), delegating: true)
+    return AgentProcessTools.definitions(
+      offering: offeredAgents(settings: settings),
+      delegating: true,
+      planFirst: settings.plansBeforeDelegating)
+  }
+
+  /// The settings a child at `depth` runs with: the caller's own, or another
+  /// profile's once selected. A child is a peer of its parent and may start
+  /// children of its own, except at the leaf depth, where it could not start
+  /// anything: there the agent tools are withheld, so it does not pay for
+  /// their schemas on every call.
+  static func childSettings(from settings: AppSettings, agentID: UUID, depth: Int) -> AppSettings {
+    var child = settings
+    if child.selectedAgentID != agentID { child.selectAgent(agentID) }
+    if depth >= maxDepth, let index = child.agents.firstIndex(where: { $0.id == agentID }) {
+      child.agents[index].canSpawnSubagents = false
+    }
+    return child
   }
 
   /// Every agent other than the caller's, by name. The first of two agents
@@ -133,13 +150,7 @@ enum SubagentTool {
     case .worker:
       agentID = "\(parent.name).worker"
       displayName = "\(parent.name) worker"
-      var derived = settings
-      // The worker has the caller's tools but may not delegate further: a
-      // child that could start children of its own would only add depth.
-      if let index = derived.agents.firstIndex(where: { $0.id == parent.id }) {
-        derived.agents[index].canSpawnSubagents = false
-      }
-      childSettings = derived
+      childSettings = Self.childSettings(from: settings, agentID: parent.id, depth: depth)
       baseContext = AgentDelegationPrompt.workerInstructions
       child.provider = conversation.provider
       child.modelID = conversation.modelID
@@ -157,8 +168,7 @@ enum SubagentTool {
     case .profile(let profile):
       agentID = profile.name
       displayName = profile.name
-      var selected = settings
-      selected.selectAgent(profile.id)
+      let selected = Self.childSettings(from: settings, agentID: profile.id, depth: depth)
       childSettings = selected
       baseContext = ""
       let provider = selected.defaultProviderConfiguration

@@ -7,8 +7,10 @@ Usage:
 Prints, per case: model calls, prompt tokens (sum and peak), completion tokens,
 tool calls by name, repeated identical calls, tool errors, bytes of tool output
 that stayed in the context, share of the final context made of file contents,
-wall time and whether check.sh passed. With --detail the per-call timeline of a
-case is printed.
+delegation figures (agents started, most started in one reply, started without
+waiting, whether the parent planned in text before its first tool call, tree
+depth), wall time and whether check.sh passed. With --detail the per-call
+timeline of a case is printed.
 """
 import json
 import sys
@@ -36,6 +38,62 @@ def load_calls(path):
 
 def est_tokens(chars):
     return chars // 4
+
+
+CHILD_MARK = "You are running as agent '"
+
+
+def is_child_request(req):
+    """A child's brief says which agent it runs as; a parent's messages never do."""
+    for m in req.get("messages") or []:
+        if m.get("role") == "user" and CHILD_MARK in text_of(m.get("content")):
+            return True
+    return False
+
+
+def child_depth(req):
+    """How deep the agent answering `req` sits: coder.worker is 1, coder.worker.worker 2."""
+    for m in req.get("messages") or []:
+        text = text_of(m.get("content"))
+        if m.get("role") == "user" and CHILD_MARK in text:
+            name = text.split(CHILD_MARK, 1)[1].split("'", 1)[0]
+            return name.count(".worker")
+    return 0
+
+
+def agent_stats(calls):
+    """Delegation figures of one case: how many children were started, the most
+    in one reply, how many without waiting, whether the parent planned in text
+    before its first tool call, and how deep the tree went."""
+    agents = par = async_starts = 0
+    plan = None
+    depth = 0
+    for call in calls:
+        req = call.get("request") or {}
+        res = call.get("response") or {}
+        tcs = res.get("tool_calls") or []
+        starts = [tc for tc in tcs if tc.get("name") == "agent_start"]
+        agents += len(starts)
+        par = max(par, len(starts))
+        for tc in starts:
+            try:
+                args = json.loads(tc.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            if args.get("wait") is False:
+                async_starts += 1
+        if not is_child_request(req):
+            if plan is None and tcs:
+                plan = bool((res.get("content") or "").strip())
+        else:
+            depth = max(depth, child_depth(req))
+    return {
+        "agents": agents,
+        "par": par,
+        "async": async_starts,
+        "plan": plan,
+        "depth": depth,
+    }
 
 
 def analyze_case(case_dir):
@@ -105,8 +163,14 @@ def analyze_case(case_dir):
         if prev is not None and msgs[:len(prev)] != prev:
             prefix_changed += 1
         prev = msgs
+    delegation = agent_stats(calls)
     return {
         "prefix_changed": prefix_changed,
+        "agents": delegation["agents"],
+        "par": delegation["par"],
+        "async": delegation["async"],
+        "plan": delegation["plan"],
+        "depth": delegation["depth"],
         "case": meta["case"],
         "pass": meta.get("check"),
         "calls": len(calls),
@@ -140,22 +204,26 @@ def fmt_k(n):
 def print_summary(run_dir, rows):
     print(f"\n## {run_dir.name}")
     print()
-    print("| case | ok | calls | tool calls | prompt Σ | peak | compl | repeat | tool err | ctx tool-out | file part | prefix Δ | time |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| case | ok | calls | tool calls | prompt Σ | peak | compl | repeat | tool err | ctx tool-out | file part | prefix Δ | agents | par | async | plan | depth | time |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     tot = Counter()
     for r in rows:
         ok = "✅" if r["pass"] else ("❌" if r["pass"] is False else "–")
         if r["timed_out"]:
             ok += "⏱"
+        plan = "–" if r["plan"] is None else ("y" if r["plan"] else "n")
         print(f"| {r['case']} | {ok} | {r['calls']} | {r['tool_calls']} | {fmt_k(r['prompt_sum'])} | {fmt_k(r['prompt_peak'])} | "
               f"{r['completion']} | {r['repeats']} | {r['tool_errors']} | {fmt_k(r['tool_result_chars'])} | "
-              f"{fmt_k(r['file_chars'])} | {r['prefix_changed']} | {r['elapsed']}s |")
-        for key in ("calls", "tool_calls", "prompt_sum", "completion", "repeats", "tool_errors", "prefix_changed"):
+              f"{fmt_k(r['file_chars'])} | {r['prefix_changed']} | {r['agents']} | {r['par']} | {r['async']} | {plan} | {r['depth']} | {r['elapsed']}s |")
+        for key in ("calls", "tool_calls", "prompt_sum", "completion", "repeats", "tool_errors", "prefix_changed", "agents", "async"):
             tot[key] += r[key]
+        tot["par"] = max(tot["par"], r["par"])
+        tot["depth"] = max(tot["depth"], r["depth"])
+        tot["plan"] += 1 if r["plan"] else 0
         tot["pass"] += 1 if r["pass"] else 0
         tot["elapsed"] += r["elapsed"] or 0
     print(f"| **total** | {tot['pass']}/{len(rows)} | {tot['calls']} | {tot['tool_calls']} | {fmt_k(tot['prompt_sum'])} | | "
-          f"{tot['completion']} | {tot['repeats']} | {tot['tool_errors']} | | | {tot['prefix_changed']} | {tot['elapsed']:.0f}s |")
+          f"{tot['completion']} | {tot['repeats']} | {tot['tool_errors']} | | | {tot['prefix_changed']} | {tot['agents']} | {tot['par']} | {tot['async']} | {tot['plan']}/{len(rows)} | {tot['depth']} | {tot['elapsed']:.0f}s |")
     names = Counter()
     for r in rows:
         names.update(r["tool_names"])

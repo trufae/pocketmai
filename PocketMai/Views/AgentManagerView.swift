@@ -45,6 +45,13 @@ struct AgentManagerView: View {
           "Tap an agent to select it; the provider, model, system prompt, tools, MCP servers, and advanced options in Settings then belong to it, and new chats start from it. \(AgentProfile.stockName) is always available. A new agent starts as a copy of the selected one."
         )
       }
+      Section {
+        Toggle("Plan before delegating", isOn: planBinding)
+      } footer: {
+        Text(
+          "An agent that can spawn subagents opens a request of several steps with a short numbered plan — which steps go to child agents and which of those run in parallel — before its first agent_start; a single question gets no plan."
+        )
+      }
     }
     .navigationTitle("Agents")
     .toolbar {
@@ -150,6 +157,15 @@ struct AgentManagerView: View {
       parts.append("Subagents")
     }
     return parts.joined(separator: " · ")
+  }
+
+  private var planBinding: Binding<Bool> {
+    Binding(
+      get: { store.settings.plansBeforeDelegating },
+      set: { value in
+        store.settings.plansBeforeDelegating = value
+        store.saveSettings()
+      })
   }
 
   private var removalBinding: Binding<Bool> {

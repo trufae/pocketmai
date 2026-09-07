@@ -15,7 +15,9 @@ public actor AgentRuntime {
     displayName: "Agents",
     description:
       "Delegate work to child agents that run with a context and tool set of their own. "
-      + "agent_start launches one with a brief and either waits for its answer or returns its pid; "
+      + "agent_start launches one with a brief and either waits for its answer or returns its "
+      + "pid, in which case the answer arrives later as a message; children started in one reply "
+      + "run at once, and a child may start children of its own; "
       + "agent_status lists the children with their state and can read one's transcript; agent_result "
       + "collects the answer of a child started without waiting; agent_stop ends a child and everything "
       + "it started. Use them for independent subtasks, parallel research, or work whose tool output "
@@ -58,6 +60,7 @@ public actor AgentRuntime {
   /// Nil keeps the built-in text, so MaiCore works without configuration.
   private var delegationTemplate: String?
   private var workerInstructions: String?
+  private var plansBeforeDelegating = false
   /// The compaction prompt autocompact renders; nil keeps the built-in one.
   private var compactionTemplate: String?
   /// Durable notes added to the system prompt of top-level runs. A child agent
@@ -154,6 +157,13 @@ public actor AgentRuntime {
     delegationTemplate = prompt?.trimmingCharacters(in: .whitespacesAndNewlines).nilWhenEmpty
     self.workerInstructions =
       workerInstructions?.trimmingCharacters(in: .whitespacesAndNewlines).nilWhenEmpty
+  }
+
+  /// Whether `agent_start` asks the model to open a request of several steps
+  /// with a numbered plan before its first delegation (`use.plan`). Off until
+  /// a host says otherwise.
+  public func configurePlanning(_ enabled: Bool) {
+    plansBeforeDelegating = enabled
   }
 
   /// Installs the template autocompact summarizes with, the same one a host
@@ -336,7 +346,7 @@ public actor AgentRuntime {
       agentID: request.agentID,
       depth: depth,
       pid: pid)
-    let concreteDefinitions = try visibleDefinitions(for: request)
+    let concreteDefinitions = try visibleDefinitions(for: request, depth: depth)
     let definitions =
       request.useToolProxy && !concreteDefinitions.isEmpty
       ? ToolProxy.definitions(for: concreteDefinitions, exposing: request.proxyExposedTools)
@@ -463,7 +473,16 @@ public actor AgentRuntime {
       if !injected.isEmpty {
         for message in injected {
           transcript.append(message)
-          await emit(.userMessage(context, message))
+          // A child started without waiting reports here too: its answer
+          // counts as taken, and hosts hear of it as of a waited child.
+          if let child = AgentProcessTools.deliveredChildPID(of: message) {
+            await supervisor.collect(child)
+            if let result = await supervisor.result(child) {
+              await emit(.childFinished(context, child: result))
+            }
+          } else {
+            await emit(.userMessage(context, message))
+          }
         }
         await supervisor.note(pid, transcript: transcript)
       }
@@ -520,6 +539,11 @@ public actor AgentRuntime {
       }
       if let memorySection, depth == 0 {
         insertSystem(memorySection, into: &providerMessages)
+      }
+      // The effort level and its guidance reach the model in words as well as
+      // in the provider's own field, for the models that have none.
+      if let effortSection = ReasoningEffort.promptSection(for: request.options) {
+        insertSystem(effortSection, into: &providerMessages)
       }
       if textToolMode != nil || toolBudgetExhausted {
         let prompt =
@@ -662,12 +686,14 @@ public actor AgentRuntime {
       let calls = providerResponse.message.toolCalls
       if calls.isEmpty {
         // A message that arrived while the model was answering is not left
-        // behind for a run that is about to end: the loop goes round once more
-        // so the answer takes it into account. A run out of turns ends anyway
-        // and leaves the message queued for its host.
+        // behind for a run that is about to end, and neither is a child
+        // started without waiting: the run holds until its answer lands in
+        // the inbox, then goes round once more so the answer takes it into
+        // account. A run out of turns ends anyway and leaves the message
+        // queued for its host.
         if localModelTurns < request.limits.maxModelTurns,
           await budget.canClaimModelTurn(),
-          await supervisor.hasQueuedMessages(pid)
+          try await AgentProcessTools.awaitAnyChild(of: pid, supervisor: supervisor)
         {
           continue
         }
@@ -685,22 +711,42 @@ public actor AgentRuntime {
         return result
       }
 
-      for call in calls {
-        try Task.checkCancellation()
-        try await holdWhilePaused(pid)
-        let result: ToolResult
-        if budget.deadlinePassed {
-          // Out of time between two calls: the rest are answered rather than
-          // run, so the transcript stays sendable and the pause at the top of
-          // the loop is clean.
-          await emit(.toolStarted(context, call))
-          result = ToolResult(
-            callID: call.id,
-            text:
-              "Error: the run's time limit was reached before this call ran; it was not executed.",
-            isError: true)
-          await emit(.toolFinished(context, result))
-        } else if localToolCalls < request.limits.maxToolCalls, await budget.claimToolCall() {
+      // The reply's calls run in order, except that a call to a concurrent
+      // tool — the agent family, or any tool that says so — is started and
+      // left running while the calls after it start, so children started in
+      // one reply work side by side and a blocking start never holds back
+      // the rest. The results join the transcript in call order once the
+      // last of them is in.
+      let modelTurn = localModelTurns
+      var results = [ToolResult?](repeating: nil, count: calls.count)
+      try await withThrowingTaskGroup(of: (Int, ToolResult).self) { group in
+        for (index, call) in calls.enumerated() {
+          try Task.checkCancellation()
+          try await holdWhilePaused(pid)
+          if budget.deadlinePassed {
+            // Out of time between two calls: the rest are answered rather
+            // than run, so the transcript stays sendable and the pause at
+            // the top of the loop is clean.
+            await emit(.toolStarted(context, call))
+            let result = ToolResult(
+              callID: call.id,
+              text:
+                "Error: the run's time limit was reached before this call ran; it was not executed.",
+              isError: true)
+            await emit(.toolFinished(context, result))
+            results[index] = result
+            continue
+          }
+          guard localToolCalls < request.limits.maxToolCalls, await budget.claimToolCall() else {
+            let result = ToolResult(
+              callID: call.id,
+              text:
+                "Error: the tool call budget for this run (\(request.limits.maxToolCalls)) is exhausted; this call was not executed. Answer with the information already gathered.",
+              isError: true)
+            await emit(.toolFinished(context, result))
+            results[index] = result
+            continue
+          }
           localToolCalls += 1
           await supervisor.note(pid, toolCalls: localToolCalls, activity: call.name)
           // Repeating a call is often right — the directory changed, a file
@@ -710,39 +756,103 @@ public actor AgentRuntime {
           let key = ToolCallKey(call)
           let repeats = repeatedCalls[key, default: 0]
           let pollable = Self.reservedToolNames.contains(Self.canonicalToolName(call.name))
-          if pollable || repeats < Self.maximumIdenticalCalls {
-            repeatedCalls[key] = repeats + 1
-            result = try await execute(
-              call,
-              definitions: concreteDefinitions,
-              request: request,
-              context: context,
-              modelTurn: localModelTurns,
-              depth: depth,
-              budget: budget,
-              emit: emit)
-          } else {
+          guard pollable || repeats < Self.maximumIdenticalCalls else {
             repeatGuardTripped = true
             await emit(.toolStarted(context, call))
-            result = ToolResult(
+            let result = ToolResult(
               callID: call.id,
               text:
                 "Error: this exact call has already run \(repeats) times with the same arguments; change them, or answer with what you have.",
               isError: true)
             await emit(.toolFinished(context, result))
+            results[index] = result
+            continue
           }
-        } else {
-          result = ToolResult(
-            callID: call.id,
-            text:
-              "Error: the tool call budget for this run (\(request.limits.maxToolCalls)) is exhausted; this call was not executed. Answer with the information already gathered.",
-            isError: true)
-          await emit(.toolFinished(context, result))
+          repeatedCalls[key] = repeats + 1
+          if Self.runsConcurrently(call, in: concreteDefinitions) {
+            let gate = LaunchGate()
+            group.addTask {
+              defer { gate.open() }
+              return (
+                index,
+                try await self.execute(
+                  call,
+                  definitions: concreteDefinitions,
+                  request: request,
+                  context: context,
+                  modelTurn: modelTurn,
+                  depth: depth,
+                  budget: budget,
+                  launched: { gate.open() },
+                  emit: emit)
+              )
+            }
+            // The next call starts once this one is under way, so children
+            // started together get their pids, and their slots, in call order.
+            await gate.wait()
+          } else {
+            results[index] = try await execute(
+              call,
+              definitions: concreteDefinitions,
+              request: request,
+              context: context,
+              modelTurn: modelTurn,
+              depth: depth,
+              budget: budget,
+              emit: emit)
+          }
         }
+        for try await (index, result) in group {
+          results[index] = result
+        }
+      }
+      for (index, call) in calls.enumerated() {
+        guard let result = results[index] else { continue }
         if !result.isError { completedToolRuns[ToolCallKey(call)] = result.text }
-        transcript.append(
-          AgentMessage(role: .tool, content: [.toolResult(result)]))
-        await supervisor.note(pid, transcript: transcript)
+        transcript.append(AgentMessage(role: .tool, content: [.toolResult(result)]))
+      }
+      await supervisor.note(pid, transcript: transcript)
+    }
+  }
+
+  /// Whether `call` names a tool whose calls run alongside the rest of the
+  /// reply instead of after the call before them.
+  private static func runsConcurrently(
+    _ call: ToolCall,
+    in definitions: [ToolDefinition]
+  ) -> Bool {
+    let name = canonicalToolName(call.name)
+    return definitions.contains { $0.name == name && $0.annotations.concurrent }
+  }
+
+  /// A one-shot signal a concurrent call gives once it is under way — a
+  /// child registered, a tool called — so the reply's next call can start.
+  /// `wait` returns at once when the signal was already given, and the call's
+  /// end gives it too, so an early error never holds the reply up.
+  private final class LaunchGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var opened = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func open() {
+      lock.lock()
+      opened = true
+      let resumed = waiters
+      waiters = []
+      lock.unlock()
+      for waiter in resumed { waiter.resume() }
+    }
+
+    func wait() async {
+      await withCheckedContinuation { continuation in
+        lock.lock()
+        if opened {
+          lock.unlock()
+          continuation.resume()
+        } else {
+          waiters.append(continuation)
+          lock.unlock()
+        }
       }
     }
   }
@@ -930,6 +1040,7 @@ public actor AgentRuntime {
     modelTurn: Int,
     depth: Int,
     budget: RunBudget,
+    launched: @escaping @Sendable () -> Void = {},
     emit: @escaping AgentEventHandler
   ) async throws -> ToolResult {
     // A proxied model that names a hidden tool directly still gets it run:
@@ -1051,6 +1162,7 @@ public actor AgentRuntime {
         parent: context,
         depth: depth,
         budget: budget,
+        launched: launched,
         emit: emit)
     case Self.agentStatusToolName:
       return await reportAgentStatus(approvedCall, parent: context, emit: emit)
@@ -1069,6 +1181,7 @@ public actor AgentRuntime {
       await emit(.toolFinished(context, result))
       return result
     }
+    launched()
     do {
       let output = try await tool.call(
         arguments: approvedCall.arguments,
@@ -1106,6 +1219,7 @@ public actor AgentRuntime {
     parent: AgentEventContext,
     depth: Int,
     budget: RunBudget,
+    launched: @escaping @Sendable () -> Void = {},
     emit: @escaping AgentEventHandler
   ) async -> ToolResult {
     let arguments = call.arguments.objectValue ?? [:]
@@ -1169,6 +1283,8 @@ public actor AgentRuntime {
       task: start.brief.headline,
       depth: childDepth,
       limit: request.limits.maxSubagents)
+    // Registered, so the reply's next start may register after it.
+    launched()
     let childContext = AgentEventContext(
       runID: childRunID,
       parentRunID: parent.runID,
@@ -1277,9 +1393,10 @@ public actor AgentRuntime {
   }
 
   /// The agent MaiCore invents when a delegating agent does not name a child:
-  /// same provider and model, the parent's tools, and inline delegation so it
-  /// actually runs them. Without it, switching delegation on would leave an
-  /// agent with no way to do anything.
+  /// same provider and model, the parent's tools, and the parent's delegation
+  /// and subagents, so it is a peer that hands work down in turn until the
+  /// depth limit hides the agent tools. Without it, switching delegation on
+  /// would leave an agent with no way to do anything.
   private func derivedWorker(
     for request: AgentRequest,
     toolNames: Set<String>
@@ -1290,14 +1407,16 @@ public actor AgentRuntime {
       instructions: workerInstructions ?? AgentDelegationPrompt.workerInstructions,
       provider: request.provider,
       model: request.model,
-      toolNames: toolNames,
+      toolNames: toolNames.union(Self.agentToolNames),
+      toolGroupNames: request.toolGroupNames ?? [],
+      subagentNames: request.subagentNames,
       stream: request.stream,
       limits: request.limits,
       options: request.options,
       toolCallingStrategy: request.toolCallingStrategy,
       useToolProxy: request.useToolProxy,
       proxyExposedTools: request.proxyExposedTools,
-      toolDelegation: .inline,
+      toolDelegation: request.toolDelegation,
       retry: request.retry,
       autocompact: request.autocompact,
       context: request.context)
@@ -1314,7 +1433,13 @@ public actor AgentRuntime {
     return result
   }
 
-  private func visibleDefinitions(for request: AgentRequest) throws -> [ToolDefinition] {
+  /// What the model of a run at `depth` may call. The agent tools are left
+  /// out at the depth limit: a child there could not start anything, so the
+  /// four schemas would be paid on every call for nothing.
+  private func visibleDefinitions(
+    for request: AgentRequest,
+    depth: Int = 0
+  ) throws -> [ToolDefinition] {
     for name in request.subagentNames where agents[name] == nil {
       throw AgentRuntimeError.agentNotRegistered(name)
     }
@@ -1343,6 +1468,7 @@ public actor AgentRuntime {
           || Self.agentToolNames.isSubset(of: request.toolNames)
       } ?? true
     if agentToolsEnabled, request.limits.maxSubagents > 0,
+      depth < request.limits.maxSubagentDepth,
       delegating || !offeredAgents.isEmpty
     {
       definitions.append(
@@ -1362,7 +1488,8 @@ public actor AgentRuntime {
         ? (agent.displayName == name ? "" : agent.displayName) : agent.description
       return AgentProcessTools.OfferedAgent(id: name, purpose: purpose)
     }
-    return AgentProcessTools.definitions(offering: offered, delegating: delegating)
+    return AgentProcessTools.definitions(
+      offering: offered, delegating: delegating, planFirst: plansBeforeDelegating)
   }
 
   private func request(

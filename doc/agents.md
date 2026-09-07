@@ -101,6 +101,41 @@ slot and no budget; `agent_start` with `wait` false answers `Queued … as #N`
 with status `queued`, a blocking start just waits, and `agent_stop` on a queued
 child ends the wait like any other cancellation.
 
+## Asynchronous calls
+
+Two things make a tree actually run in parallel rather than one child at a
+time, and both are properties of the tool call, not of the model.
+
+**A concurrent tool call is started, not awaited.** `ToolAnnotations.concurrent`
+marks a tool whose calls the run starts and leaves running while it goes on to
+the next call of the same reply; the results still join the transcript in call
+order once the last of them is in. The four `agent_*` tools are concurrent, so
+a reply that carries three `agent_start` calls starts three children at once
+and blocks only until the last of them has answered — the parent never waits
+for one child to finish before starting the next. A tool that writes what a
+later call reads stays sequential, which is the default; a plugin may mark its
+own long, independent calls concurrent in the same way.
+
+**A child started with `wait: false` reports by itself.** The start answers at
+once with a pid, and when the child ends its answer — or the reason it ended
+without one — is posted to the parent's inbox as a user-role message, in the
+same step as the process is marked finished, and read at the parent's next
+model turn like anything a person queued (`AgentProcessTools.deliveredChildPID`
+tells the two apart; the runtime marks such a child collected and emits
+`childFinished` for it, never `userMessage`). A parent never polls.
+`agent_result` still exists for taking the answer early; doing so drops the
+pending delivery so nothing is read twice.
+
+**A run does not end with children still working.** When the model answers
+with no tool calls while one of its children is alive, the run holds
+(`AgentProcessTools.awaitAnyChild`) until a message lands in its inbox and then
+asks the model once more, so the final answer accounts for every child it
+started. This is what lets a one-shot `pmai "…"` fan out without exiting on
+top of its own children, and what keeps a worker from answering its parent
+while its grandchildren are still running. A run out of turns ends anyway and
+leaves the delivery queued for the next turn on the same pid, which is how a
+chat still owns a child started three turns ago.
+
 ## Limits pause, they do not fail
 
 A run that reaches `limits.maxModelTurns`, `limits.maxTotalTokens`, or
@@ -174,7 +209,7 @@ implicitly.
   discarded afterwards. Which tools an agent has is always its definition's
   list, whatever its depth in the tree.
 
-Autocompact starts at 64k tokens by default. Changing it changes how the main agent thinks
+The switch is off by default. Turning it on changes how the main agent thinks
 about its work, costs an extra model round-trip per delegated task, and is worth
 it only when tool output is bulky. It is set per agent with `/set delegation`,
 persisted into the agent's definition, and readable and writable from the iOS
@@ -185,12 +220,17 @@ app through the same `MaiConfiguration` file.
 `subagent` mode with no configured subagents would give an agent nothing to
 delegate to. So when the parent does not name a child definition, MaiCore
 derives one: **`<parent>.worker`**, same provider and model, inheriting the
-parent's tool allow-list, always `inline` so it does not delegate further, and
-taking its instructions from the delegation prompt.
+parent's tool allow-list, its delegation mode and its subagents, and taking its
+instructions from the delegation prompt. A worker is a peer of its parent: it
+can hand part of its task down in turn, and `limits.maxSubagentDepth` is what
+stops the recursion. At the depth limit the agent tools are not offered at all
+(the child could not start anything, so the four schemas would be paid on every
+call for nothing), which also keeps the leaves of a deep tree cheap.
 
 This is what makes the feature usable without configuration: switch delegation
 on and the existing agent keeps working, with the option of moving bulky tool
-traffic one level down.
+traffic one level down, and a level below that when a piece of work is itself
+too big for one context.
 
 Naming a real definition instead (`agent: "researcher"`) is how you get a
 *different* model or a *narrower* tool set for the child — a cheap local model
@@ -216,15 +256,27 @@ disable agents` change that permission on the current agent; `/agent tools ID
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `agent_start` | `agent?`, `context`, `task`, `output`, `wait?`, `tools?` | pid, plus the answer when `wait` |
+| `agent_start` | `agent?`, `context`, `task`, `output`, `wait?`, `tools?` | pid, plus the answer when `wait`; without `wait`, the answer arrives later as a message |
 | `agent_status` | `pid?`, `tree?`, `log?` | one process, or the caller's subtree; with `pid` and `log`, that agent's recent transcript |
 | `agent_result` | `pid`, `wait?` | final answer, usage, stop reason; a child that stopped without answering returns the end of its transcript |
 | `agent_stop` | `pid`, `reason?` | what was stopped |
 
 `wait` defaults to **true**: the parent blocks until the child answers. That is
-the common case and the one the user asked for — the parent delegates, waits,
-and continues with one clean result. `wait: false` returns a pid immediately for
-fan-out, and the parent collects with `agent_result` later.
+the common case — the parent delegates, waits, and continues with one clean
+result — and because the call is concurrent, several starts in one reply are
+already a fan-out. `wait: false` returns a pid immediately and the answer is
+delivered to the parent's inbox when the child ends (see *Asynchronous calls*);
+`agent_result` collects it sooner when the parent cannot go on without it.
+
+The descriptions carry the guidance a model needs to use the family well: a
+child is self-contained (it cannot see the conversation, so `context` must
+carry what it needs), one concrete task each, independent tasks started in
+the same reply, and a child may start children of its own. With `use.plan` on
+(`/set use.plan`, the default) `agent_start` also asks for a short numbered
+plan before the first delegation of a request with several steps, saying which
+steps go to children and which of those run in parallel; a single question
+gets no plan. The sentence lives in the tool description, so it costs nothing
+for an agent that cannot start children.
 
 `agent_stop` kills a subtree, not just one node, because a half-stopped tree
 leaks running work nobody is waiting for.
@@ -320,7 +372,9 @@ forwards only depth-0 events to the editor.
 /set limits.maxTotalTokens 120k   token cap on a run (off to lift)
 /set retry.attempts N             repeats of a failed model call; /set retry.delay 5
 /set autocompact 120k             summarize older exchanges once the chat holds ~N tokens
+/effort LEVEL [TEXT]              how hard the model thinks (low, medium, high, xhigh, max), plus guidance
 /set use.agentsmd on              add the tree's AGENTS.md files (here up to the repo root) to every run's prompt
+/set use.plan off                 stop asking for a numbered plan before the first delegation (on by default)
 /continue                         run a paused, failed, or cancelled task on from where it stopped
 /edit delegation                  edit the brief template
 /edit worker                      edit the derived worker's instructions

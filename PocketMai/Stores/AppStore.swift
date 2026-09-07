@@ -328,6 +328,23 @@ final class AppStore: ObservableObject {
     return assistantMessage.id
   }
 
+  /// Appends what reached the chat mid-turn from elsewhere — the answers its
+  /// child agents delivered — as user messages with a fresh assistant message
+  /// after them, the way queued user messages are folded in. Nil for nothing.
+  func appendUserMessagesAndAssistant(_ texts: [String], in conversationID: UUID) -> UUID? {
+    guard !texts.isEmpty, let index = indexedConversationIndex(for: conversationID) else {
+      return nil
+    }
+    conversations[index].messages.append(
+      contentsOf: texts.map { ChatMessage(role: .user, text: $0) })
+    let assistantMessage = ChatMessage(role: .assistant, text: "")
+    conversations[index].messages.append(assistantMessage)
+    conversations[index].updatedAt = Date()
+    upsertSummary(for: conversations[index])
+    saveConversations()
+    return assistantMessage.id
+  }
+
   private func abandonResponse(in conversationID: UUID) {
     responseTasks[conversationID]?.cancel()
     responseTasks[conversationID] = nil

@@ -72,6 +72,35 @@ extension AppStore {
     Task { await agentSupervisor.complete(pid) }
   }
 
+  /// A child started without waiting reports into the chat's inbox. When the
+  /// model has answered with such a child still working, the turn holds here
+  /// instead of ending with the work unfinished — or breaks off for a message
+  /// the person queued meanwhile — then folds what the children delivered
+  /// into the chat as user messages with a fresh assistant message after
+  /// them, the way queued user messages are folded in. Nil when nothing is
+  /// on its way: a chat that never used an agent tool has no process and is
+  /// untouched.
+  func awaitAgentDeliveriesAndAppendAssistant(in conversationID: UUID) async throws -> UUID? {
+    guard let pid = agentProcessIDs[conversationID] else { return nil }
+    while !(await agentSupervisor.hasQueuedMessages(pid)) {
+      if hasQueuedUserMessages(in: conversationID) {
+        return injectQueuedUserMessagesAndAppendAssistant(in: conversationID)
+      }
+      let working = await agentSupervisor.tree().children(of: pid).contains {
+        !$0.state.isTerminal
+      }
+      guard working else { return nil }
+      try await Task.sleep(for: .milliseconds(100))
+    }
+    let delivered = await agentSupervisor.drainInbox(pid).filter { $0.role == .user }
+    for message in delivered {
+      if let child = AgentProcessTools.deliveredChildPID(of: message) {
+        await agentSupervisor.collect(child)
+      }
+    }
+    return appendUserMessagesAndAssistant(delivered.map(\.text), in: conversationID)
+  }
+
   /// Kills everything a conversation started, for a chat that is going away.
   func stopAgentProcesses(for conversationID: UUID, reason: String = "Chat closed") {
     guard let pid = agentProcessIDs.removeValue(forKey: conversationID) else { return }

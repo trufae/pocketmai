@@ -587,16 +587,25 @@ public struct ConfiguredUse: Codable, Equatable, Sendable {
   /// Adds the working tree's AGENTS.md files — from the working directory up
   /// to the repository root — to the system prompt of every run.
   public var agentsmd: Bool
+  /// Asks an agent that can start children to open a request of several
+  /// steps with a short numbered plan — which steps go to child agents and
+  /// which of those run in parallel — before its first `agent_start`; a
+  /// single question gets no plan. Carried by the `agent_start` description,
+  /// so it costs nothing where children are not allowed. On by default.
+  public var plan: Bool
 
-  public init(agentsmd: Bool = false) {
+  public init(agentsmd: Bool = false, plan: Bool = true) {
     self.agentsmd = agentsmd
+    self.plan = plan
   }
 
-  private enum CodingKeys: String, CodingKey { case agentsmd }
+  private enum CodingKeys: String, CodingKey { case agentsmd, plan }
 
   public init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
-    self.init(agentsmd: try container.decodeIfPresent(Bool.self, forKey: .agentsmd) ?? false)
+    self.init(
+      agentsmd: try container.decodeIfPresent(Bool.self, forKey: .agentsmd) ?? false,
+      plan: try container.decodeIfPresent(Bool.self, forKey: .plan) ?? true)
   }
 }
 

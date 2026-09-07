@@ -55,6 +55,71 @@ final class SubagentToolTests: XCTestCase {
       [AgentProfile.stockName, "Researcher"])
   }
 
+  func testThePlanSentenceFollowsTheSetting() throws {
+    var settings = AppSettings.defaults
+    settings.agents[0].canSpawnSubagents = true
+    XCTAssertTrue(settings.plansBeforeDelegating)
+    let planned = try XCTUnwrap(
+      SubagentTool.definitions(for: Conversation(), settings: settings).first)
+    XCTAssertTrue(planned.description.contains("numbered plan"), planned.description)
+    settings.plansBeforeDelegating = false
+    let unplanned = try XCTUnwrap(
+      SubagentTool.definitions(for: Conversation(), settings: settings).first)
+    XCTAssertFalse(unplanned.description.contains("numbered plan"), unplanned.description)
+
+    // Settings saved before the switch existed load with it on.
+    let legacy = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
+    XCTAssertTrue(legacy.plansBeforeDelegating)
+    let off = try JSONDecoder().decode(
+      AppSettings.self, from: Data(#"{"plansBeforeDelegating":false}"#.utf8))
+    XCTAssertFalse(off.plansBeforeDelegating)
+  }
+
+  func testEveryAgentToolIsAnAsynchronousCall() {
+    var settings = AppSettings.defaults
+    settings.agents[0].canSpawnSubagents = true
+    let definitions = SubagentTool.definitions(for: Conversation(), settings: settings)
+    XCTAssertEqual(Set(definitions.map(\.name)), AgentProcessTools.toolNames)
+    XCTAssertTrue(definitions.allSatisfy { $0.annotations.concurrent })
+  }
+
+  func testAChildIsAPeerUntilTheLeafDepth() throws {
+    var settings = AppSettings.defaults
+    settings.agents[0].canSpawnSubagents = true
+    settings.addAgent(named: "Coder")
+    settings.selectAgent(AgentProfile.stockID)
+    let coderID = try XCTUnwrap(settings.agents.first { $0.name == "Coder" }?.id)
+    let coderIndex = try XCTUnwrap(settings.agents.firstIndex { $0.id == coderID })
+    settings.agents[coderIndex].canSpawnSubagents = true
+
+    // One level down a worker keeps the permission and sees the tools.
+    let worker = SubagentTool.childSettings(
+      from: settings, agentID: AgentProfile.stockID, depth: 1)
+    XCTAssertEqual(worker.selectedAgentID, AgentProfile.stockID)
+    XCTAssertTrue(worker.selectedAgent.canSpawnSubagents)
+    XCTAssertFalse(SubagentTool.definitions(for: Conversation(), settings: worker).isEmpty)
+
+    // At the leaf depth it could not start anything, so the tools are withheld.
+    let leaf = SubagentTool.childSettings(
+      from: settings, agentID: AgentProfile.stockID, depth: SubagentTool.maxDepth)
+    XCTAssertFalse(leaf.selectedAgent.canSpawnSubagents)
+    XCTAssertTrue(SubagentTool.definitions(for: Conversation(), settings: leaf).isEmpty)
+
+    // A named profile is selected in the copy and follows the same rule.
+    let named = SubagentTool.childSettings(from: settings, agentID: coderID, depth: 1)
+    XCTAssertEqual(named.selectedAgentID, coderID)
+    XCTAssertTrue(named.selectedAgent.canSpawnSubagents)
+    let namedLeaf = SubagentTool.childSettings(
+      from: settings, agentID: coderID, depth: SubagentTool.maxDepth)
+    XCTAssertEqual(namedLeaf.selectedAgentID, coderID)
+    XCTAssertFalse(namedLeaf.selectedAgent.canSpawnSubagents)
+
+    // The caller's own settings are untouched.
+    XCTAssertEqual(settings.selectedAgentID, AgentProfile.stockID)
+    XCTAssertTrue(settings.selectedAgent.canSpawnSubagents)
+    XCTAssertTrue(settings.agents[coderIndex].canSpawnSubagents)
+  }
+
   func testAWorkerTranscriptKeepsEveryTurnInOrder() {
     var conversation = Conversation()
     conversation.messages = [

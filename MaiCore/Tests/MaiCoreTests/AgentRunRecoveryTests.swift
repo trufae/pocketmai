@@ -178,6 +178,10 @@ func queuedChildrenStartWhenSlotFrees() async throws {
         ]),
       stopReason: .toolCall),
     textReply("Both handed out"),
+    // The run holds for its background children and asks again as each
+    // answer is delivered.
+    textReply("First delivered"),
+    textReply("Both delivered"),
   ])
   let childProvider = SlowChildProvider()
   let recorder = RecoveryEventRecorder()
@@ -206,7 +210,8 @@ func queuedChildrenStartWhenSlotFrees() async throws {
     await recorder.append(event)
   }
 
-  #expect(result.response.text == "Both handed out")
+  #expect(result.transcript.contains { $0.role == .assistant && $0.text == "Both handed out" })
+  #expect(result.response.text == "Both delivered")
   let starts = result.transcript.flatMap(\.toolResults)
   #expect(starts.count == 2)
   #expect(!starts[1].isError)
@@ -217,9 +222,9 @@ func queuedChildrenStartWhenSlotFrees() async throws {
     starts[0].structuredContent?.objectValue?["pid"]?.stringValue.flatMap(AgentPID.init(text:)))
   let secondPID = try #require(
     starts[1].structuredContent?.objectValue?["pid"]?.stringValue.flatMap(AgentPID.init(text:)))
-  // The first child is still busy, so the second is parked, not running.
-  #expect(await runtime.supervisor.info(secondPID)?.state == .queued)
-  #expect(await runtime.supervisor.liveProcesses().contains { $0.pid == secondPID })
+  // Both answers were delivered before the run ended, so neither is live.
+  #expect(await runtime.supervisor.info(secondPID)?.isCollected == true)
+  #expect(!(await runtime.supervisor.liveProcesses().contains { $0.pid == secondPID }))
 
   try await waitForRecovery(timeout: .seconds(5)) {
     let first = await runtime.supervisor.info(firstPID)?.state

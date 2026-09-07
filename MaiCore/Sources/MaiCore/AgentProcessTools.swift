@@ -59,21 +59,27 @@ public enum AgentProcessTools {
 
   /// The four definitions, worded for what this parent may do: name one of
   /// `agents`, run a worker with its own tools when `delegating`, or both.
+  /// `planFirst` adds the request to open a multi-step task with a plan
+  /// (`use.plan`). Every one of them is a concurrent call: the run starts
+  /// them without waiting, so several children started in one reply work at
+  /// once and a blocking start never holds back the calls after it.
   public static func definitions(
     offering agents: [OfferedAgent],
-    delegating: Bool
+    delegating: Bool,
+    planFirst: Bool = false
   ) -> [ToolDefinition] {
     let offered = agents.sorted { $0.id < $1.id }
     var startProperties: [String: JSONValue] = [
       "context": .object([
         "type": .string("string"),
         "description": .string(
-          "What it cannot discover on its own: facts, decisions, and paths already found. It cannot see this conversation."
+          "Everything it must know and cannot find out: facts established, decisions made, paths found. It cannot see this conversation."
         ),
       ]),
       "task": .object([
         "type": .string("string"),
-        "description": .string("The single thing to do."),
+        "description": .string(
+          "The one concrete thing to do, complete enough to be done standalone."),
       ]),
       "output": .object([
         "type": .string("string"),
@@ -84,7 +90,7 @@ public enum AgentProcessTools {
       "wait": .object([
         "type": .string("boolean"),
         "description": .string(
-          "Wait for the answer (default); false returns a pid to collect with \(resultToolName)."
+          "Wait for the answer (default). false returns a pid at once and the answer arrives later as a message in this conversation."
         ),
       ]),
       "tools": .object([
@@ -107,10 +113,16 @@ public enum AgentProcessTools {
     }
 
     let names = offered.map(\.id)
-    let startDescription =
+    var startDescription =
       delegating
-      ? "Run a task in a child agent with your tools; only its answer enters this conversation. Use it for work with bulky tool output, not for small calls."
-      : "Run one task in a child agent with a transcript of its own; only its answer comes back. Agents: \(names.joined(separator: ", "))."
+      ? "Run one self-contained task in a child agent with your tools and a transcript of its own: it cannot see this conversation, and only its answer comes back, so your context stays small. Use it for work whose tool output would bloat your context, not for one small call."
+      : "Run one self-contained task in a child agent with a transcript of its own: it cannot see this conversation, and only its answer comes back. Agents: \(names.joined(separator: ", "))."
+    startDescription +=
+      " Independent tasks: start them all in the same reply, they run at once. A child may start children of its own."
+    if planFirst {
+      startDescription +=
+        " For a request with several steps, write a short numbered plan in your reply before the first \(startToolName), saying which steps go to children and which of those run in parallel; a single question needs no plan."
+    }
 
     return [
       ToolDefinition(
@@ -127,6 +139,7 @@ public enum AgentProcessTools {
           destructive: false,
           idempotent: false,
           openWorld: true,
+          concurrent: true,
           approval: .confirm)),
       ToolDefinition(
         name: statusToolName,
@@ -137,7 +150,8 @@ public enum AgentProcessTools {
           "properties": .object([
             "pid": .object([
               "type": .string("string"),
-              "description": .string("An agent's pid, the number after # (2 for '#2 main.worker')."),
+              "description": .string(
+                "An agent's pid, the number after # (2 for '#2 main.worker')."),
             ]),
             "tree": .object([
               "type": .string("boolean"),
@@ -156,11 +170,12 @@ public enum AgentProcessTools {
           destructive: false,
           idempotent: true,
           openWorld: false,
+          concurrent: true,
           approval: .automatic)),
       ToolDefinition(
         name: resultToolName,
         description:
-          "Take the answer of a child started with wait false, by pid; waits for it unless wait is false. A failed child returns its error and the end of its transcript.",
+          "Collect the answer of a child started with wait false, by pid, when you need it before it arrives on its own; waits for it unless wait is false. A failed child returns its error and the end of its transcript.",
         inputSchema: .object([
           "type": .string("object"),
           "properties": .object([
@@ -181,6 +196,7 @@ public enum AgentProcessTools {
           destructive: false,
           idempotent: false,
           openWorld: false,
+          concurrent: true,
           approval: .automatic)),
       ToolDefinition(
         name: stopToolName,
@@ -206,6 +222,7 @@ public enum AgentProcessTools {
           destructive: false,
           idempotent: true,
           openWorld: false,
+          concurrent: true,
           approval: .automatic)),
     ]
   }
@@ -225,7 +242,9 @@ public enum AgentProcessTools {
     /// asynchronous; the others wait unless told not to.
     public var wait: Bool
 
-    public init(brief: AgentTaskBrief, agent: String? = nil, tools: Set<String>? = nil, wait: Bool) {
+    public init(
+      brief: AgentTaskBrief, agent: String? = nil, tools: Set<String>? = nil, wait: Bool
+    ) {
       self.brief = brief
       self.agent = agent
       self.tools = tools
@@ -336,20 +355,24 @@ public enum AgentProcessTools {
       }
       let child = try await body()
       // A body that answered after it was stopped is recorded as stopped:
-      // the supervisor already told everyone why it ended.
+      // the supervisor already told everyone why it ended. A background
+      // child's answer goes to its parent's inbox in the same step.
       try Task.checkCancellation()
-      await supervisor.finish(pid, result: child, announce: background)
+      await supervisor.finish(pid, result: child, announce: background, deliver: background)
       return child
     } catch is CancellationError {
-      await supervisor.fail(pid, state: .cancelled, message: "Cancelled", announce: background)
+      await supervisor.fail(
+        pid, state: .cancelled, message: "Cancelled", announce: background, deliver: background)
       throw CancellationError()
     } catch let deadline as QueueDeadlineExceeded {
       await supervisor.fail(
-        pid, state: .interrupted, message: deadline.message, announce: background)
+        pid, state: .interrupted, message: deadline.message, announce: background,
+        deliver: background)
       throw AgentRuntimeError.limitExceeded("time")
     } catch {
       await supervisor.fail(
-        pid, state: .failed, message: error.localizedDescription, announce: background)
+        pid, state: .failed, message: error.localizedDescription, announce: background,
+        deliver: background)
       throw error
     }
   }
@@ -413,6 +436,85 @@ public enum AgentProcessTools {
       if let deadline, ContinuousClock.now >= deadline.instant {
         throw QueueDeadlineExceeded(message: "\(deadline.interruption.summary) while queued")
       }
+      try await Task.sleep(for: .milliseconds(100))
+    }
+  }
+
+  // MARK: - Asynchronous children
+
+  /// A child started with `wait` false is an asynchronous tool call: the
+  /// start answers at once with a pid, and the answer — or the reason the
+  /// child ended without one — reaches the parent later as a message in its
+  /// inbox, read at its next model turn like anything a person queued. So a
+  /// parent never polls, and a parent whose model answered while children
+  /// were still working holds for them (`awaitAnyChild`) instead of ending
+  /// with the work unfinished. The message id names the child, so the run
+  /// can mark the answer collected and tell a delivery from a person.
+  static let deliveryIDPrefix = "agent-delivery:"
+
+  /// The message a finished background child leaves for its parent.
+  public static func deliveryMessage(
+    pid: AgentPID,
+    agentID: String,
+    result: AgentResult
+  ) -> AgentMessage {
+    let body = childResult(callID: "", pid: pid, agentID: agentID, result: result).text
+    let text =
+      result.interruption == nil
+      ? "Agent \(pid) (\(agentID)) finished. Its answer:\n\(body)" : body
+    return AgentMessage(id: deliveryID(for: pid), role: .user, content: text)
+  }
+
+  /// The message a background child that produced no result leaves.
+  public static func deliveryMessage(
+    pid: AgentPID,
+    agentID: String,
+    ended reason: String
+  ) -> AgentMessage {
+    AgentMessage(
+      id: deliveryID(for: pid),
+      role: .user,
+      content: "Agent \(pid) (\(agentID)) ended without answering: \(reason).")
+  }
+
+  private static func deliveryID(for pid: AgentPID) -> String {
+    "\(deliveryIDPrefix)\(pid.rawValue):\(UUID().uuidString)"
+  }
+
+  /// The child whose end `message` delivers, or nil for a message a person
+  /// queued.
+  public static func deliveredChildPID(of message: AgentMessage) -> AgentPID? {
+    guard message.id.hasPrefix(deliveryIDPrefix) else { return nil }
+    let rest = message.id.dropFirst(deliveryIDPrefix.count)
+    guard let colon = rest.firstIndex(of: ":") else { return nil }
+    return AgentPID(text: String(rest[..<colon]))
+  }
+
+  /// Drops the delivery waiting for `parent` about `child`, once the parent
+  /// took the answer through `agent_result` instead.
+  public static func discardDelivery(
+    of child: AgentPID,
+    for parent: AgentPID,
+    supervisor: AgentSupervisor
+  ) async {
+    for queued in await supervisor.queuedMessages(for: parent)
+    where deliveredChildPID(of: queued.message) == child {
+      await supervisor.discardQueuedMessage(id: queued.id)
+    }
+  }
+
+  /// Holds while `pid` has a child still working and nothing in its inbox,
+  /// and answers whether a message is waiting to be read. A run calls it when
+  /// its model has answered: true means go round once more, false means
+  /// nothing is on its way and the run may end.
+  public static func awaitAnyChild(
+    of pid: AgentPID,
+    supervisor: AgentSupervisor
+  ) async throws -> Bool {
+    while true {
+      if await supervisor.hasQueuedMessages(pid) { return true }
+      let working = await supervisor.tree().children(of: pid).contains { !$0.state.isTerminal }
+      guard working else { return false }
       try await Task.sleep(for: .milliseconds(100))
     }
   }
@@ -681,6 +783,7 @@ public enum AgentProcessTools {
 
     if let finished = await supervisor.result(pid) {
       await supervisor.collect(pid)
+      if let caller { await discardDelivery(of: pid, for: caller, supervisor: supervisor) }
       return childResult(callID: callID, pid: pid, agentID: finished.agentID, result: finished)
     }
     guard let handle = await supervisor.handle(pid) else {
@@ -703,6 +806,7 @@ public enum AgentProcessTools {
     }
     do {
       let child = try await awaitChild(handle, pid: pid, supervisor: supervisor)
+      if let caller { await discardDelivery(of: pid, for: caller, supervisor: supervisor) }
       return childResult(callID: callID, pid: pid, agentID: child.agentID, result: child)
     } catch is CancellationError {
       return failure(callID: callID, "agent \(pid) was cancelled.")
@@ -737,5 +841,35 @@ public enum AgentProcessTools {
       structuredContent: .object([
         "stopped": .array(stopped.map { .string(String($0.rawValue)) })
       ]))
+  }
+}
+
+extension AgentSupervisor {
+  /// `finish`, and for a child started without waiting the delivery of its
+  /// answer to its parent's inbox, in one step — so a parent looking for
+  /// either sees both at once.
+  func finish(_ pid: AgentPID, result: AgentResult, announce: Bool, deliver: Bool) {
+    finish(pid, result: result, announce: announce)
+    guard deliver, let info = info(pid), let parent = info.parent else { return }
+    post(
+      AgentProcessTools.deliveryMessage(pid: pid, agentID: info.agentID, result: result),
+      to: parent)
+  }
+
+  /// `fail`, and the delivery of the reason to the parent of a child started
+  /// without waiting; a stop's own reason wins over the run's report.
+  func fail(
+    _ pid: AgentPID,
+    state: AgentProcessState,
+    message: String,
+    announce: Bool,
+    deliver: Bool
+  ) {
+    fail(pid, state: state, message: message, announce: announce)
+    guard deliver, let info = info(pid), let parent = info.parent else { return }
+    post(
+      AgentProcessTools.deliveryMessage(
+        pid: pid, agentID: info.agentID, ended: info.failure ?? message),
+      to: parent)
   }
 }

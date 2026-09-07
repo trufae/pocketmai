@@ -650,7 +650,14 @@ public enum ResponseFormat: Codable, Equatable, Sendable {
 public struct GenerationOptions: Codable, Equatable, Sendable {
   public var temperature: Double?
   public var maxOutputTokens: Int?
+  /// A `ReasoningEffort` name (`low` … `max`), which the runtime turns into a
+  /// system prompt section and a provider into the fields its API family
+  /// understands; or a provider's own value, sent as `reasoning_effort` as it
+  /// is.
   public var reasoningEffort: String?
+  /// Extra guidance for the system prompt that goes with the effort, as
+  /// `/effort LEVEL TEXT` sets it.
+  public var reasoningGuidance: String?
   public var includeStreamUsage: Bool
   public var additional: [String: JSONValue]
 
@@ -658,18 +665,21 @@ public struct GenerationOptions: Codable, Equatable, Sendable {
     temperature: Double? = nil,
     maxOutputTokens: Int? = nil,
     reasoningEffort: String? = nil,
+    reasoningGuidance: String? = nil,
     includeStreamUsage: Bool = true,
     additional: [String: JSONValue] = [:]
   ) {
     self.temperature = temperature
     self.maxOutputTokens = maxOutputTokens
     self.reasoningEffort = reasoningEffort
+    self.reasoningGuidance = reasoningGuidance
     self.includeStreamUsage = includeStreamUsage
     self.additional = additional
   }
 
   private enum CodingKeys: String, CodingKey {
-    case temperature, maxOutputTokens, reasoningEffort, includeStreamUsage, additional
+    case temperature, maxOutputTokens, reasoningEffort, reasoningGuidance, includeStreamUsage
+    case additional
   }
 
   public init(from decoder: Decoder) throws {
@@ -678,6 +688,7 @@ public struct GenerationOptions: Codable, Equatable, Sendable {
       temperature: try container.decodeIfPresent(Double.self, forKey: .temperature),
       maxOutputTokens: try container.decodeIfPresent(Int.self, forKey: .maxOutputTokens),
       reasoningEffort: try container.decodeIfPresent(String.self, forKey: .reasoningEffort),
+      reasoningGuidance: try container.decodeIfPresent(String.self, forKey: .reasoningGuidance),
       includeStreamUsage: try container.decodeIfPresent(Bool.self, forKey: .includeStreamUsage)
         ?? true,
       additional: try container.decodeIfPresent(

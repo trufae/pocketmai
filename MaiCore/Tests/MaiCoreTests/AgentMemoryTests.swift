@@ -239,9 +239,10 @@ func memoryReachesTopLevelRunsOnly() async throws {
   #expect(parent.messages[1].text.contains("Prefers Swift."))
   // The stored transcript is untouched: memory is run-scoped context.
   #expect(parent.messages[0].text == "Be terse.")
-  // Both sides carry the file tool now; only the parent can start agents.
+  // Both sides carry the file tool, and the agent family too: the worker is
+  // a peer, so its brief is what tells its request apart.
   let worker = try #require(
-    requests.first { !$0.tools.contains { $0.name == AgentRuntime.agentStartToolName } })
+    requests.first { $0.messages.contains { $0.text.contains("running as agent '") } })
   #expect(!worker.messages.contains { $0.text.contains("Prefers Swift.") })
 
   // Clearing it costs the next run nothing.

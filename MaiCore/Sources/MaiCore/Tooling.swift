@@ -12,6 +12,13 @@ public struct ToolAnnotations: Codable, Equatable, Sendable {
   public var destructive: Bool
   public var idempotent: Bool
   public var openWorld: Bool
+  /// An asynchronous tool call: the run starts it and goes on to the next
+  /// call of the same reply instead of waiting for it, so every concurrent
+  /// call a reply makes runs at once — `agent_start` above all, so several
+  /// children started in one reply work side by side. Results still join the
+  /// transcript in call order. A tool that writes what a later call reads
+  /// stays sequential, which is the default.
+  public var concurrent: Bool
   public var approval: ToolApprovalRequirement
 
   public init(
@@ -20,6 +27,7 @@ public struct ToolAnnotations: Codable, Equatable, Sendable {
     destructive: Bool = false,
     idempotent: Bool = false,
     openWorld: Bool = true,
+    concurrent: Bool = false,
     approval: ToolApprovalRequirement = .confirm
   ) {
     self.title = title
@@ -27,7 +35,27 @@ public struct ToolAnnotations: Codable, Equatable, Sendable {
     self.destructive = destructive
     self.idempotent = idempotent
     self.openWorld = openWorld
+    self.concurrent = concurrent
     self.approval = approval
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case title, readOnly, destructive, idempotent, openWorld, concurrent, approval
+  }
+
+  /// Every key is optional on the way in, so annotations written before
+  /// `concurrent` existed — plugin manifests, saved tool catalogs — decode.
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      title: try container.decodeIfPresent(String.self, forKey: .title),
+      readOnly: try container.decodeIfPresent(Bool.self, forKey: .readOnly) ?? false,
+      destructive: try container.decodeIfPresent(Bool.self, forKey: .destructive) ?? false,
+      idempotent: try container.decodeIfPresent(Bool.self, forKey: .idempotent) ?? false,
+      openWorld: try container.decodeIfPresent(Bool.self, forKey: .openWorld) ?? true,
+      concurrent: try container.decodeIfPresent(Bool.self, forKey: .concurrent) ?? false,
+      approval: try container.decodeIfPresent(ToolApprovalRequirement.self, forKey: .approval)
+        ?? .confirm)
   }
 }
 
