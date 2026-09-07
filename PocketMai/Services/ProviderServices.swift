@@ -1621,6 +1621,7 @@ enum OpenAICompatibleProvider {
   }
 
   private static func mapCoreError(_ error: Error) -> ChatProviderError {
+    if error is MaiOpenAI.OpenAICompatibleEmptyReply { return .emptyResponse }
     guard let error = error as? MaiOpenAI.OpenAICompatibleProviderError else {
       return .providerRequestFailed(error.localizedDescription)
     }

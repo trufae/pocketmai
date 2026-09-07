@@ -742,8 +742,6 @@ public enum OpenAICompatibleProviderError: LocalizedError, Equatable, Sendable {
   case invalidBaseURL(String)
   case missingModel
   case emptyResponse
-  /// The call succeeded but the model produced neither text nor a tool call.
-  case emptyModelReply
   case invalidResponse(String)
   case providerFailure(String)
   case invalidToolArguments(tool: String, arguments: String)
@@ -756,7 +754,7 @@ public enum OpenAICompatibleProviderError: LocalizedError, Equatable, Sendable {
       "Invalid OpenAI-compatible base URL: \(value)"
     case .missingModel:
       "An OpenAI-compatible model must be selected. Use /model NAME or --model NAME."
-    case .emptyResponse, .emptyModelReply:
+    case .emptyResponse:
       "The provider returned an empty response."
     case .invalidResponse(let message), .providerFailure(let message),
       .unsupportedContent(let message):
