@@ -526,7 +526,12 @@ public actor AgentRuntime {
       await supervisor.note(pid, usage: totalUsage)
       await budget.record(tokens: usage.totalTokens)
 
-      if let textToolMode, !toolBudgetExhausted {
+      // A server such as Ollama parses the model's own function-call syntax
+      // into native tool calls even when the request offered no tools. Those
+      // calls are as good as a text block and run below; reading only the text
+      // would mistake the turn for one without a call and repeat the repair
+      // feedback until the turn limit.
+      if let textToolMode, !toolBudgetExhausted, providerResponse.message.toolCalls.isEmpty {
         let decision = AgentToolLoopPolicy.evaluate(
           response: providerResponse.message.text,
           tools: definitions,

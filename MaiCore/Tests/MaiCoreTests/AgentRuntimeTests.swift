@@ -861,6 +861,46 @@ func textToolRepairAndRespond() async throws {
   #expect(await provider.requests.first?.messages.contains { $0.text.contains("respond") } == true)
 }
 
+@Test("Text fallback runs native tool calls a server parsed out of the model's own syntax")
+func textToolAcceptsNativeCalls() async throws {
+  let provider = ScriptedProvider(
+    responses: [
+      ProviderResponse(
+        message: AgentMessage(
+          role: .assistant,
+          content: [
+            .toolCall(
+              ToolCall(id: "srv-1", name: "echo", arguments: .object(["text": .string("hi")])))
+          ]),
+        stopReason: .toolCall),
+      ProviderResponse(message: .assistant("Echoed: hi"), stopReason: .stop),
+    ],
+    capabilities: [.streaming])
+  let runtime = AgentRuntime()
+  try await runtime.register(provider)
+  try await runtime.register(
+    tool: ClosureTool(
+      definition: ToolDefinition(
+        name: "echo", description: "Echo",
+        parameters: [ToolParameterDef(name: "text", type: "string", description: "Text", required: true)])
+    ) { arguments, _ in
+      ToolOutput(text: arguments.objectValue?["text"]?.stringValue ?? "")
+    })
+
+  let result = try await runtime.run(
+    AgentRequest(
+      provider: "scripted",
+      model: "fixture",
+      messages: [.user("echo hi")],
+      toolNames: ["echo"],
+      toolCallingStrategy: .text))
+
+  #expect(result.response.text == "Echoed: hi")
+  #expect(result.modelTurns == 2)
+  #expect(result.toolCalls == 1)
+  #expect(!result.transcript.contains { $0.text.contains("missing_tool_call") })
+}
+
 @Test("A call without reported usage is estimated, marked as such, and still counts against the budget")
 func estimatedUsage() async throws {
   let provider = ScriptedProvider(responses: [
