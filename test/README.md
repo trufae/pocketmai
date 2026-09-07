@@ -55,4 +55,4 @@ instructions to compare prompts.
 | 12-config-edit | change one key, add one key in a JSON file | read, patch |
 | 13-big-log | count and rank errors in a 4000-line log | run (grep/sort), never a full read |
 
-The findings from the first sweeps are in `LALA.md` at the repository root.
+The findings and the todo list live in `PLAN.md` next to this file.

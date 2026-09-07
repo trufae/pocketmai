@@ -11,7 +11,7 @@ the other way MaiCore keeps a transcript small.
 
 Without the proxy, every request carries the JSON schema of every enabled tool.
 The standard coding set (`files`, `run`, `todo`) is 17 tools and about 8.9k
-characters, roughly 2.2k tokens, after the catalog cut recorded in `LALA.md`
+characters, roughly 2.2k tokens, after the catalog cut recorded in `test/PLAN.md`
 (it was 23 tools and 16k characters before), and it is resent on every model
 turn of every run because the schemas live outside the conversation.
 
@@ -48,7 +48,7 @@ the less there is for the proxy to save.
 
 Thirteen coding tasks, `gemma4:31b` on Ollama cloud. The first table is the
 initial study, before any fix, on the old 23-tool catalog; the second is the
-same benchmark on the current build (17-tool catalog, every fix in `LALA.md`
+same benchmark on the current build (17-tool catalog, every fix in `test/PLAN.md`
 applied), two runs per mode so the run-to-run noise is visible.
 
 | initial study (23 tools) | solved | model calls | prompt tokens | first-call prompt |
@@ -138,7 +138,7 @@ the proxy's: the same tasks fail natively now and then.
   schema cost grows with the catalog; the proxy's cost grows only with what a
   task actually asks about.
 - **Small, stable coding set: the hybrid, or nothing.** The 17 standard tools
-  cost about 2.2k tokens per call after the catalog cut in `LALA.md`; the
+  cost about 2.2k tokens per call after the catalog cut in `test/PLAN.md`; the
   hybrid brings that to about 1k plus the generated `list-tools` description,
   at the same pass rate. The pure proxy is not worth its failure modes on a
   catalog this small.

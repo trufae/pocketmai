@@ -1,4 +1,4 @@
-# LALA — making pmai solve prompts faster with fewer tokens
+# Plan — making pmai solve prompts faster with fewer tokens
 
 Findings from running 13 sample coding workflows (`test/cases`) through pmai on
 `gemma4:31b` (Ollama cloud, `env-ollamacloud.sh`) with a logging proxy between
