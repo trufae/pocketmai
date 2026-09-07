@@ -804,4 +804,6 @@ extension ProviderStopReason {
 
 /// Only a reply with nothing in it is a repairable turn; an empty HTTP body is
 /// still a transport failure.
-public struct OpenAICompatibleEmptyReply: ProviderEmptyResponseError {}
+public struct OpenAICompatibleEmptyReply: ProviderEmptyResponseError, LocalizedError {
+  public var errorDescription: String? { "The provider returned an empty response." }
+}

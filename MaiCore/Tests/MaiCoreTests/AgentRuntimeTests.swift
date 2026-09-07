@@ -252,7 +252,7 @@ func repeatedCallWithdrawsTools() async throws {
   // The fourth identical call trips the guard; the fifth turn is offered no tools.
   #expect(!requests[3].tools.isEmpty)
   #expect(requests[4].tools.isEmpty)
-  #expect(requests[4].messages.contains { $0.text.contains("repeated with identical arguments") })
+  #expect(requests[4].messages.contains { $0.text.contains("made no progress") })
   #expect(result.transcript.contains { $0.toolResults.contains { $0.text.contains("already run 3 times") } })
 }
 
@@ -1089,6 +1089,41 @@ func emptyReplyAfterToolResultIsRepaired() async throws {
   #expect(result.modelTurns == 3)
   #expect(result.transcript.contains { $0.text.contains("missing_tool_call") })
   #expect(await provider.requests.count == 3)
+}
+
+@Test("Three empty replies in a row withdraw the tools and force an answer")
+func repeatedEmptyRepliesWithdrawTools() async throws {
+  let provider = ScriptedProvider(
+    responses: [
+      ProviderResponse(
+        message: AgentMessage(
+          role: .assistant,
+          content: [.toolCall(ToolCall(id: "c1", name: "probe", arguments: .object([:])))]),
+        stopReason: .toolCall),
+      ProviderResponse(message: .assistant("Nothing more I can do."), stopReason: .stop),
+    ],
+    failures: [1: EmptyReplyFailure(), 2: EmptyReplyFailure(), 3: EmptyReplyFailure()])
+  let runtime = AgentRuntime()
+  try await runtime.register(provider)
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "probe", description: "Probe")) { _, _ in
+      ToolOutput(text: "42")
+    })
+
+  let result = try await runtime.run(
+    AgentRequest(
+      provider: "scripted",
+      model: "fixture",
+      messages: [.user("probe")],
+      toolNames: ["probe"],
+      retry: AgentRetryPolicy(attempts: 2, delaySeconds: 0)))
+
+  #expect(result.response.text == "Nothing more I can do.")
+  let requests = await provider.requests
+  #expect(requests.count == 5)
+  #expect(!requests[3].tools.isEmpty)
+  #expect(requests[4].tools.isEmpty)
+  #expect(requests[4].messages.contains { $0.text.contains("made no progress") })
 }
 
 private struct EmptyReplyFailure: ProviderEmptyResponseError {}
