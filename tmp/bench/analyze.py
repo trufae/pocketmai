@@ -96,7 +96,17 @@ def analyze_case(case_dir):
                 tool_errors += 1
     names = Counter(n for n, _ in tool_calls)
     repeats = sum(c - 1 for c in Counter(tool_calls).values() if c > 1)
+    # KV-cache view: how many requests changed something before the messages
+    # the previous request already carried (0 means every call only appended).
+    prefix_changed = 0
+    prev = None
+    for call in calls:
+        msgs = (call.get("request") or {}).get("messages") or []
+        if prev is not None and msgs[:len(prev)] != prev:
+            prefix_changed += 1
+        prev = msgs
     return {
+        "prefix_changed": prefix_changed,
         "case": meta["case"],
         "pass": meta.get("check"),
         "calls": len(calls),
@@ -130,7 +140,7 @@ def fmt_k(n):
 def print_summary(run_dir, rows):
     print(f"\n## {run_dir.name}")
     print()
-    print("| case | ok | calls | tool calls | prompt Σ | peak | compl | repeat | tool err | ctx tool-out | file part | struct dup | time |")
+    print("| case | ok | calls | tool calls | prompt Σ | peak | compl | repeat | tool err | ctx tool-out | file part | prefix Δ | time |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     tot = Counter()
     for r in rows:
@@ -139,13 +149,13 @@ def print_summary(run_dir, rows):
             ok += "⏱"
         print(f"| {r['case']} | {ok} | {r['calls']} | {r['tool_calls']} | {fmt_k(r['prompt_sum'])} | {fmt_k(r['prompt_peak'])} | "
               f"{r['completion']} | {r['repeats']} | {r['tool_errors']} | {fmt_k(r['tool_result_chars'])} | "
-              f"{fmt_k(r['file_chars'])} | {fmt_k(r['structured_chars'])} | {r['elapsed']}s |")
-        for key in ("calls", "tool_calls", "prompt_sum", "completion", "repeats", "tool_errors"):
+              f"{fmt_k(r['file_chars'])} | {r['prefix_changed']} | {r['elapsed']}s |")
+        for key in ("calls", "tool_calls", "prompt_sum", "completion", "repeats", "tool_errors", "prefix_changed"):
             tot[key] += r[key]
         tot["pass"] += 1 if r["pass"] else 0
         tot["elapsed"] += r["elapsed"] or 0
     print(f"| **total** | {tot['pass']}/{len(rows)} | {tot['calls']} | {tot['tool_calls']} | {fmt_k(tot['prompt_sum'])} | | "
-          f"{tot['completion']} | {tot['repeats']} | {tot['tool_errors']} | | | | {tot['elapsed']:.0f}s |")
+          f"{tot['completion']} | {tot['repeats']} | {tot['tool_errors']} | | | {tot['prefix_changed']} | {tot['elapsed']:.0f}s |")
     names = Counter()
     for r in rows:
         names.update(r["tool_names"])

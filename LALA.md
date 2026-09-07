@@ -195,23 +195,28 @@ there are two different optimisation targets that should be selectable and
 measured separately, context size (rewrite/prune old messages) versus cache
 reuse (append only, never touch old messages).
 
-- [ ] **Add `context.mode = size | cache` to the agent config** and make the
-  benchmark report both prompt tokens and a *prefix-reuse* figure (requests
-  whose messages are a strict extension of the previous request's; see
-  `analyze.py`, which already computes it). In `cache` mode nothing before the
-  last user message may change: no compaction rewrite mid-run, no refresh of
-  the project-instructions block during a run, volatile blocks (queued user
-  messages, repair notes) only appended. In `size` mode the runtime may prune.
-- [ ] **File contents are the dominant conversation cost and never leave.**
-  In `01-explain` 2.9k of the 3.6k characters of tool output in the final
-  window are file bodies already summarised by the answer. Proposal (the
-  user's): once a read has been consumed (the model edited, answered, or read
-  the next file), replace the body in the transcript with a reference,
-  `<file name="cli.py" lines="1-24" sha="…" />`, that the model can re-open
-  with `files_read` if it needs it again. Re-reads after edits are rare
-  (1–3 per 13 tasks), so the reference is almost always enough. Implement as a
-  transcript edit (`AgentTranscriptEdit.rewrite`) applied by the runtime in
-  `size` mode, not as a tool the model must remember to call.
+- [x] **`context: cache | size` on the agent** (`f843dc7`, `8455b59`; `/set
+  context`, runner `--context`). `cache`, the default, never changes a sent
+  message; `size` prunes as described below. `analyze.py` reports a *prefix Δ*
+  column (requests that changed something the previous request already
+  carried): 0 in cache mode on every run, 1–4 in size mode, all of them the
+  rewrites. Autocompact stays as configured in both modes (it is off by
+  default and an explicit choice when on).
+- [x] **File bodies collapse to a reference in size mode** (`f843dc7`,
+  `8455b59`). `AgentContextPruning` replaces a `files_read` body with
+  `[cli.py: 24 lines, 572 characters, read earlier and removed from the
+  context; call files_read again if needed]`, as a transcript edit the REPL
+  shows as `✂ context`. **Measured, and the first version was wrong:** pruning
+  bodies read two results ago *inside the same run* made the model re-read
+  them when it wrote the answer (`01-explain`: 10 calls and 27k tokens instead
+  of 7 and 18k in one run, neutral in the other; every other task reads too
+  few files for it to fire). Two size-mode sweeps totalled 206k and 214k
+  prompt tokens against 215k and 206k in cache mode: a wash on single-prompt
+  tasks. So the current prompt's reads now stay untouched and only bodies
+  read for *earlier* prompts collapse, which is where the debt accumulates in
+  a long chat. Open: a multi-prompt benchmark case (the runner is one-shot) to
+  measure that saving, and extending the rule to long `run_sh` outputs of
+  earlier prompts.
 - [x] **Context tools removed** (`150afc7`). Never called in 900+ model calls
   while costing four schemas on every call of the default agent. The edit
   types, the editor and the `transcriptEdited` event stay for the automatic
@@ -227,8 +232,8 @@ reuse (append only, never touch old messages).
 - [x] **Exploration nudges** (`dc3e68e`): `files_list` says it lists one folder
   and points at `files_find` with `*` for the whole tree; `files_find` says so
   too. No new tree tool: `files_find` already does it. Still open: a
-  `files_read` that takes several paths, and the system prompt line "grep
-  first, read ranges" (section 6).
+  `files_read` that takes several paths (one call instead of four for a small
+  package), and the system prompt line "grep first, read ranges" (section 6).
 - [x] **Prefix stability measured after the fixes:** 0 of 66 consecutive
   native requests and 0 of 88 text-protocol requests change their prefix (57 of
   71 did before). Within a run nothing before the last message moves:
