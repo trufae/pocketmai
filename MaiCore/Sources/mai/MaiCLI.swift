@@ -1366,7 +1366,7 @@ struct MaiCLI {
 
     let hello = ConfiguredProvider(id: "hello", kind: .hello)
     try await runtime.register(plugins.makeProvider(from: hello, environment: environment))
-    let baseURL = baseURLOverride ?? URL(string: "https://api.openai.com/v1")!
+    let baseURL = baseURLOverride ?? URL(string: "http://127.0.0.1:11434/v1")!
     let openAI = ConfiguredProvider(
       id: ProviderID.openAI.rawValue,
       kind: .openAICompatible,
@@ -1421,8 +1421,8 @@ struct MaiCLI {
       return profile
     }
     var profile = SessionProfile(
-      provider: providerOverride ?? "hello",
-      model: modelOverride ?? "",
+      provider: providerOverride ?? .openAI,
+      model: modelOverride ?? "gpt-oss:20b",
       instructions: options.systemOverride ?? "You are a helpful, concise assistant.",
       stream: options.stream)
     options.applyLimitOverrides(to: &profile.limits)
