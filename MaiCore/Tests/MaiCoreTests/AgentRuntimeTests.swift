@@ -111,6 +111,59 @@ func compactJSONSortsKeys() {
   #expect(value.compactJSONString == #"{"entries":[1],"path":".","workspace":"w"}"#)
 }
 
+@Test("OpenAI-compatible tool results carry structured content only when they have no text")
+func openAIStructuredContentOnlyWithoutText() async throws {
+  let recorder = URLRequestRecorder()
+  StubURLProtocol.install(forHost: "structured.example.test") { request in
+    recorder.record(request, body: try requestBodyData(request))
+    return try httpResponse(
+      request,
+      contentType: "application/json",
+      body: #"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#)
+  }
+  defer { StubURLProtocol.reset(host: "structured.example.test") }
+
+  let provider = OpenAICompatibleProvider(
+    configuration: .init(
+      baseURL: try #require(URL(string: "https://structured.example.test/v1"))),
+    session: stubSession())
+  let listing = ToolResult(
+    callID: "c1",
+    content: [.text("a.txt (3 bytes)")],
+    structuredContent: .object(["entries": .array([.string("a.txt")])]))
+  let bare = ToolResult(
+    callID: "c2",
+    content: [],
+    structuredContent: .object(["ok": .bool(true)]))
+  let call = AgentMessage(
+    role: .assistant,
+    content: [
+      .toolCall(ToolCall(id: "c1", name: "files_list", arguments: .object([:]))),
+      .toolCall(ToolCall(id: "c2", name: "probe", arguments: .object([:]))),
+    ])
+  _ = try await provider.complete(
+    ProviderRequest(
+      model: "test-model",
+      messages: [
+        .user("list"), call,
+        AgentMessage(role: .tool, content: [.toolResult(listing), .toolResult(bare)]),
+      ],
+      stream: false)
+  ) { _ in }
+
+  let body = try jsonObject(try #require(recorder.body))
+  let messages = try #require(body["messages"] as? [[String: Any]])
+  let toolMessages = messages.filter { $0["role"] as? String == "tool" }
+  #expect(toolMessages.count == 2)
+  let texts = toolMessages.map { message -> String in
+    if let text = message["content"] as? String { return text }
+    let parts = message["content"] as? [[String: Any]] ?? []
+    return parts.compactMap { $0["text"] as? String }.joined()
+  }
+  #expect(texts[0] == "a.txt (3 bytes)")
+  #expect(texts[1] == "<structured_content>\n{\"ok\":true}\n</structured_content>")
+}
+
 @Test("Tool result previews bound lines, line length, and terminal control characters")
 func toolResultPreview() {
   let result = ToolResult(

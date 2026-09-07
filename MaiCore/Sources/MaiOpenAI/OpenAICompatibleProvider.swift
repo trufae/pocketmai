@@ -461,7 +461,16 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     if message.role == .tool || !message.toolResults.isEmpty {
       return try message.toolResults.map { result in
         var content = result.content
-        if let structured = result.structuredContent {
+        // Structured content is for programs; the model reads the text. It is
+        // sent only when there is no text to carry the result, so a listing or
+        // a file is not paid for twice on every later request.
+        let hasText = content.contains { part in
+          if case .text(let text) = part {
+            return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          }
+          return false
+        }
+        if !hasText, let structured = result.structuredContent {
           content.append(
             .text("<structured_content>\n\(structured.compactJSONString)\n</structured_content>"))
         }
