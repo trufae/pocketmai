@@ -9,7 +9,7 @@ func memoryPromptSection() {
   #expect(AgentMemory(text: "   \n  ").promptSection == nil)
 
   var memory = AgentMemory(text: "Prefers Swift.")
-  let section = try? #require(memory.promptSection)
+  let section = memory.promptSection
   #expect(section?.contains("Prefers Swift.") == true)
   #expect(section?.contains("<user_preferences>") == true)
   // The envelope has to say the notes lose to the live conversation.

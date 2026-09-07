@@ -275,19 +275,23 @@ long its run has been going (`5 turns · 2 tools · 2.1k tok · 1m4s`), and
 of the whole tree. When a turn ends the REPL prints `✓ took 5s` in cyan, or
 `✗ took 5s` in red when it failed or was cancelled.
 
-`/stats` ranks every provider:model pair ever used by average output speed,
-one colored bar per model, followed by the same rows ranked by time in use,
+`/stats` ranks every provider:model pair ever used three times, one colored
+bar per model: by average output speed, by time in use, and by efficiency,
 with the request and token counts beside each bar. The runtime records every
 provider call it makes — REPL turns, one-shot runs, tool-loop rounds, child
 agents, and the visual workspace — into `ModelUsageStore`, kept in
 `~/.pmai/stats.json` (`$PMAI_HOME` relocates it) so the totals span every
 project. Tokens come from the provider's usage payload, or are estimated from
 text length and marked `~` when it reports none; speed is visible output
-tokens over the first→last token window of the stream, and time in use adds
-the wait for the first token. `/stats rm PROVIDER[:MODEL]` drops one row or a
-whole provider, `/stats reset` forgets everything, and `/stats path` prints
-the file. PocketMai's Statistics screen is built on the same `ModelUsageLedger`
-and `ModelUsageReport`, so both hosts rank, color, and describe models alike.
+tokens over the first→last token window of the stream, time in use adds the
+wait for the first token, and efficiency is total tokens divided by seconds in
+use and by requests (`tokens / (seconds × requests)`, printed as `tok/s/req`).
+`/stats speed`, `/stats time`, and `/stats efficiency` print one ranking,
+`/stats show PROVIDER[:MODEL]` prints every fact recorded about a model or a
+provider, `/stats rm PROVIDER[:MODEL]` drops one row or a whole provider,
+`/stats reset` forgets everything, and `/stats path` prints the file.
+PocketMai's Statistics screen is built on the same `ModelUsageLedger` and
+`ModelUsageReport`, so both hosts rank, color, and describe models alike.
 
 On piped input each prompt is preceded by a colored separator so prompts remain
 easy to find in terminal scrollback. Long input scrolls horizontally and is

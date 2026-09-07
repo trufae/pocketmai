@@ -110,6 +110,33 @@ func latexRendering() {
   #expect(renderer.feed("put} = \\frac{a}{b}$$") == "Throughput = a / b")
 }
 
+@Test("LaTex commands become Unicode symbols, scripts, roots, and accents")
+func latexSymbols() {
+  func render(_ source: String) -> String {
+    stripANSI(MarkdownTerminalRenderer.render(source, theme: .plain))
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+  #expect(
+    render("• Compaction logic $\\rightarrow$ summary requests $\\rightarrow$ error handling.")
+      == "• Compaction logic → summary requests → error handling.")
+  #expect(
+    render("$x \\in \\mathbb{R}$, $A \\subseteq B$, $p \\land q \\Rightarrow \\neg r$, $\\forall x \\exists y$")
+      == "x ∈ ℝ, A ⊆ B, p ∧ q ⇒ ¬r, ∀x ∃y")
+  #expect(
+    render("$x^2 + e^{-x} = \\sum_{i=1}^{n} a_i$ and $10^{-3}$, $\\text{TPS}_{\\text{output}}$, $\\lim_{x \\to 0}$")
+      == "x² + e⁻ˣ = Σᵢ₌₁ⁿ aᵢ and 10⁻³, TPS_output, lim_(x → 0)")
+  #expect(
+    render("$\\sqrt{2}$, $\\sqrt{x+1}$, $\\sqrt[3]{8}$, $\\frac12$, $\\binom{n}{k}$, $\\int_0^1 f(x)\\,dx$")
+      == "√2, √(x+1), ³√8, 1 / 2, C(n, k), ∫₀¹ f(x) dx")
+  #expect(
+    render("$a \\not\\in B$, $a \\not= b$, $90^\\circ$, $\\hat{x}$, $\\vec{v}$, $\\overline{AB}$, $\\boxed{42}$")
+      == "a ∉ B, a ≠ b, 90°, x\u{0302}, v\u{20D7}, AB, [42]")
+  #expect(
+    render("$\\left( \\alpha + \\Omega \\right)$, $\\langle a, b \\rangle$, $\\|v\\|$, $a \\ll b \\cdots$, $\\mathbf{v} \\cdot \\nabla$")
+      == "( α + Ω ), ⟨a, b⟩, ‖v‖, a ≪ b ⋯, v · ∇")
+  #expect(render("it costs $5 and $10 total, or $ 20") == "it costs $5 and $10 total, or $ 20")
+}
+
 @Test("Streamable length stops before unfinished constructs")
 func streamableLength() {
   #expect(MarkdownInlineParser.streamableLength(of: "Hello world") == 6)

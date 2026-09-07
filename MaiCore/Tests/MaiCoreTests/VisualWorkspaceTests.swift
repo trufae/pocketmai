@@ -526,12 +526,15 @@ func statsTabRendersUsageBars() async throws {
   #expect(output.contains("Stats"))
   #expect(output.contains("Average output speed"))
   #expect(output.contains("Time in use"))
+  #expect(output.contains("Efficiency"))
   // RenderOnce swaps non-ASCII glyphs (the em dash, the bars) for ASCII.
   #expect(output.contains("qwen3.8:27b"))
   #expect(output.contains("40.0 tok/s"))
   #expect(output.contains("big-pickle"))
   #expect(output.contains("20.0 tok/s"))
   #expect(output.contains("1m44s"))
+  // 5,000 tokens over 104 s in use and one request.
+  #expect(output.contains("48.1 tok/s/req"))
   #expect(output.contains("Reset statistics"))
   #expect(output.contains("~ marks"))
 

@@ -614,26 +614,10 @@ private struct MessageBubbleContent: View, Equatable {
     return nil
   }
 
+  /// MaiCore's spelling of the call(s) behind the message, the same one the
+  /// pmai REPL uses.
   private var generationStatsText: String? {
-    guard let stats = message.stats else { return nil }
-    var parts: [String] = []
-    if let tps = stats.tokensPerSecond {
-      parts.append(String(format: "%.1f tok/s", tps))
-    }
-    if let firstToken = stats.firstTokenSeconds {
-      parts.append(
-        String(format: firstToken >= 10 ? "first tok %.1fs" : "first tok %.2fs", firstToken))
-    }
-    let approx = stats.tokensEstimated ? "~" : ""
-    parts.append("\(approx)\(stats.inputTokens) in")
-    if stats.cachedTokens > 0 {
-      parts.append("\(stats.cachedTokens) cached")
-    }
-    parts.append("\(approx)\(stats.outputTokens) out")
-    if stats.callCount > 1 {
-      parts.append("\(stats.callCount) calls")
-    }
-    return parts.joined(separator: " · ")
+    message.stats?.summary
   }
 
   @ViewBuilder

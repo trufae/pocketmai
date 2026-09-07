@@ -166,6 +166,22 @@ public struct ModelCallStats: Codable, Equatable, Sendable {
   /// plus streaming the rest.
   public var totalSeconds: TimeInterval { promptSeconds + generationSeconds }
 
+  /// What a message footer says about the call(s) behind it:
+  /// `42.1 tok/s · first tok 0.85s · ~1.2k in · 300 cached · ~450 out · 3 calls`.
+  public var summary: String {
+    var parts: [String] = []
+    if let tokensPerSecond { parts.append(ModelUsageFormat.speed(tokensPerSecond)) }
+    if let firstTokenSeconds {
+      parts.append("first tok \(ModelUsageFormat.seconds(firstTokenSeconds))")
+    }
+    let approx = tokensEstimated ? "~" : ""
+    parts.append("\(approx)\(ModelUsageFormat.count(inputTokens)) in")
+    if cachedTokens > 0 { parts.append("\(ModelUsageFormat.count(cachedTokens)) cached") }
+    parts.append("\(approx)\(ModelUsageFormat.count(outputTokens)) out")
+    if callCount > 1 { parts.append("\(callCount) calls") }
+    return parts.joined(separator: " · ")
+  }
+
   /// A stream whose first→last token window is shorter than this never showed
   /// the client any real generation pacing, so the window cannot be a divisor.
   public static let minimumStreamedGenerationSeconds: TimeInterval = 0.2
@@ -251,9 +267,6 @@ public struct ModelCallStats: Codable, Equatable, Sendable {
     end: Date = Date(),
     userInputTokens: Int? = nil
   ) -> ModelCallStats {
-    let usage = response.usage
-    let resolved = resolveTiming(timing, end: end)
-    let responseCharacters = response.message.text.count
     let images = messages.reduce(0) { total, message in
       total
         + message.content.filter {
@@ -261,21 +274,50 @@ public struct ModelCallStats: Codable, Equatable, Sendable {
           return false
         }.count
     }
+    return measured(
+      providerLabel: providerLabel,
+      modelID: modelID,
+      usage: response.usage,
+      estimatedInputTokens: estimatedTokenCount(of: messages),
+      outputCharacterCount: response.message.text.count,
+      timing: timing,
+      end: end,
+      userInputTokens: userInputTokens,
+      imageInputs: images > 0 ? images : nil)
+  }
+
+  /// The stats of one call from what every host has at hand once a call
+  /// ends: the provider's usage payload (nil when it reported none), the
+  /// input estimate to fall back on, the length of the text received, and
+  /// the stream timing. PocketMai's providers and the runtime both go
+  /// through here, so a call is measured the same way on every host.
+  public static func measured(
+    providerLabel: String,
+    modelID: String,
+    usage: TokenUsage?,
+    estimatedInputTokens: Int,
+    outputCharacterCount: Int,
+    timing: StreamTimingObservation,
+    end: Date = Date(),
+    userInputTokens: Int? = nil,
+    imageInputs: Int? = nil
+  ) -> ModelCallStats {
+    let resolved = resolveTiming(timing, end: end)
+    let receivedTextTokens = estimatedTokenCount(forCharacterCount: outputCharacterCount)
     return ModelCallStats(
       providerLabel: providerLabel,
       modelID: modelID,
-      inputTokens: usage?.inputTokens ?? estimatedTokenCount(of: messages),
+      inputTokens: usage?.inputTokens ?? estimatedInputTokens,
       userInputTokens: userInputTokens,
-      outputTokens: usage?.outputTokens
-        ?? estimatedTokenCount(forCharacterCount: responseCharacters),
-      receivedTextTokens: estimatedTokenCount(forCharacterCount: responseCharacters),
+      outputTokens: usage?.outputTokens ?? receivedTextTokens,
+      receivedTextTokens: receivedTextTokens,
       reasoningTokens: usage?.reasoningTokens,
-      imageInputs: images > 0 ? images : nil,
+      imageInputs: imageInputs,
       cachedTokens: usage?.cachedTokens ?? 0,
       promptSeconds: resolved.promptSeconds,
       generationSeconds: resolved.generationSeconds,
       firstTokenSeconds: resolved.firstTokenSeconds,
-      tokensEstimated: usage == nil)
+      tokensEstimated: usage?.isEstimated ?? true)
   }
 }
 
@@ -391,6 +433,103 @@ public struct ModelUsageTotals: Codable, Identifiable, Equatable, Sendable {
     return total / Double(count)
   }
 
+  /// The efficiency score `totalTokens / (totalSeconds × callCount)`: how many
+  /// tokens each request moved per second the model was in use. Nil until the
+  /// model has both moved tokens and spent time.
+  public var efficiency: Double? {
+    Self.efficiency(tokens: totalTokens, seconds: totalSeconds, requests: callCount)
+  }
+
+  public static func efficiency(tokens: Int, seconds: TimeInterval, requests: Int) -> Double? {
+    guard tokens > 0, seconds > 0, requests > 0 else { return nil }
+    return Double(tokens) / (seconds * Double(requests))
+  }
+
+  /// The number behind one ranking metric, nil when the row cannot show it.
+  public func value(_ metric: ModelUsageReport.Metric) -> Double? {
+    switch metric {
+    case .speed: averageTokensPerSecond
+    case .time: Optional(totalSeconds)
+    case .efficiency: efficiency
+    }
+  }
+
+  /// One line under the model's name with the facts the rankings leave out:
+  /// `~1.2k sent · ~3.4k recv · 45 req · 12m34s in use · prompt 800.0 tok/s · first tok 0.85s`.
+  public var summary: String {
+    var parts: [String] = []
+    if let userInputTokens, userInputTokens > 0 {
+      parts.append("~\(ModelUsageFormat.count(userInputTokens)) sent")
+    }
+    if let receivedTextTokens, receivedTextTokens > 0 {
+      parts.append("~\(ModelUsageFormat.count(receivedTextTokens)) recv")
+    }
+    if let reasoningTokens, reasoningTokens > 0 {
+      parts.append("\(ModelUsageFormat.count(reasoningTokens)) thinking")
+    }
+    if let imageInputs, imageInputs > 0 {
+      parts.append("\(imageInputs) image\(imageInputs == 1 ? "" : "s")")
+    }
+    if cachedTokens > 0 { parts.append("\(ModelUsageFormat.count(cachedTokens)) cached") }
+    parts.append("\(callCount) req")
+    if totalSeconds > 0 { parts.append("\(ModelUsageFormat.duration(totalSeconds)) in use") }
+    if let averagePromptTokensPerSecond {
+      parts.append("prompt \(ModelUsageFormat.speed(averagePromptTokensPerSecond))")
+    }
+    if let averageFirstTokenSeconds {
+      parts.append("first tok \(ModelUsageFormat.seconds(averageFirstTokenSeconds))")
+    }
+    return parts.joined(separator: " · ")
+  }
+
+  /// Everything recorded about the row, one fact per line, for a detail
+  /// sheet or `/stats show PROVIDER:MODEL`.
+  public var detailLines: [String] {
+    let estimated = estimatedCallCount > 0
+    var lines: [String] = []
+    if let userInputTokens, userInputTokens > 0 {
+      lines.append("Text sent: \(ModelUsageFormat.tokens(userInputTokens, estimated: true))")
+    }
+    if let receivedTextTokens, receivedTextTokens > 0 {
+      lines.append("Text received: \(ModelUsageFormat.tokens(receivedTextTokens, estimated: true))")
+    }
+    lines.append("Prompt tokens: \(ModelUsageFormat.tokens(inputTokens, estimated: estimated))")
+    lines.append("Completion tokens: \(ModelUsageFormat.tokens(outputTokens, estimated: estimated))")
+    if let reasoningTokens, reasoningTokens > 0 {
+      lines.append("Thinking tokens: \(ModelUsageFormat.tokens(reasoningTokens))")
+    }
+    if let imageInputs, imageInputs > 0 { lines.append("Images sent: \(imageInputs)") }
+    if cachedTokens > 0 { lines.append("Cached tokens: \(ModelUsageFormat.tokens(cachedTokens))") }
+    lines.append("Requests: \(callCount)")
+    if estimated { lines.append("Estimated counts: \(estimatedCallCount) req") }
+    if let averageTokensPerSecond {
+      lines.append("Average output speed: \(ModelUsageFormat.speed(averageTokensPerSecond))")
+    }
+    if let lastOutputTokensPerSecond {
+      lines.append("Last output speed: \(ModelUsageFormat.speed(lastOutputTokensPerSecond))")
+    }
+    if let averagePromptTokensPerSecond {
+      lines.append(
+        "Prompt processing speed: \(ModelUsageFormat.speed(averagePromptTokensPerSecond))")
+    }
+    if let lastFirstTokenSeconds {
+      lines.append("Last time to first token: \(ModelUsageFormat.seconds(lastFirstTokenSeconds))")
+    }
+    if let averageFirstTokenSeconds {
+      lines.append(
+        "Average time to first token: \(ModelUsageFormat.seconds(averageFirstTokenSeconds))")
+    }
+    if generationSeconds > 0 {
+      lines.append("Generation time: \(ModelUsageFormat.duration(generationSeconds))")
+    }
+    if totalSeconds > 0 { lines.append("Time in use: \(ModelUsageFormat.duration(totalSeconds))") }
+    if let efficiency { lines.append("Efficiency: \(ModelUsageFormat.efficiency(efficiency))") }
+    if lastUsedAt > .distantPast {
+      lines.append("Last used: \(lastUsedAt.formatted(date: .abbreviated, time: .shortened))")
+    }
+    return lines
+  }
+
   /// Folds one completed call into the totals.
   public mutating func record(_ stats: ModelCallStats, at date: Date = Date()) {
     inputTokens += stats.inputTokens
@@ -442,7 +581,27 @@ public struct ProviderUsageTotals: Identifiable, Equatable, Sendable {
   public var lastUsedAt: Date
 
   public var id: String { providerLabel }
+  public var totalTokens: Int { inputTokens + outputTokens }
   public var totalSeconds: TimeInterval { promptSeconds + generationSeconds }
+
+  public var efficiency: Double? {
+    ModelUsageTotals.efficiency(tokens: totalTokens, seconds: totalSeconds, requests: callCount)
+  }
+
+  /// One line under the provider's name:
+  /// `3 models · ~1.2k sent · ~3.4k recv · 45 req · 12m34s in use`.
+  public var summary: String {
+    var parts = ["\(modelCount) model\(modelCount == 1 ? "" : "s")"]
+    if userInputTokens > 0 { parts.append("~\(ModelUsageFormat.count(userInputTokens)) sent") }
+    if receivedTextTokens > 0 {
+      parts.append("~\(ModelUsageFormat.count(receivedTextTokens)) recv")
+    }
+    if reasoningTokens > 0 { parts.append("\(ModelUsageFormat.count(reasoningTokens)) thinking") }
+    if imageInputs > 0 { parts.append("\(imageInputs) image\(imageInputs == 1 ? "" : "s")") }
+    parts.append("\(callCount) req")
+    if totalSeconds > 0 { parts.append("\(ModelUsageFormat.duration(totalSeconds)) in use") }
+    return parts.joined(separator: " · ")
+  }
 
   public init(providerLabel: String, models: [ModelUsageTotals]) {
     self.providerLabel = providerLabel
@@ -529,6 +688,27 @@ public struct ModelUsageLedger: Codable, Equatable, Sendable {
     return before - totals.count
   }
 
+  /// The rows a user names on a command line: a row id, a provider label
+  /// (every model of it), or `PROVIDER:MODEL`.
+  public func totals(matching target: String) -> [ModelUsageTotals] {
+    if let row = totals(id: target) { return [row] }
+    let byProvider = totals.filter { $0.providerLabel == target }
+    if !byProvider.isEmpty { return byProvider }
+    guard let separator = target.firstIndex(of: ":") else { return [] }
+    let id = ModelUsageTotals.id(
+      providerLabel: String(target[..<separator]),
+      modelID: String(target[target.index(after: separator)...]))
+    return totals(id: id).map { [$0] } ?? []
+  }
+
+  /// Drops the rows `totals(matching:)` names. Returns how many rows went.
+  @discardableResult
+  public mutating func remove(matching target: String) -> Int {
+    let ids = Set(totals(matching: target).map(\.id))
+    totals.removeAll { ids.contains($0.id) }
+    return ids.count
+  }
+
   /// Rows that can show a speed, fastest first: a ranking at a glance.
   public var sortedBySpeed: [ModelUsageTotals] {
     totals
@@ -544,6 +724,13 @@ public struct ModelUsageLedger: Codable, Equatable, Sendable {
     totals.sorted { $0.totalSeconds > $1.totalSeconds }
   }
 
+  /// Rows with an efficiency score, best first.
+  public var sortedByEfficiency: [ModelUsageTotals] {
+    totals
+      .filter { $0.efficiency != nil }
+      .sorted { ($0.efficiency ?? 0) > ($1.efficiency ?? 0) }
+  }
+
   public var providerTotals: [ProviderUsageTotals] {
     Dictionary(grouping: totals, by: \.providerLabel)
       .map { ProviderUsageTotals(providerLabel: $0.key, models: $0.value) }
@@ -557,6 +744,12 @@ public struct ModelUsageLedger: Codable, Equatable, Sendable {
   public var estimatedCallCount: Int { totals.reduce(0) { $0 + $1.estimatedCallCount } }
   public var inputTokens: Int { totals.reduce(0) { $0 + $1.inputTokens } }
   public var outputTokens: Int { totals.reduce(0) { $0 + $1.outputTokens } }
+  public var totalTokens: Int { inputTokens + outputTokens }
+
+  /// The efficiency score of every row taken together.
+  public var efficiency: Double? {
+    ModelUsageTotals.efficiency(tokens: totalTokens, seconds: totalSeconds, requests: callCount)
+  }
   public var userInputTokens: Int { totals.reduce(0) { $0 + ($1.userInputTokens ?? 0) } }
   public var receivedTextTokens: Int { totals.reduce(0) { $0 + ($1.receivedTextTokens ?? 0) } }
   public var reasoningTokens: Int { totals.reduce(0) { $0 + ($1.reasoningTokens ?? 0) } }
@@ -613,6 +806,31 @@ public struct FileModelUsagePersistence: ModelUsagePersistence {
   }
 }
 
+/// One `UserDefaults` value, the way PocketMai keeps its totals. The suite is
+/// named rather than held so the persistence stays Sendable.
+public struct UserDefaultsModelUsagePersistence: ModelUsagePersistence {
+  public let key: String
+  public let suiteName: String?
+
+  public init(key: String, suiteName: String? = nil) {
+    self.key = key
+    self.suiteName = suiteName
+  }
+
+  private var defaults: UserDefaults {
+    suiteName.flatMap(UserDefaults.init(suiteName:)) ?? .standard
+  }
+
+  public func load() throws -> ModelUsageLedger {
+    guard let data = defaults.data(forKey: key) else { return ModelUsageLedger() }
+    return try ModelUsageLedger.decode(data)
+  }
+
+  public func save(_ ledger: ModelUsageLedger) throws {
+    defaults.set(try ledger.encoded(), forKey: key)
+  }
+}
+
 /// The shared, concurrency-safe home of a host's usage ledger. The runtime
 /// records into it after every provider call; commands and screens read it.
 /// Every change is written through the persistence at once, so a crash never
@@ -662,6 +880,14 @@ public actor ModelUsageStore {
   @discardableResult
   public func remove(providerLabel: String) -> Int {
     let removed = ledger.remove(providerLabel: providerLabel)
+    if removed > 0 { persist() }
+    return removed
+  }
+
+  /// Drops the rows a command-line target names; see `ModelUsageLedger.totals(matching:)`.
+  @discardableResult
+  public func remove(matching target: String) -> Int {
+    let removed = ledger.remove(matching: target)
     if removed > 0 { persist() }
     return removed
   }
@@ -768,6 +994,25 @@ public enum ModelUsageFormat {
     String(format: seconds >= 10 ? "%.1fs" : "%.2fs", seconds)
   }
 
+  /// `3.2 tok/s/req`: tokens per second in use, per request.
+  public static func efficiency(_ score: Double) -> String {
+    String(format: "%.1f tok/s/req", score)
+  }
+
+  /// `text` cut to `width` cells with a trailing ellipsis, for a label column.
+  public static func clip(_ text: String, to width: Int) -> String {
+    guard text.count > width, width > 1 else { return text }
+    return String(text.prefix(width - 1)) + "…"
+  }
+
+  /// `text` padded with spaces to `width` cells, on the left when `leading`.
+  public static func pad(_ text: String, to width: Int, leading: Bool = false) -> String {
+    let missing = max(0, width - text.count)
+    guard missing > 0 else { return text }
+    let fill = String(repeating: " ", count: missing)
+    return leading ? fill + text : text + fill
+  }
+
   /// `<1s`, `5s`, `1m4s`, or `2h3m4s`: how long something took or has been
   /// running, rounded to whole seconds.
   public static func duration(_ seconds: TimeInterval) -> String {
@@ -820,11 +1065,51 @@ public enum ModelUsageFormat {
 /// Hosts render the rows with their own widgets; `lines` is the plain-text
 /// rendering the REPL prints and the visual workspace's command output shows.
 public struct ModelUsageReport: Equatable, Sendable {
+  /// The rankings every host shows, in the order they are printed.
   public enum Metric: String, CaseIterable, Sendable {
     /// Average visible output speed.
     case speed
     /// Seconds the model has been busy in total.
     case time
+    /// `totalTokens / (totalSeconds × callCount)`.
+    case efficiency
+
+    /// The heading over the bars: `Average output speed`.
+    public var title: String {
+      switch self {
+      case .speed: "Average output speed"
+      case .time: "Time in use"
+      case .efficiency: "Efficiency"
+      }
+    }
+
+    /// The short name a picker or `/stats METRIC` uses: `Speed`.
+    public var label: String {
+      switch self {
+      case .speed: "Speed"
+      case .time: "Time"
+      case .efficiency: "Efficiency"
+      }
+    }
+
+    /// How the number is computed, for help text and footers.
+    public var explanation: String {
+      switch self {
+      case .speed: "visible output tokens over the streaming window of each call"
+      case .time: "the wait for the first token plus generation time, summed over every call"
+      case .efficiency: "total tokens divided by seconds in use and by requests"
+      }
+    }
+
+    /// The number spelled out — `42.1 tok/s`, `12m34s`, `3.2 tok/s/req` —
+    /// or what a row without it says.
+    public func text(_ value: Double?) -> String {
+      switch self {
+      case .speed: value.map(ModelUsageFormat.speed) ?? "no speed"
+      case .time: ModelUsageFormat.duration(value ?? 0)
+      case .efficiency: value.map(ModelUsageFormat.efficiency) ?? "no score"
+      }
+    }
   }
 
   public struct Row: Identifiable, Equatable, Sendable {
@@ -834,11 +1119,10 @@ public struct ModelUsageReport: Equatable, Sendable {
     public var modelID: String
     public var color: ModelUsageColor
     public var speed: Double?
-    /// Speed relative to the fastest row, 0...1; zero when there is no speed.
-    public var speedFraction: Double
     public var seconds: TimeInterval
-    /// Time relative to the row that has been busy longest, 0...1.
-    public var secondsFraction: Double
+    public var efficiency: Double?
+    /// Each metric relative to the best row, 0...1; zero for a row without it.
+    public var fractions: [Metric: Double]
     public var callCount: Int
     public var inputTokens: Int
     public var outputTokens: Int
@@ -848,31 +1132,40 @@ public struct ModelUsageReport: Equatable, Sendable {
     public var lastUsedAt: Date
 
     public var totalTokens: Int { inputTokens + outputTokens }
+    public var speedFraction: Double { fraction(.speed) }
+    public var secondsFraction: Double { fraction(.time) }
+
+    /// The row's number for one metric, nil when it has none.
+    public func number(_ metric: Metric) -> Double? {
+      switch metric {
+      case .speed: speed
+      case .time: Optional(seconds)
+      case .efficiency: efficiency
+      }
+    }
 
     public func fraction(_ metric: Metric) -> Double {
-      switch metric {
-      case .speed: speedFraction
-      case .time: secondsFraction
-      }
+      fractions[metric] ?? 0
     }
 
-    /// The bar's number, `42.1 tok/s` or `12m34s`.
+    /// The bar's number, `42.1 tok/s`, `12m34s`, or `3.2 tok/s/req`.
     public func value(_ metric: Metric) -> String {
-      switch metric {
-      case .speed: speed.map(ModelUsageFormat.speed) ?? "no speed"
-      case .time: ModelUsageFormat.duration(seconds)
-      }
+      metric.text(number(metric))
     }
 
-    /// What the row says after its bar: `12m34s · 45 req · 120.3k tok`.
+    /// What the row says after its bar: `12m34s · 45 req · 120.3k tok`. The
+    /// metrics the bar does not show come first, so every ranking reads whole.
     public func detail(_ metric: Metric) -> String {
       var parts: [String] = []
       switch metric {
       case .speed: parts.append(ModelUsageFormat.duration(seconds))
       case .time: if let speed { parts.append(ModelUsageFormat.speed(speed)) }
+      case .efficiency:
+        if let speed { parts.append(ModelUsageFormat.speed(speed)) }
+        parts.append(ModelUsageFormat.duration(seconds))
       }
       parts.append("\(callCount) req")
-      parts.append("\(estimated ? "~" : "")\(ModelUsageFormat.count(totalTokens)) tok")
+      parts.append(ModelUsageFormat.tokens(totalTokens, estimated: estimated))
       return parts.joined(separator: " · ")
     }
   }
@@ -884,11 +1177,14 @@ public struct ModelUsageReport: Equatable, Sendable {
   public var inputTokens: Int
   public var outputTokens: Int
   public var reasoningTokens: Int
+  public var efficiency: Double?
   public var hasEstimates: Bool
 
   public init(_ ledger: ModelUsageLedger) {
-    let maxSpeed = ledger.totals.compactMap(\.averageTokensPerSecond).max() ?? 0
-    let maxSeconds = ledger.totals.map(\.totalSeconds).max() ?? 0
+    let best = Dictionary(
+      uniqueKeysWithValues: Metric.allCases.map { metric in
+        (metric, ledger.totals.compactMap { $0.value(metric) }.max() ?? 0)
+      })
     let ranked =
       ledger.sortedBySpeed
       + ledger.totals.filter { $0.averageTokensPerSecond == nil }.sorted {
@@ -902,9 +1198,13 @@ public struct ModelUsageReport: Equatable, Sendable {
         modelID: entry.modelID,
         color: ModelUsagePalette.color(forProviderLabel: entry.providerLabel),
         speed: entry.averageTokensPerSecond,
-        speedFraction: maxSpeed > 0 ? (entry.averageTokensPerSecond ?? 0) / maxSpeed : 0,
         seconds: entry.totalSeconds,
-        secondsFraction: maxSeconds > 0 ? entry.totalSeconds / maxSeconds : 0,
+        efficiency: entry.efficiency,
+        fractions: Dictionary(
+          uniqueKeysWithValues: Metric.allCases.map { metric in
+            let top = best[metric] ?? 0
+            return (metric, top > 0 ? (entry.value(metric) ?? 0) / top : 0)
+          }),
         callCount: entry.callCount,
         inputTokens: entry.inputTokens,
         outputTokens: entry.outputTokens,
@@ -919,6 +1219,7 @@ public struct ModelUsageReport: Equatable, Sendable {
     inputTokens = ledger.inputTokens
     outputTokens = ledger.outputTokens
     reasoningTokens = ledger.reasoningTokens
+    efficiency = ledger.efficiency
     hasEstimates = ledger.estimatedCallCount > 0
   }
 
@@ -928,15 +1229,16 @@ public struct ModelUsageReport: Equatable, Sendable {
 
   public var isEmpty: Bool { rows.isEmpty }
 
-  /// Rows sorted for one metric: by speed for `.speed`, by time for `.time`.
+  /// Rows ranked for one metric, best first; rows without it keep their
+  /// speed ranking at the end.
   public func rows(for metric: Metric) -> [Row] {
     switch metric {
     case .speed: rows
-    case .time: rows.sorted { $0.seconds > $1.seconds }
+    case .time, .efficiency: rows.sorted { ($0.number(metric) ?? -1) > ($1.number(metric) ?? -1) }
     }
   }
 
-  /// `2 models · 57 requests · 15m36s in use · 150.4k tokens`
+  /// `2 models · 57 requests · 15m36s in use · 150.4k tokens · efficiency 2.8 tok/s/req`
   public var headline: String {
     var parts = [
       "\(modelCount) model\(modelCount == 1 ? "" : "s")",
@@ -947,52 +1249,84 @@ public struct ModelUsageReport: Equatable, Sendable {
     if reasoningTokens > 0 {
       parts.append("\(ModelUsageFormat.count(reasoningTokens)) thinking")
     }
+    if let efficiency {
+      parts.append("efficiency \(ModelUsageFormat.efficiency(efficiency))")
+    }
     return parts.joined(separator: " · ")
   }
 
   public static let emptyMessage =
     "No model usage recorded yet. Statistics appear after the first model response."
 
-  /// The plain-text report: a headline, then one bar per model for each
-  /// metric. `paint` may wrap a bar in color for terminals that show it; the
-  /// text stays free of escapes otherwise, so any surface can print it.
-  public func lines(
-    width: Int = 80,
-    metrics: [Metric] = Metric.allCases,
-    paint: (String, ModelUsageColor) -> String = { text, _ in text }
-  ) -> [String] {
-    guard !isEmpty else { return [Self.emptyMessage] }
-    var lines = ["Model usage: \(headline)"]
+  /// What a run of report text is, so a terminal can color it: headings, the
+  /// provider-colored label and bar, the number, and the muted rest.
+  public enum Style: Equatable, Sendable {
+    case heading
+    case headline
+    case label(ModelUsageColor)
+    case bar(ModelUsageColor)
+    case value
+    case detail
+    case note
+  }
+
+  /// One run of a report line; `style` is nil for spacing.
+  public struct Run: Equatable, Sendable {
+    public var text: String
+    public var style: Style?
+
+    public init(_ text: String, _ style: Style? = nil) {
+      self.text = text
+      self.style = style
+    }
+  }
+
+  /// The report as styled runs, one array per line: a headline, then one
+  /// bar per model for each metric. `lines` joins them into plain text.
+  public func runs(width: Int = 80, metrics: [Metric] = Metric.allCases) -> [[Run]] {
+    guard !isEmpty else { return [[Run(Self.emptyMessage)]] }
+    var lines: [[Run]] = [[Run("Model usage: ", .heading), Run(headline, .headline)]]
     let labelWidth = min(28, rows.map { $0.title.count }.max() ?? 0)
     for metric in metrics {
-      lines.append(metric == .speed ? "Average output speed" : "Time in use")
+      lines.append([Run(metric.title, .heading)])
       let metricRows = rows(for: metric)
       let valueWidth = metricRows.map { $0.value(metric).count }.max() ?? 0
       let barWidth = max(6, min(30, width - labelWidth - valueWidth - 34))
       for row in metricRows {
-        let label = Self.pad(Self.clip(row.title, to: labelWidth), to: labelWidth)
-        let bar = paint(
-          ModelUsageFormat.bar(fraction: row.fraction(metric), width: barWidth), row.color)
-        let value = Self.pad(row.value(metric), to: valueWidth, leading: true)
-        lines.append("  \(label) \(bar) \(value)  \(row.detail(metric))")
+        lines.append([
+          Run("  "),
+          Run(
+            ModelUsageFormat.pad(ModelUsageFormat.clip(row.title, to: labelWidth), to: labelWidth),
+            .label(row.color)),
+          Run(" "),
+          Run(ModelUsageFormat.bar(fraction: row.fraction(metric), width: barWidth), .bar(row.color)),
+          Run(" "),
+          Run(ModelUsageFormat.pad(row.value(metric), to: valueWidth, leading: true), .value),
+          Run("  "),
+          Run(row.detail(metric), .detail),
+        ])
       }
     }
     if hasEstimates {
-      lines.append(
-        "~ marks token counts estimated from text length (about 4 characters per token).")
+      lines.append([
+        Run(
+          "~ marks token counts estimated from text length (about 4 characters per token).",
+          .note)
+      ])
     }
     return lines
   }
 
-  static func clip(_ text: String, to width: Int) -> String {
-    guard text.count > width, width > 1 else { return text }
-    return String(text.prefix(width - 1)) + "…"
-  }
-
-  static func pad(_ text: String, to width: Int, leading: Bool = false) -> String {
-    let missing = max(0, width - text.count)
-    guard missing > 0 else { return text }
-    let fill = String(repeating: " ", count: missing)
-    return leading ? fill + text : text + fill
+  /// The plain-text report. `paint` may wrap a styled run in color for
+  /// terminals that show it; the text stays free of escapes otherwise, so
+  /// any surface can print it.
+  public func lines(
+    width: Int = 80,
+    metrics: [Metric] = Metric.allCases,
+    paint: (String, Style) -> String = { text, _ in text }
+  ) -> [String] {
+    runs(width: width, metrics: metrics).map { line in
+      line.map { run in run.style.map { paint(run.text, $0) } ?? run.text }.joined()
+    }
   }
 }

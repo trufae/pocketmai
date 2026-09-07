@@ -1,75 +1,49 @@
 import MaiCore
 import SwiftUI
 
-/// Settings → Statistics: lifetime token consumption and generation speed for
-/// every provider/model that has been used. A bar chart on top compares average
-/// speed across models; tapping a bar names it below the chart. The numbers,
-/// rankings, and provider colors come from MaiCore, the same code behind the
-/// pmai REPL's `/stats`.
+/// Settings → Statistics: lifetime token consumption, generation speed, time
+/// in use, and efficiency for every provider/model that has been used. A bar
+/// chart on top ranks the models by the chosen metric; tapping a bar names it
+/// below the chart. The numbers, rankings, descriptions, and provider colors
+/// come from MaiCore, the same code behind the pmai REPL's `/stats`.
 struct UsageStatsView: View {
+  private typealias Metric = ModelUsageReport.Metric
+
   @ObservedObject private var stats = UsageStatsStore.shared
+  @State private var metric: Metric = .speed
   @State private var selectedID: String?
   @State private var selectedModelIDs: Set<String> = []
   @State private var selectedProviderLabels: Set<String> = []
   @State private var hasInitializedSelections = false
   @State private var confirmingReset = false
-  @State private var detailEntry: UsageStatsStore.ModelTotals?
+  @State private var detailEntry: ModelUsageTotals?
   @State private var deletingProvider: ProviderUsageTotals?
 
   private static let chartHeight: CGFloat = 120
 
-  /// Fastest first, so the chart reads as a ranking at a glance.
-  private var filteredTotals: [UsageStatsStore.ModelTotals] {
-    stats.totals.filter {
-      selectedProviderLabels.contains($0.providerLabel) && selectedModelIDs.contains($0.id)
-    }
+  /// The models and providers ticked in the lists are the ones the chart
+  /// and the totals cover.
+  private var filteredLedger: ModelUsageLedger {
+    ModelUsageLedger(
+      totals: stats.totals.filter {
+        selectedProviderLabels.contains($0.providerLabel) && selectedModelIDs.contains($0.id)
+      })
   }
 
-  private var chartTotals: [UsageStatsStore.ModelTotals] {
-    filteredTotals
-      .filter { $0.averageTokensPerSecond != nil }
-      .sorted { ($0.averageTokensPerSecond ?? 0) > ($1.averageTokensPerSecond ?? 0) }
+  private var report: ModelUsageReport { ModelUsageReport(filteredLedger) }
+
+  /// Rows with a number for the chosen metric, best first.
+  private var chartRows: [ModelUsageReport.Row] {
+    report.rows(for: metric).filter { ($0.number(metric) ?? 0) > 0 }
   }
 
-  private var listTotals: [UsageStatsStore.ModelTotals] {
-    filteredTotals.sorted { $0.lastUsedAt > $1.lastUsedAt }
+  private var selectedRow: ModelUsageReport.Row? {
+    chartRows.first { $0.id == selectedID } ?? chartRows.first
   }
 
-  private var allModelTotals: [UsageStatsStore.ModelTotals] {
-    stats.totals.sorted { $0.lastUsedAt > $1.lastUsedAt }
-  }
+  private var allModelTotals: [ModelUsageTotals] { stats.ledger.sortedByLastUsed }
 
-  private var providerTotals: [ProviderUsageTotals] {
-    stats.ledger.providerTotals
-  }
-
-  private var totalInputTokens: Int {
-    listTotals.reduce(0) { $0 + $1.inputTokens }
-  }
-
-  private var totalUserInputTokens: Int {
-    listTotals.reduce(0) { $0 + ($1.userInputTokens ?? 0) }
-  }
-
-  private var totalOutputTokens: Int {
-    listTotals.reduce(0) { $0 + $1.outputTokens }
-  }
-
-  private var totalReceivedTextTokens: Int {
-    listTotals.reduce(0) { $0 + ($1.receivedTextTokens ?? 0) }
-  }
-
-  private var totalReasoningTokens: Int {
-    listTotals.reduce(0) { $0 + ($1.reasoningTokens ?? 0) }
-  }
-
-  private var totalImageInputs: Int {
-    listTotals.reduce(0) { $0 + ($1.imageInputs ?? 0) }
-  }
-
-  private var selectedEntry: UsageStatsStore.ModelTotals? {
-    chartTotals.first { $0.id == selectedID } ?? chartTotals.first
-  }
+  private var providerTotals: [ProviderUsageTotals] { stats.ledger.providerTotals }
 
   var body: some View {
     List {
@@ -78,18 +52,28 @@ struct UsageStatsView: View {
           "No Usage Yet",
           systemImage: "chart.bar",
           description: Text("Statistics appear here after the first model response."))
-      } else if listTotals.isEmpty {
+      } else if report.isEmpty {
         ContentUnavailableView(
           "No Statistics Selected",
           systemImage: "line.3.horizontal.decrease.circle",
           description: Text("Select at least one model and provider to show statistics."))
-      }
-      if !chartTotals.isEmpty {
+      } else {
         Section {
-          speedChart
-          totalTokensSummary
+          Picker("Metric", selection: $metric) {
+            ForEach(Metric.allCases, id: \.self) { Text($0.label).tag($0) }
+          }
+          .pickerStyle(.segmented)
+          chart
+          Text(report.headline)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .monospacedDigit()
+            .frame(maxWidth: .infinity)
+          tokenSummary
         } header: {
-          Text("Average Output Speed")
+          Text(metric.title)
+        } footer: {
+          Text("\(metric.title): \(metric.explanation).")
         }
       }
       if !allModelTotals.isEmpty {
@@ -100,7 +84,7 @@ struct UsageStatsView: View {
         } header: {
           Text("Models")
         } footer: {
-          if allModelTotals.contains(where: { $0.estimatedCallCount > 0 }) {
+          if stats.ledger.estimatedCallCount > 0 {
             Text("~ marks token counts estimated from text length (~4 characters per token).")
           }
         }
@@ -113,7 +97,9 @@ struct UsageStatsView: View {
         } header: {
           Text("Providers")
         } footer: {
-          Text("Select models and providers to include them in the chart and token totals.")
+          Text(
+            "Select models and providers to include them in the chart and totals. Long-press a row for every recorded fact."
+          )
         }
       }
       if !stats.totals.isEmpty {
@@ -146,7 +132,7 @@ struct UsageStatsView: View {
       }
     }
     .confirmationDialog(
-      detailEntry.map(sectionTitle(for:)) ?? "",
+      detailEntry?.title ?? "",
       isPresented: Binding(
         get: { detailEntry != nil },
         set: { if !$0 { detailEntry = nil } }
@@ -157,12 +143,9 @@ struct UsageStatsView: View {
       Button("Delete Statistics", role: .destructive) {
         stats.remove(id: entry.id)
         selectedModelIDs.remove(entry.id)
-        if selectedID == entry.id {
-          selectedID = nil
-        }
       }
     } message: { entry in
-      Text(fullDetailText(for: entry))
+      Text(entry.detailLines.joined(separator: "\n"))
     }
     .confirmationDialog(
       deletingProvider.map { "Delete all statistics for \($0.providerLabel)?" } ?? "",
@@ -179,41 +162,53 @@ struct UsageStatsView: View {
         stats.remove(providerLabel: provider.providerLabel)
         selectedModelIDs.subtract(removedIDs)
         selectedProviderLabels.remove(provider.providerLabel)
-        if let selectedID, removedIDs.contains(selectedID) {
-          self.selectedID = nil
-        }
       }
     } message: { provider in
-      Text("Removes the usage statistics of every model of this provider.")
+      Text(provider.summary)
     }
   }
 
-  private var speedChart: some View {
-    let entries = chartTotals
-    let maxSpeed = entries.compactMap(\.averageTokensPerSecond).max() ?? 1
+  /// One bar per model, its height the row's share of the best value for the
+  /// chosen metric, in the provider's shared color.
+  private var chart: some View {
+    let rows = chartRows
     return VStack(spacing: 10) {
+      if rows.isEmpty {
+        Text("No \(metric.label.lowercased()) recorded for the selected models yet.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
       HStack(alignment: .bottom, spacing: 6) {
-        ForEach(entries) { entry in
-          let isSelected = entry.id == selectedEntry?.id
-          speedBar(entry, maxSpeed: maxSpeed, isSelected: isSelected)
+        ForEach(rows) { row in
+          let isSelected = row.id == selectedRow?.id
+          Rectangle()
+            .fill(Color(row.color).opacity(isSelected ? 1 : 0.35))
+            .clipShape(UnevenRoundedRectangle(topLeadingRadius: 4, topTrailingRadius: 4))
+            .frame(maxWidth: 48)
+            .frame(height: max(6, Self.chartHeight * row.fraction(metric)))
+            .frame(maxWidth: .infinity, maxHeight: Self.chartHeight, alignment: .bottom)
             .contentShape(Rectangle())
-            .onTapGesture {
-              selectedID = entry.id
-            }
-            .accessibilityLabel(sectionTitle(for: entry))
-            .accessibilityValue(speedDescription(for: entry))
+            .onTapGesture { selectedID = row.id }
+            .accessibilityLabel(row.title)
+            .accessibilityValue(row.value(metric))
         }
       }
       .animation(.snappy(duration: 0.2), value: selectedID)
-      if let selected = selectedEntry {
-        HStack(spacing: 6) {
-          Text(sectionTitle(for: selected))
-            .font(.caption)
+      if let row = selectedRow {
+        VStack(spacing: 2) {
+          HStack(spacing: 6) {
+            Text(row.title)
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .lineLimit(1)
+              .truncationMode(.middle)
+            Text(row.value(metric))
+              .font(.caption.weight(.semibold))
+              .monospacedDigit()
+          }
+          Text(row.detail(metric))
+            .font(.caption2)
             .foregroundStyle(.secondary)
-            .lineLimit(1)
-            .truncationMode(.middle)
-          Text(speedDescription(for: selected))
-            .font(.caption.weight(.semibold))
             .monospacedDigit()
         }
         .frame(maxWidth: .infinity)
@@ -222,40 +217,14 @@ struct UsageStatsView: View {
     .padding(.vertical, 6)
   }
 
-  private func speedBar(
-    _ entry: UsageStatsStore.ModelTotals,
-    maxSpeed: Double,
-    isSelected: Bool
-  ) -> some View {
-    let outputSpeed = outputSpeed(for: entry)
-    let barHeight = max(6, Self.chartHeight * outputSpeed / maxSpeed)
-    let opacity = isSelected ? 1.0 : 0.35
-
-    return Rectangle()
-      .fill(providerColor(for: entry.providerLabel).opacity(opacity))
-      .clipShape(UnevenRoundedRectangle(topLeadingRadius: 4, topTrailingRadius: 4))
-      .frame(maxWidth: 48)
-      .frame(height: barHeight)
-      .frame(maxWidth: .infinity, maxHeight: Self.chartHeight, alignment: .bottom)
-  }
-
-  private func outputSpeed(for entry: UsageStatsStore.ModelTotals) -> Double {
-    entry.averageTokensPerSecond ?? 0
-  }
-
-  private func speedDescription(for entry: UsageStatsStore.ModelTotals) -> String {
-    "↓ \(speedText(outputSpeed(for: entry))) output"
-  }
-
-  private var totalTokensSummary: some View {
-    HStack(spacing: 12) {
-      Label("~\(totalUserInputTokens.formatted()) sent", systemImage: "arrow.up")
-      Label("~\(totalReceivedTextTokens.formatted()) recv", systemImage: "arrow.down")
-      if totalReasoningTokens > 0 {
-        Label("\(totalReasoningTokens.formatted()) thinking", systemImage: "brain")
-      }
-      if totalImageInputs > 0 {
-        Label("\(totalImageInputs.formatted()) images", systemImage: "photo")
+  private var tokenSummary: some View {
+    let ledger = filteredLedger
+    return HStack(spacing: 12) {
+      Label("~\(ModelUsageFormat.count(ledger.userInputTokens)) sent", systemImage: "arrow.up")
+      Label(
+        "~\(ModelUsageFormat.count(ledger.receivedTextTokens)) recv", systemImage: "arrow.down")
+      if ledger.imageInputs > 0 {
+        Label("\(ledger.imageInputs) images", systemImage: "photo")
       }
     }
     .font(.caption.weight(.medium))
@@ -264,38 +233,32 @@ struct UsageStatsView: View {
     .frame(maxWidth: .infinity)
   }
 
-  private func modelRow(_ entry: UsageStatsStore.ModelTotals) -> some View {
+  private func modelRow(_ entry: ModelUsageTotals) -> some View {
     let isSelected = selectedModelIDs.contains(entry.id)
-    let approx = entry.estimatedCallCount > 0 ? "~" : ""
     return Button {
       if isSelected {
         selectedModelIDs.remove(entry.id)
       } else {
         selectedModelIDs.insert(entry.id)
       }
-      if let selectedID,
-        !chartTotals.contains(where: { $0.id == selectedID })
-      {
-        self.selectedID = nil
-      }
     } label: {
       HStack(spacing: 10) {
         VStack(alignment: .leading, spacing: 3) {
           HStack {
-            Text(sectionTitle(for: entry))
+            Text(entry.title)
               .font(.subheadline.weight(.medium))
               .foregroundStyle(.primary)
               .lineLimit(1)
               .truncationMode(.middle)
             Spacer()
-            if let average = entry.averageTokensPerSecond {
-              Text(speedText(average))
+            if let number = entry.value(metric), number > 0 {
+              Text(metric.text(number))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
             }
           }
-          Text(detailText(for: entry, approx: approx))
+          Text(entry.summary)
             .font(.caption)
             .foregroundStyle(.secondary)
             .monospacedDigit()
@@ -307,43 +270,45 @@ struct UsageStatsView: View {
     .padding(.vertical, 2)
     .buttonStyle(.plain)
     .listRowBackground(
-      isSelected ? providerColor(for: entry.providerLabel).opacity(0.14) : Color.clear
+      isSelected ? Color(providerLabel: entry.providerLabel).opacity(0.14) : Color.clear
     )
     .onLongPressGesture {
       detailEntry = entry
     }
-    .accessibilityLabel(sectionTitle(for: entry))
+    .accessibilityLabel(entry.title)
     .accessibilityValue(isSelected ? "Selected" : "Not selected")
   }
 
   private func providerRow(_ provider: ProviderUsageTotals) -> some View {
     let isSelected = selectedProviderLabels.contains(provider.providerLabel)
-    let approx = provider.estimatedCallCount > 0 ? "~" : ""
     return Button {
       if isSelected {
         selectedProviderLabels.remove(provider.providerLabel)
       } else {
         selectedProviderLabels.insert(provider.providerLabel)
       }
-      if let selectedID,
-        !chartTotals.contains(where: { $0.id == selectedID })
-      {
-        self.selectedID = nil
-      }
     } label: {
       HStack(spacing: 10) {
         Circle()
-          .fill(providerColor(for: provider.providerLabel))
+          .fill(Color(providerLabel: provider.providerLabel))
           .frame(width: 10, height: 10)
         VStack(alignment: .leading, spacing: 3) {
-          Text(provider.providerLabel)
-            .foregroundStyle(.primary)
-          Text(providerDetailText(for: provider, approx: approx))
+          HStack {
+            Text(provider.providerLabel)
+              .foregroundStyle(.primary)
+            Spacer()
+            if let efficiency = provider.efficiency, metric == .efficiency {
+              Text(ModelUsageFormat.efficiency(efficiency))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            }
+          }
+          Text(provider.summary)
             .font(.caption)
             .foregroundStyle(.secondary)
             .monospacedDigit()
         }
-        Spacer()
         Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
           .foregroundStyle(isSelected ? Color.accentColor : .secondary)
       }
@@ -353,139 +318,18 @@ struct UsageStatsView: View {
       deletingProvider = provider
     }
     .accessibilityLabel(provider.providerLabel)
-    .accessibilityValue(
-      "\(isSelected ? "Selected" : "Not selected"), \(providerDetailText(for: provider, approx: approx))"
-    )
+    .accessibilityValue("\(isSelected ? "Selected" : "Not selected"), \(provider.summary)")
+  }
+}
+
+extension Color {
+  /// The shared palette's color, so a provider looks the same here as in the
+  /// pmai visual workspace.
+  fileprivate init(_ color: ModelUsageColor) {
+    self.init(red: color.red, green: color.green, blue: color.blue)
   }
 
-  private func fullDetailText(for entry: UsageStatsStore.ModelTotals) -> String {
-    let approx = entry.estimatedCallCount > 0 ? "~" : ""
-    var lines: [String] = []
-    if let userInputTokens = entry.userInputTokens, userInputTokens > 0 {
-      lines.append("Text sent: ~\(userInputTokens.formatted())")
-    }
-    if let receivedTextTokens = entry.receivedTextTokens, receivedTextTokens > 0 {
-      lines.append("Text received: ~\(receivedTextTokens.formatted())")
-    }
-    lines.append("Provider prompt tokens: \(approx)\(entry.inputTokens.formatted())")
-    lines.append("Provider completion tokens: \(approx)\(entry.outputTokens.formatted())")
-    if let reasoningTokens = entry.reasoningTokens, reasoningTokens > 0 {
-      lines.append("Thinking tokens: \(reasoningTokens.formatted())")
-    }
-    if let imageInputs = entry.imageInputs, imageInputs > 0 {
-      lines.append("Images sent: \(imageInputs.formatted())")
-    }
-    if entry.cachedTokens > 0 {
-      lines.append("Cached tokens: \(entry.cachedTokens.formatted())")
-    }
-    lines.append("Requests: \(entry.callCount)")
-    if entry.estimatedCallCount > 0 {
-      lines.append("Estimated counts: \(entry.estimatedCallCount) req")
-    }
-    if let average = entry.averageTokensPerSecond {
-      lines.append("Average output speed: \(speedText(average))")
-    }
-    if let last = entry.lastOutputTokensPerSecond {
-      lines.append("Last output speed: \(speedText(last))")
-    }
-    if let promptSpeed = entry.averagePromptTokensPerSecond {
-      lines.append("Prompt processing speed: \(speedText(promptSpeed))")
-    }
-    if let lastFirstToken = entry.lastFirstTokenSeconds {
-      lines.append("Last time to first token: \(secondsText(lastFirstToken))")
-    }
-    if let averageFirstToken = entry.averageFirstTokenSeconds {
-      lines.append("Average time to first token: \(secondsText(averageFirstToken))")
-    }
-    if entry.generationSeconds > 0 {
-      lines.append(
-        "Generation time: \(Duration.seconds(entry.generationSeconds).formatted(.units(allowed: [.hours, .minutes, .seconds])))"
-      )
-    }
-    if entry.totalSeconds > 0 {
-      lines.append("Time in use: \(ModelUsageFormat.duration(entry.totalSeconds))")
-    }
-    if entry.lastUsedAt > .distantPast {
-      lines.append(
-        "Last used: \(entry.lastUsedAt.formatted(date: .abbreviated, time: .shortened))")
-    }
-    return lines.joined(separator: "\n")
-  }
-
-  private func detailText(for entry: UsageStatsStore.ModelTotals, approx: String) -> String {
-    var parts: [String] = []
-    if let userInputTokens = entry.userInputTokens, userInputTokens > 0 {
-      parts.append("~\(tokenText(userInputTokens)) sent")
-    }
-    if let receivedTextTokens = entry.receivedTextTokens, receivedTextTokens > 0 {
-      parts.append("~\(tokenText(receivedTextTokens)) recv")
-    }
-    if let reasoningTokens = entry.reasoningTokens, reasoningTokens > 0 {
-      parts.append("\(tokenText(reasoningTokens)) thinking")
-    }
-    if let imageInputs = entry.imageInputs, imageInputs > 0 {
-      parts.append("\(imageInputs.formatted()) images")
-    }
-    if entry.cachedTokens > 0 {
-      parts.append("\(tokenText(entry.cachedTokens)) cached")
-    }
-    parts.append("\(entry.callCount) req")
-    if entry.totalSeconds > 0 {
-      parts.append("\(ModelUsageFormat.duration(entry.totalSeconds)) in use")
-    }
-    if let promptSpeed = entry.averagePromptTokensPerSecond {
-      parts.append("prompt \(speedText(promptSpeed))")
-    }
-    if let averageFirstToken = entry.averageFirstTokenSeconds {
-      parts.append("first tok \(secondsText(averageFirstToken))")
-    }
-    return parts.joined(separator: " · ")
-  }
-
-  private func providerDetailText(for provider: ProviderUsageTotals, approx: String) -> String {
-    var parts: [String] = []
-    if provider.userInputTokens > 0 {
-      parts.append("~\(tokenText(provider.userInputTokens)) sent")
-    }
-    if provider.receivedTextTokens > 0 {
-      parts.append("~\(tokenText(provider.receivedTextTokens)) recv")
-    }
-    if provider.reasoningTokens > 0 {
-      parts.append("\(tokenText(provider.reasoningTokens)) thinking")
-    }
-    if provider.imageInputs > 0 {
-      parts.append("\(provider.imageInputs.formatted()) images")
-    }
-    if provider.totalSeconds > 0 {
-      parts.append("\(ModelUsageFormat.duration(provider.totalSeconds)) in use")
-    }
-    return parts.joined(separator: " · ")
-  }
-
-  private func sectionTitle(for entry: UsageStatsStore.ModelTotals) -> String {
-    entry.title
-  }
-
-  private func tokenText(_ count: Int) -> String {
-    count.formatted(.number.notation(.compactName))
-  }
-
-  private func speedText(_ tokensPerSecond: Double) -> String {
-    ModelUsageFormat.speed(tokensPerSecond)
-  }
-
-  private func secondsText(_ seconds: TimeInterval) -> String {
-    ModelUsageFormat.seconds(seconds)
-  }
-
-  /// The shared palette's hue for a provider, so a provider has the same
-  /// color here as in the pmai visual workspace.
-  private func providerColor(
-    for providerLabel: String
-  ) -> Color {
-    Color(
-      hue: ModelUsagePalette.hue(forProviderLabel: providerLabel),
-      saturation: ModelUsagePalette.saturation,
-      brightness: ModelUsagePalette.brightness)
+  fileprivate init(providerLabel: String) {
+    self.init(ModelUsagePalette.color(forProviderLabel: providerLabel))
   }
 }

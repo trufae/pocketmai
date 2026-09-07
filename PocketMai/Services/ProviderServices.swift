@@ -1738,26 +1738,20 @@ enum OpenAICompatibleProvider {
     outputCharacterCount: Int,
     timing: StreamTimingObservation
   ) async {
-    // The resolver measures speed over the first→last token window and falls
-    // back to total wall time when the stream arrived as one burst, so a local
-    // endpoint that delivers everything at once cannot produce absurd tok/s.
-    let resolved = GenerationStats.resolveTiming(timing, end: Date())
-    let stats = GenerationStats(
+    // MaiCore measures the call the way the pmai runtime does: speed over the
+    // first→last token window, total wall time when the stream arrived as one
+    // burst (so a local endpoint that delivers everything at once cannot
+    // produce absurd tok/s), and counts estimated from text length, marked as
+    // such, when the provider reported no usage.
+    let stats = GenerationStats.measured(
       providerLabel: context.providerLabel,
       modelID: context.modelID,
-      inputTokens: usage?.inputTokens ?? context.fallbackInputTokenEstimate,
+      usage: usage,
+      estimatedInputTokens: context.fallbackInputTokenEstimate,
+      outputCharacterCount: outputCharacterCount,
+      timing: timing,
       userInputTokens: context.userInputTokens,
-      outputTokens: usage?.outputTokens
-        ?? GenerationStats.estimatedTokenCount(forCharacterCount: outputCharacterCount),
-      receivedTextTokens: GenerationStats.estimatedTokenCount(
-        forCharacterCount: outputCharacterCount),
-      reasoningTokens: usage?.reasoningTokens,
-      imageInputs: context.imageInputCount,
-      cachedTokens: usage?.cachedTokens ?? 0,
-      promptSeconds: resolved.promptSeconds,
-      generationSeconds: resolved.generationSeconds,
-      firstTokenSeconds: resolved.firstTokenSeconds,
-      tokensEstimated: usage == nil)
+      imageInputs: context.imageInputCount)
     await UsageStatsStore.record(stats, assistantMessageID: context.assistantMessageID)
   }
 

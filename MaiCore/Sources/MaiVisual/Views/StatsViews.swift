@@ -3,9 +3,9 @@ import MaiCore
 import SwiftTUIRuntime
 
 /// Lifetime usage per provider/model, ranked the way PocketMai's Statistics
-/// screen ranks it: one colored bar per model for average output speed and
-/// one for time in use. Colors come from the shared palette, so a provider
-/// looks the same here as on the phone.
+/// screen ranks it: one colored bar per model for each metric of the shared
+/// report — average output speed, time in use, and efficiency. Colors come
+/// from the shared palette, so a provider looks the same here as on the phone.
 struct StatsScreen: View {
   let workspace: VisualWorkspace
 
@@ -22,16 +22,9 @@ struct StatsScreen: View {
               Text("Model statistics").bold()
               Text(report.headline).foregroundStyle(.muted).lineLimit(1).truncationMode(.tail)
             }
-            UsageBarChart(
-              title: "Average output speed",
-              metric: .speed,
-              report: report,
-              width: Int(proxy.size.width) - 2)
-            UsageBarChart(
-              title: "Time in use",
-              metric: .time,
-              report: report,
-              width: Int(proxy.size.width) - 2)
+            ForEach(ModelUsageReport.Metric.allCases, id: \.self) { metric in
+              UsageBarChart(metric: metric, report: report, width: Int(proxy.size.width) - 2)
+            }
             if report.hasEstimates {
               Text(
                 "~ marks token counts estimated from text length (about 4 characters per token)."
@@ -62,7 +55,6 @@ struct StatsScreen: View {
 /// row, the value, and the row's other facts. Bars share one width so the
 /// column reads as a ranking.
 private struct UsageBarChart: View {
-  let title: String
   let metric: ModelUsageReport.Metric
   let report: ModelUsageReport
   let width: Int
@@ -83,15 +75,18 @@ private struct UsageBarChart: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
-      Text(title).bold()
+      Text(metric.title).bold()
       ForEach(rows) { row in
         HStack(spacing: 1) {
-          Text(padded(clipped(row.title, to: labelWidth), to: labelWidth))
-            .lineLimit(1)
+          Text(
+            ModelUsageFormat.pad(
+              ModelUsageFormat.clip(row.title, to: labelWidth), to: labelWidth)
+          )
+          .lineLimit(1)
           Text(ModelUsageFormat.bar(fraction: row.fraction(metric), width: barWidth))
             .foregroundStyle(
               Color(red: row.color.red, green: row.color.green, blue: row.color.blue))
-          Text(padded(row.value(metric), to: valueWidth, leading: true)).bold()
+          Text(ModelUsageFormat.pad(row.value(metric), to: valueWidth, leading: true)).bold()
           Text(row.detail(metric))
             .foregroundStyle(.muted)
             .lineLimit(1)
@@ -99,17 +94,5 @@ private struct UsageBarChart: View {
         }
       }
     }
-  }
-
-  private func clipped(_ text: String, to width: Int) -> String {
-    guard text.count > width, width > 1 else { return text }
-    return String(text.prefix(width - 1)) + "…"
-  }
-
-  private func padded(_ text: String, to width: Int, leading: Bool = false) -> String {
-    let missing = max(0, width - text.count)
-    guard missing > 0 else { return text }
-    let fill = String(repeating: " ", count: missing)
-    return leading ? fill + text : text + fill
   }
 }

@@ -4,11 +4,11 @@ import MaiCore
 /// Accumulates token usage and generation speed per provider/model across the
 /// whole app. Providers report every completed model call (chat turns, tool-loop
 /// rounds, title generation), so totals reflect real consumption. The arithmetic
-/// is MaiCore's `ModelUsageLedger`, the same code behind the pmai REPL's
-/// `/stats`; this store adds the main-actor publishing SwiftUI needs, the
-/// UserDefaults persistence PocketMai has always used, and the per-message
-/// stats kept briefly so the tool loop can stamp them onto the assistant
-/// message before it is persisted.
+/// and the persistence are MaiCore's `ModelUsageLedger` and
+/// `UserDefaultsModelUsagePersistence`, the same code behind the pmai REPL's
+/// `/stats`; this store adds the main-actor publishing SwiftUI needs and the
+/// per-message stats kept briefly so the tool loop can stamp them onto the
+/// assistant message before it is persisted.
 @MainActor
 final class UsageStatsStore: ObservableObject {
   static let shared = UsageStatsStore()
@@ -22,10 +22,12 @@ final class UsageStatsStore: ObservableObject {
   private var pendingByMessageID: [UUID: GenerationStats] = [:]
   private var pendingOrder: [UUID] = []
   private static let pendingLimit = 64
-  private static let defaultsKey = "usageStats.totals.v1"
+  /// The key every release has stored the totals under; the ledger reads the
+  /// numeric dates earlier releases wrote as well as the ISO 8601 dates now.
+  private static let persistence = UserDefaultsModelUsagePersistence(key: "usageStats.totals.v1")
 
   private init() {
-    ledger = Self.loadLedger()
+    ledger = (try? Self.persistence.load()) ?? ModelUsageLedger()
   }
 
   static func record(_ stats: GenerationStats, assistantMessageID: UUID?) {
@@ -72,18 +74,6 @@ final class UsageStatsStore: ObservableObject {
   }
 
   private func persistLedger() {
-    guard let data = try? ledger.encoded() else { return }
-    UserDefaults.standard.set(data, forKey: Self.defaultsKey)
-  }
-
-  /// Totals saved by any earlier release decode too: the ledger reads the
-  /// numeric dates they stored as well as the ISO 8601 dates written now.
-  private static func loadLedger() -> ModelUsageLedger {
-    guard let data = UserDefaults.standard.data(forKey: defaultsKey),
-      let decoded = try? ModelUsageLedger.decode(data)
-    else {
-      return ModelUsageLedger()
-    }
-    return decoded
+    try? Self.persistence.save(ledger)
   }
 }

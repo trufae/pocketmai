@@ -118,7 +118,7 @@ func acpPermissionPolicy() {
 
 @Test("A catalog agent becomes an acp-kind provider record")
 func acpCatalog() {
-  let gemini = try? #require(ACPCatalog.agent("gemini"))
+  let gemini = ACPCatalog.agent("gemini")
   #expect(gemini?.command == "gemini")
   let provider = gemini?.configuredProvider()
   #expect(provider?.kind == ACPConfiguredProviderFactory.providerKind)

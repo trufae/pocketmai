@@ -331,7 +331,7 @@ func unansweredToolCallsAreSettled() {
     in: cut, reason: "the run was cancelled")
   #expect(repaired.count == 5)
   #expect(repaired[4].role == .tool)
-  let result = try? #require(repaired[4].toolResults.first)
+  let result = repaired[4].toolResults.first
   #expect(result?.callID == "c1")
   #expect(result?.isError == true)
   #expect(result?.text == "Error: not executed; the run was cancelled.")

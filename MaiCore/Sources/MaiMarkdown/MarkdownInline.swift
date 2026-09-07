@@ -189,7 +189,12 @@ public enum MarkdownInlineParser {
       let delimiterLength = index + 1 < chars.count && chars[index + 1] == "$" ? 2 : 1
       let start = index
       var cursor = index + delimiterLength
-      while cursor < chars.count {
+      // Pandoc's rule keeps prices out of maths: a single `$` opens a formula
+      // only before a non-space, and closes one only after a non-space and
+      // not before a digit, so "$5 and $10" stays text.
+      let opensInline =
+        delimiterLength == 2 || (cursor < chars.count && !chars[cursor].isWhitespace)
+      while opensInline, cursor < chars.count {
         if chars[cursor] == "\\" {
           cursor += 2
           continue
@@ -200,6 +205,12 @@ public enum MarkdownInlineParser {
         }
         if delimiterLength == 2 {
           guard cursor + 1 < chars.count, chars[cursor + 1] == "$" else {
+            cursor += 1
+            continue
+          }
+        } else {
+          let followedByDigit = cursor + 1 < chars.count && chars[cursor + 1].isNumber
+          guard !chars[cursor - 1].isWhitespace, !followedByDigit else {
             cursor += 1
             continue
           }

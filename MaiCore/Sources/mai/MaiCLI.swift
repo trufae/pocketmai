@@ -6715,7 +6715,9 @@ struct MaiCLI {
   }
 
   /// `/stats`: the usage ledger the runtime fills after every model call,
-  /// printed as one colored bar per provider:model for speed and for time.
+  /// printed as one colored bar per provider:model for speed, time in use,
+  /// and efficiency. `/stats METRIC` shows one ranking; `/stats show TARGET`
+  /// every fact recorded about a model or a provider.
   private static func handleStatsCommand(
     _ argument: String,
     store: ModelUsageStore,
@@ -6724,51 +6726,71 @@ struct MaiCLI {
     let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
       String.init)
     let action = fields.first?.lowercased() ?? ""
-    switch action {
-    case "", "list", "show":
+    let target = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespaces) : ""
+    func printReport(_ metrics: [ModelUsageReport.Metric]) async {
       let report = ModelUsageReport(await store.ledger)
       let colors = await terminal.paintsOutput
-      let lines = report.lines(width: TerminalLineEditor.terminalColumns()) { bar, color in
-        guard colors, let code = TerminalLineEditor.foregroundColorCode(color.hex) else {
-          return bar
+      // Headings in the cyan of `✓ took`, label and bar in the provider's
+      // palette color, the number bold, the rest dim.
+      let lines = report.lines(width: TerminalLineEditor.terminalColumns(), metrics: metrics) {
+        text, style in
+        guard colors else { return text }
+        let code: String
+        switch style {
+        case .heading: code = "1;36"
+        case .headline: code = "36"
+        case .label(let color), .bar(let color):
+          guard let colorCode = TerminalLineEditor.foregroundColorCode(color.hex) else {
+            return text
+          }
+          code = colorCode
+        case .value: code = "1"
+        case .detail, .note: code = "2"
         }
-        return "\u{1B}[\(code)m\(bar)\u{1B}[0m"
+        return "\u{1B}[\(code)m\(text)\u{1B}[0m"
       }
       await terminal.line(lines.joined(separator: "\n"))
       if let error = await store.lastPersistenceError {
         await terminal.line(
           "warning: statistics could not be saved: \(error)", to: .standardError)
       }
+    }
+    if let metric = ModelUsageReport.Metric(rawValue: action) {
+      await printReport([metric])
+      return
+    }
+    switch action {
+    case "", "list":
+      await printReport(ModelUsageReport.Metric.allCases)
+    case "show":
+      guard !target.isEmpty else {
+        await printReport(ModelUsageReport.Metric.allCases)
+        return
+      }
+      let rows = await store.ledger.totals(matching: target)
+      guard !rows.isEmpty else {
+        await terminal.line(noStatisticsMessage(for: target))
+        return
+      }
+      await terminal.line(
+        rows.map { row in
+          ([row.title] + row.detailLines.map { "  " + $0 }).joined(separator: "\n")
+        }.joined(separator: "\n"))
     case "reset", "clear":
       await store.reset()
       await terminal.line("Usage statistics reset.")
     case "rm", "remove", "delete", "forget":
-      let target = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespaces) : ""
       guard !target.isEmpty else {
         await terminal.line("Usage: /stats rm PROVIDER[:MODEL]")
         return
       }
-      if await store.remove(id: target) {
-        await terminal.line("Removed the statistics of '\(target)'.")
-        return
-      }
-      let byProvider = await store.remove(providerLabel: target)
-      if byProvider > 0 {
+      switch await store.remove(matching: target) {
+      case 0: await terminal.line(noStatisticsMessage(for: target))
+      case 1: await terminal.line("Removed the statistics of '\(target)'.")
+      case let count:
         await terminal.line(
-          "Removed the statistics of \(byProvider) model\(byProvider == 1 ? "" : "s") of provider '\(target)'."
-        )
-        return
+          "Removed the statistics of \(count) models of provider '\(target)'.")
       }
-      if let separator = target.firstIndex(of: ":") {
-        let id = ModelUsageTotals.id(
-          providerLabel: String(target[..<separator]),
-          modelID: String(target[target.index(after: separator)...]))
-        if await store.remove(id: id) {
-          await terminal.line("Removed the statistics of '\(target)'.")
-          return
-        }
-      }
-      await terminal.line("No statistics for '\(target)'. /stats lists the provider:model pairs.")
     case "path":
       await terminal.line(
         await store.location?.path ?? "Statistics are kept in memory for this session only.")
@@ -6779,16 +6801,23 @@ struct MaiCLI {
     }
   }
 
+  private static func noStatisticsMessage(for target: String) -> String {
+    "No statistics for '\(target)'. /stats lists the provider:model pairs."
+  }
+
   private static let statsHelp = """
     Statistics commands:
-      /stats                 Rank every provider:model used by tokens/s, with time in use
+      /stats                 Rank every provider:model used by tokens/s, time in use, and efficiency
+      /stats METRIC          One ranking: speed, time, or efficiency
+      /stats show PROVIDER[:MODEL]  Every fact recorded about one model or a whole provider
       /stats rm PROVIDER[:MODEL]  Drop the statistics of one model or a whole provider
       /stats reset           Forget every statistic
       /stats path            Print the file the statistics are saved in
     The runtime records tokens (from the provider's usage, or estimated from text
     length and marked ~) and the wall-clock time of every model call, in the REPL,
     one-shot runs, and the visual workspace alike. Speed is visible output tokens
-    over the streaming window; time in use adds the wait for the first token.
+    over the streaming window; time in use adds the wait for the first token;
+    efficiency is total tokens / (seconds in use × requests).
     """
 
   private static let exportHelp = """
@@ -8111,7 +8140,8 @@ struct MaiCLI {
       "/agents", "/agents tree", "/agents clear", "/agents log ", "/agents kill ", "/agents focus ",
       "/agents focus main", "/queue", "/queue push ", "/queue pop", "/queue drop",
       "/help queue", "/help export", "/export markdown ", "/export json ", "/export debug ",
-      "/stats", "/stats reset", "/stats rm ", "/stats path", "/help stats",
+      "/stats", "/stats speed", "/stats time", "/stats efficiency", "/stats show ",
+      "/stats reset", "/stats rm ", "/stats path", "/help stats",
       "/export epub ", "/export docx ", "/set ui.subagents all", "/set ui.subagents tools",
       "/set ui.subagents stats", "/set ui.subagents none",
       "/agent use ",
@@ -8424,7 +8454,7 @@ struct MaiCLI {
     /attach clear       Drop the attachments queued for the next message
     /copy [N] [PATH]    Copy the last reply, or N messages, to the clipboard or a file
     /export FORMAT [PATH]  Save this chat as markdown, json, debug, epub, or docx
-    /stats              Tokens/s and time in use for every provider:model, as bars
+    /stats              Tokens/s, time in use, and efficiency per provider:model, as bars
     \(visualHelp)/clear              Clear conversation history
     /exit               Exit the REPL
 

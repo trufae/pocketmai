@@ -318,18 +318,30 @@ func reportRanksAndRenders() {
   #expect(report.rows[0].value(.time) == "1m44s")
 
   var painted: [ModelUsageColor] = []
-  let lines = report.lines(width: 100) { bar, color in
+  var styles: [ModelUsageReport.Style] = []
+  let lines = report.lines(width: 100) { text, style in
+    styles.append(style)
+    guard case .bar(let color) = style else { return text }
     painted.append(color)
-    return "<\(bar)>"
+    return "<\(text)>"
   }
   #expect(lines.first == "Model usage: \(report.headline)")
   #expect(lines.contains("Average output speed"))
   #expect(lines.contains("Time in use"))
+  #expect(lines.contains("Efficiency"))
   #expect(lines.contains { $0.contains("thor — qwen3.8:27b") && $0.contains("40.0 tok/s") })
   #expect(lines.contains { $0.contains("openai — big-pickle") && $0.contains("20.0 tok/s") })
   #expect(lines.contains { $0.contains("hello") && $0.contains("no speed") })
   #expect(lines.last?.hasPrefix("~ marks") == true)
-  #expect(painted.count == 6)
+  #expect(painted.count == 9)
+  #expect(styles.prefix(2) == [.heading, .headline])
+  #expect(styles.contains(.value) && styles.contains(.detail) && styles.contains(.note))
+  #expect(
+    report.runs(width: 100)[0]
+      == [
+        ModelUsageReport.Run("Model usage: ", .heading),
+        ModelUsageReport.Run(report.headline, .headline),
+      ])
   let speedBars = lines.filter { $0.contains("<") }.prefix(3).map {
     $0.split(separator: "<")[1].split(separator: ">")[0]
   }
@@ -402,4 +414,199 @@ func processSummaryShowsElapsedTime() {
 
   let starting = AgentProcessInfo(pid: AgentPID(4), runID: UUID(), agentID: "new")
   #expect(starting.summaryLine == "#4 new  [start]")
+}
+
+@Test("Efficiency is tokens per second in use per request, ranked like the other metrics")
+func efficiencyScoreAndRanking() throws {
+  var ledger = ModelUsageLedger()
+  ledger.record(
+    ModelCallStats(
+      providerLabel: "thor", modelID: "qwen3.8:27b", inputTokens: 1_000, outputTokens: 4_000,
+      promptSeconds: 4, generationSeconds: 100),
+    at: start)
+  ledger.record(
+    ModelCallStats(
+      providerLabel: "thor", modelID: "qwen3.8:27b", inputTokens: 1_000, outputTokens: 1_000,
+      generationSeconds: 46),
+    at: start)
+  ledger.record(
+    ModelCallStats(
+      providerLabel: "openai", modelID: "big-pickle", inputTokens: 500, outputTokens: 400,
+      generationSeconds: 20, tokensEstimated: true),
+    at: start)
+  ledger.record(
+    ModelCallStats(providerLabel: "hello", modelID: "hello", inputTokens: 3, outputTokens: 0),
+    at: start)
+
+  // 7,000 tokens over 150 s in use and 2 requests.
+  let thor = try #require(ledger.totals(id: "thor|qwen3.8:27b"))
+  #expect(abs((thor.efficiency ?? 0) - 7_000 / (150 * 2)) < 0.0001)
+  #expect(thor.value(.efficiency) == thor.efficiency)
+  #expect(thor.value(.time) == 150)
+  #expect(abs((ledger.totals(id: "openai|big-pickle")?.efficiency ?? 0) - 45) < 0.0001)
+  #expect(ledger.totals(id: "hello|hello")?.efficiency == nil)
+  #expect(ledger.sortedByEfficiency.map(\.id) == ["openai|big-pickle", "thor|qwen3.8:27b"])
+  #expect(abs((ledger.efficiency ?? 0) - 7_903 / (170 * 4)) < 0.0001)
+  #expect(ModelUsageTotals.efficiency(tokens: 10, seconds: 0, requests: 1) == nil)
+  #expect(ModelUsageFormat.efficiency(23.333) == "23.3 tok/s/req")
+
+  let report = ModelUsageReport(ledger)
+  let ranked = report.rows(for: .efficiency)
+  #expect(ranked.map(\.id) == ["openai|big-pickle", "thor|qwen3.8:27b", "hello|hello"])
+  #expect(ranked[0].fraction(.efficiency) == 1)
+  #expect(ranked[0].value(.efficiency) == "45.0 tok/s/req")
+  #expect(ranked[1].detail(.efficiency) == "34.2 tok/s · 2m30s · 2 req · 7.0k tok")
+  #expect(ranked[2].value(.efficiency) == "no score")
+  #expect(ranked[2].fraction(.efficiency) == 0)
+  #expect(report.headline.hasSuffix("efficiency 11.6 tok/s/req"))
+
+  let lines = report.lines(width: 100, metrics: [.efficiency])
+  #expect(lines.count == 6)
+  #expect(lines[1] == "Efficiency")
+  #expect(lines[2].contains("openai — big-pickle") && lines[2].contains("45.0 tok/s/req"))
+  #expect(report.lines(width: 100).contains("Efficiency"))
+  #expect(ModelUsageReport.Metric.allCases == [.speed, .time, .efficiency])
+  #expect(ModelUsageReport.Metric.efficiency.label == "Efficiency")
+  #expect(ModelUsageReport.Metric.time.text(nil) == "<1s")
+}
+
+@Test("Command-line targets name a row, a provider, or PROVIDER:MODEL")
+func ledgerMatchesTargets() async {
+  var ledger = ModelUsageLedger()
+  for (provider, model) in [("thor", "qwen3.8:27b"), ("thor", "gemma"), ("openai", "big-pickle")]
+  {
+    ledger.record(
+      ModelCallStats(providerLabel: provider, modelID: model, inputTokens: 1, outputTokens: 1),
+      at: start)
+  }
+  #expect(ledger.totals(matching: "thor|gemma").map(\.id) == ["thor|gemma"])
+  #expect(ledger.totals(matching: "thor:qwen3.8:27b").map(\.id) == ["thor|qwen3.8:27b"])
+  #expect(ledger.totals(matching: "thor").count == 2)
+  #expect(ledger.totals(matching: "nope").isEmpty)
+  #expect(ledger.totals(matching: "thor:nope").isEmpty)
+  #expect(ledger.remove(matching: "thor:gemma") == 1)
+  #expect(ledger.remove(matching: "thor") == 1)
+  #expect(ledger.remove(matching: "thor") == 0)
+  #expect(ledger.totals.map(\.id) == ["openai|big-pickle"])
+
+  let store = ModelUsageStore()
+  await store.record(
+    ModelCallStats(providerLabel: "openai", modelID: "big-pickle", inputTokens: 1, outputTokens: 1))
+  #expect(await store.remove(matching: "openai") == 1)
+  #expect(await store.ledger.isEmpty)
+}
+
+@Test("Rows, providers, and calls describe themselves the same way on every host")
+func summariesAndDetailLines() throws {
+  var ledger = ModelUsageLedger()
+  ledger.record(
+    ModelCallStats(
+      providerLabel: "thor", modelID: "qwen3.8:27b", inputTokens: 1_000, userInputTokens: 40,
+      outputTokens: 4_000, receivedTextTokens: 3_900, reasoningTokens: 100, imageInputs: 1,
+      cachedTokens: 200, promptSeconds: 4, generationSeconds: 100, firstTokenSeconds: 4),
+    at: start)
+  let row = try #require(ledger.totals.first)
+  #expect(
+    row.summary
+      == "~40 sent · ~3.9k recv · 100 thinking · 1 image · 200 cached · 1 req · 1m44s in use · prompt 250.0 tok/s · first tok 4.00s"
+  )
+  let lines = row.detailLines
+  #expect(lines.contains("Text sent: ~40 tok"))
+  #expect(lines.contains("Prompt tokens: 1.0k tok"))
+  #expect(lines.contains("Completion tokens: 4.0k tok"))
+  #expect(lines.contains("Thinking tokens: 100 tok"))
+  #expect(lines.contains("Requests: 1"))
+  #expect(lines.contains("Average output speed: 39.0 tok/s"))
+  #expect(lines.contains("Average time to first token: 4.00s"))
+  #expect(lines.contains("Time in use: 1m44s"))
+  #expect(lines.contains("Efficiency: 48.1 tok/s/req"))
+  #expect(lines.last?.hasPrefix("Last used: ") == true)
+  #expect(!lines.contains { $0.hasPrefix("Estimated counts") })
+
+  let provider = try #require(ledger.providerTotals.first)
+  #expect(
+    provider.summary
+      == "1 model · ~40 sent · ~3.9k recv · 100 thinking · 1 image · 1 req · 1m44s in use")
+  #expect(abs((provider.efficiency ?? 0) - 5_000 / 104) < 0.0001)
+
+  let call = ModelCallStats(
+    providerLabel: "thor", modelID: "qwen", inputTokens: 1_234, outputTokens: 300,
+    cachedTokens: 50, generationSeconds: 10, firstTokenSeconds: 0.85, callCount: 2)
+  #expect(call.summary == "30.0 tok/s · first tok 0.85s · 1.2k in · 50 cached · 300 out · 2 calls")
+  let estimated = ModelCallStats(
+    providerLabel: "hello", modelID: "hello", inputTokens: 9, outputTokens: 12,
+    tokensEstimated: true)
+  #expect(estimated.summary == "~9 in · ~12 out")
+}
+
+@Test("Hosts measure a call from its usage payload the way the runtime does")
+func measuredFromUsagePayload() {
+  var observation = StreamTimingObservation(requestStart: start)
+  for offset in [1.0, 2.0, 3.0] {
+    observation.noteTokenChunk(at: start.addingTimeInterval(offset))
+  }
+  let reported = ModelCallStats.measured(
+    providerLabel: "Ollama",
+    modelID: "llama3",
+    usage: TokenUsage(inputTokens: 30, outputTokens: 12, cachedTokens: 5, reasoningTokens: 4),
+    estimatedInputTokens: 99,
+    outputCharacterCount: 80,
+    timing: observation,
+    end: start.addingTimeInterval(3.5),
+    userInputTokens: 10,
+    imageInputs: 2)
+  #expect(!reported.tokensEstimated)
+  #expect(reported.inputTokens == 30)
+  #expect(reported.outputTokens == 12)
+  #expect(reported.receivedTextTokens == 20)
+  #expect(reported.reasoningTokens == 4)
+  #expect(reported.cachedTokens == 5)
+  #expect(reported.imageInputs == 2)
+  #expect(reported.userInputTokens == 10)
+  #expect(abs(reported.promptSeconds - 1) < 0.0001)
+  #expect(abs(reported.generationSeconds - 2) < 0.0001)
+
+  let estimated = ModelCallStats.measured(
+    providerLabel: "hello",
+    modelID: "hello",
+    usage: TokenUsage(inputTokens: 5, outputTokens: 7, isEstimated: true),
+    estimatedInputTokens: 99,
+    outputCharacterCount: 80,
+    timing: StreamTimingObservation(requestStart: start),
+    end: start.addingTimeInterval(1))
+  #expect(estimated.tokensEstimated)
+  #expect(estimated.inputTokens == 5)
+  #expect(estimated.outputTokens == 7)
+  #expect(estimated.firstTokenSeconds == nil)
+
+  let unreported = ModelCallStats.measured(
+    providerLabel: "hello",
+    modelID: "hello",
+    usage: nil,
+    estimatedInputTokens: 99,
+    outputCharacterCount: 80,
+    timing: StreamTimingObservation(requestStart: start),
+    end: start.addingTimeInterval(1))
+  #expect(unreported.tokensEstimated)
+  #expect(unreported.inputTokens == 99)
+  #expect(unreported.outputTokens == 20)
+}
+
+@Test("UserDefaults persistence round-trips a ledger under its key")
+func userDefaultsPersistence() async throws {
+  let suite = "MaiCoreTests.usage.\(UUID().uuidString)"
+  defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+  let persistence = UserDefaultsModelUsagePersistence(key: "usage", suiteName: suite)
+  #expect(try persistence.load().isEmpty)
+
+  var ledger = ModelUsageLedger()
+  ledger.record(
+    ModelCallStats(providerLabel: "thor", modelID: "qwen", inputTokens: 1, outputTokens: 2),
+    at: start)
+  try persistence.save(ledger)
+  #expect(try persistence.load() == ledger)
+  #expect(UserDefaults(suiteName: suite)?.data(forKey: "usage") != nil)
+
+  let store = ModelUsageStore(persistence: persistence)
+  #expect(await store.ledger == ledger)
 }
