@@ -116,7 +116,7 @@ public struct MaiStandardToolFactory: ConfiguredToolFactory {
         id: "files",
         displayName: "Files",
         description:
-          "List, find, grep, index, read, get or set functions, patch, write, append, rename, delete, and change directory in one workspace.",
+          "List, find, grep, index, read, get or set functions, patch, write, append, rename, and delete in one workspace.",
         toolNames: Set(MaiFileWorkspaceTool.toolNames),
         options: [
           .init(

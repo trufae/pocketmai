@@ -39,7 +39,6 @@ func fileToolsAcceptAbsolutePathsInsideTheWorkspace() async throws {
   #expect(outside.isError)
   #expect(outside.text.contains("outside the configured workspace"))
   #expect(outside.text.contains("The workspace is \(root.path)"))
-  #expect(outside.text.contains("files_chdir"))
   let missing = try await usabilityCall(usabilityTool(tools, .read), ["path": .string("src/nope.c")])
   #expect(missing.isError)
   #expect(missing.text.contains("does not exist"))

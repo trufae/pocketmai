@@ -46,11 +46,10 @@ public struct MaiFileWorkspaceTool: AgentTool {
     case write = "files_write"
     case rename = "files_rename"
     case delete = "files_delete"
-    case chdir = "files_chdir"
 
     var changesFiles: Bool {
       switch self {
-      case .list, .find, .grep, .read, .readIndex, .getFunction, .readRange, .chdir:
+      case .list, .find, .grep, .read, .readIndex, .getFunction, .readRange:
         false
       case .setFunction, .replaceRange, .patch, .write, .rename, .delete: true
       }
@@ -124,8 +123,6 @@ public struct MaiFileWorkspaceTool: AgentTool {
         return try workspace.rename(arguments)
       case .delete:
         return try workspace.delete(arguments)
-      case .chdir:
-        return try workspace.chdir(arguments)
       }
     } catch is CancellationError {
       throw CancellationError()
@@ -455,19 +452,6 @@ public struct MaiFileWorkspaceTool: AgentTool {
           idempotent: false,
           openWorld: false,
           approval: .dangerous))
-    case .chdir:
-      return ToolDefinition(
-        name: operation.rawValue,
-        description: "Change the current directory used by the Files workspace.",
-        parameters: [
-          ToolParameterDef(
-            name: "path",
-            type: "string",
-            description: "Directory path, relative to the current directory or absolute.",
-            required: true)
-        ],
-        annotations: ToolAnnotations(
-          readOnly: false, idempotent: false, openWorld: false, approval: .confirm))
     }
   }
 }
@@ -526,27 +510,6 @@ private struct MaiFileWorkspace: Sendable {
     }
     self.configuration = configuration
     rootURL = configuredRoot.resolvingSymlinksInPath().standardizedFileURL
-  }
-
-  func chdir(_ arguments: [String: JSONValue]) throws -> ToolOutput {
-    guard configuration.followsProcessWorkingDirectory else {
-      throw MaiFileWorkspaceError.invalidPath("files_chdir requires a dynamic workspace")
-    }
-    guard let rawPath = arguments["path"]?.stringValue,
-      !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    else { throw MaiFileWorkspaceError.missingArgument("path") }
-    let expanded = NSString(string: rawPath).expandingTildeInPath
-    let target = URL(fileURLWithPath: expanded, relativeTo: rootURL).standardizedFileURL
-    var isDirectory: ObjCBool = false
-    guard FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory),
-      isDirectory.boolValue
-    else { throw MaiFileWorkspaceError.notDirectory(target.path) }
-    guard FileManager.default.changeCurrentDirectoryPath(target.path) else {
-      throw MaiFileWorkspaceError.invalidPath(target.path)
-    }
-    return ToolOutput(
-      content: [.text(FileManager.default.currentDirectoryPath)],
-      structuredContent: .object(["cwd": .string(FileManager.default.currentDirectoryPath)]))
   }
 
   func list(_ arguments: [String: JSONValue]) throws -> ToolOutput {
@@ -1816,7 +1779,7 @@ extension MaiFileWorkspaceError {
   func pathHint(root: String) -> String {
     switch self {
     case .outsideWorkspace, .notFound, .notDirectory, .notFile:
-      " The workspace is \(root): give paths relative to it, or absolute paths inside it; files_chdir moves it."
+      " The workspace is \(root): give paths relative to it, or absolute paths inside it."
     default:
       ""
     }

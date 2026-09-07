@@ -587,14 +587,14 @@ removes the mutation tools when disabled. Mutations still go through normal
 confirmation, and deletion is marked dangerous.
 
 With the default Files workspace (no explicit `filesRoot`, or `filesRoot: "."`),
-`/cwd` prints the process working directory and `/cd PATH` changes it. The model
-can use `files_chdir` with the same behavior. The default workspace resolves its
-root on each tool call, keeping an installed `pmai` binary aligned with the
-directory from which it was launched. An explicit `filesRoot` remains fixed and
-does not expose `files_chdir`. Paths are relative to that directory, and an
-absolute path is accepted as long as it lies inside it, so a model can reuse a
-path a shell command printed; a path error names the directory so the model can
-correct itself.
+`/cwd` prints the process working directory and `/cd PATH` changes it; the model
+has no tool for that, since every path argument already takes a relative or an
+absolute path. The default workspace resolves its root on each tool call,
+keeping an installed `pmai` binary aligned with the directory from which it was
+launched. An explicit `filesRoot` remains fixed. Paths are relative to that
+directory, and an absolute path is accepted as long as it lies inside it, so a
+model can reuse a path a shell command printed; a path error names the directory
+so the model can correct itself.
 The `run` group is one tool, `run_sh`, which executes code on this computer
 with the privileges of the `pmai` process: the command line or script is saved
 to a temporary file and run with the configured shell (`runShell`; a name looked
