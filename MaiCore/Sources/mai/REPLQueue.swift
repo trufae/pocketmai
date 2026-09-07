@@ -38,7 +38,7 @@ extension MaiCLI {
 
   /// `/queue` shows and edits the messages waiting for the next model turn of
   /// any agent: `push` adds one without sending it, `pop` drops the newest,
-  /// `flush` drops them all. A pid narrows `pop` and `flush` to one agent.
+  /// `drop` drops them all. A pid narrows `pop` and `drop` to one agent.
   static func handleQueueCommand(
     _ argument: String,
     focus: REPLMessageTarget,
@@ -69,7 +69,7 @@ extension MaiCLI {
         await terminal.line("  \(index + 1). agent#\(entry.pid.rawValue) \(name)\(state)  \(text)")
       }
       await terminal.line(
-        "Each is delivered at its agent's next model turn. /queue pop drops the newest, /queue flush drops all."
+        "Each is delivered at its agent's next model turn. /queue pop drops the newest, /queue drop drops all."
       )
 
     case "push", "add":
@@ -98,7 +98,7 @@ extension MaiCLI {
         "Queued for \(describe(pid, main: main, info: info)) (\(count) waiting). It goes out at the agent's next model turn; the chat's own queue also goes with your next message."
       )
 
-    case "pop", "drop":
+    case "pop":
       let pid = rest.isEmpty ? nil : focusTarget(rest).map { $0.pid(main: main) }
       if !rest.isEmpty, pid == nil {
         await terminal.line("Usage: /queue pop [PID]")
@@ -112,10 +112,10 @@ extension MaiCLI {
         "Dropped from agent#\(dropped.pid.rawValue): \(AgentProcessInfo.oneLine(dropped.message.text, limit: 100))"
       )
 
-    case "flush", "clear":
+    case "drop", "flush", "clear":
       let pid = rest.isEmpty ? nil : focusTarget(rest).map { $0.pid(main: main) }
       if !rest.isEmpty, pid == nil {
-        await terminal.line("Usage: /queue flush [PID]")
+        await terminal.line("Usage: /queue drop [PID]")
         return
       }
       let dropped = await supervisor.clearQueuedMessages(for: pid)
@@ -144,7 +144,7 @@ extension MaiCLI {
       /queue push TEXT       Queue TEXT for the focused agent without sending it
       /queue push @PID TEXT  Queue TEXT for one agent
       /queue pop [PID]       Drop the newest queued message (of one agent)
-      /queue flush [PID]     Drop every queued message (of one agent)
+      /queue drop [PID]      Drop every queued message (of one agent)
 
     @PID TEXT sends one message to a running agent; /agents focus PID makes it
     the target of everything you type until /agents focus main.

@@ -8109,7 +8109,7 @@ struct MaiCLI {
       "/prompt list", "/prompt show ", "/prompt add ", "/prompt set ", "/prompt edit ",
       "/prompt rm ", "/prompt use ", "/help prompts",
       "/agents", "/agents tree", "/agents clear", "/agents log ", "/agents kill ", "/agents focus ",
-      "/agents focus main", "/queue", "/queue push ", "/queue pop", "/queue flush",
+      "/agents focus main", "/queue", "/queue push ", "/queue pop", "/queue drop",
       "/help queue", "/help export", "/export markdown ", "/export json ", "/export debug ",
       "/stats", "/stats reset", "/stats rm ", "/stats path", "/help stats",
       "/export epub ", "/export docx ", "/set ui.subagents all", "/set ui.subagents tools",
@@ -8405,7 +8405,7 @@ struct MaiCLI {
     /agents log PID     Print a running or finished agent's own transcript
     /agents clear       Forget finished agents so the tree lists only running ones
     /agents focus PID   Send what you type to a running agent (focus main returns)
-    /queue              List, push, pop, or flush messages waiting for an agent
+    /queue              List, push, pop, or drop messages waiting for an agent
     /agents enable|disable ID   Park an agent setup without deleting it
     /agents describe ID TEXT    Set the purpose a model reads when picking agents
     /agent [use] ID     Set the current chat's primary agent

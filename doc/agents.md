@@ -275,7 +275,7 @@ A chat's own process is registered before its first turn with
 `AgentRuntime.allocateProcess(agentID:)`, so messages can wait for a chat that
 is idle too; pmai folds them into the next turn it starts. Queued messages are
 editable until they are read: `discardLastQueuedMessage`, `discardQueuedMessage(id:)`,
-and `clearQueuedMessages` back `/queue pop` and `/queue flush`, and
+and `clearQueuedMessages` back `/queue pop` and `/queue drop`, and
 `AgentProcessInfo.queuedMessages` shows the count in a listing.
 
 Children report through the same event handler as their parent, background or
@@ -310,7 +310,7 @@ forwards only depth-0 events to the editor.
 /queue                        what is waiting for each process's next turn
 /queue push [@PID] TEXT       queue without sending
 /queue pop [PID]              drop the newest queued message
-/queue flush [PID]            drop them all
+/queue drop [PID]             drop them all
 /set ui.subagents LEVEL       all | tools | stats | none
 /tools enable|disable agents  allow or deny this agent the agent_* tool family
 /set delegation off|subagent      whether this agent may hand tool work to a child

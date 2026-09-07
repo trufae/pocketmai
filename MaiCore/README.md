@@ -251,7 +251,7 @@ input line, and everything else scrolls above them. A message typed while a
 turn runs is queued and joins the conversation at the agent's next model turn —
 after the tool results it is about to read — so a running agent can be steered
 without stopping it. `/queue` lists what is waiting, `/queue push TEXT` adds
-without sending, `/queue pop` drops the newest, and `/queue flush` drops all.
+without sending, `/queue pop` drops the newest, and `/queue drop` drops all.
 `/export markdown|json|debug|epub|docx [PATH]` saves the chat as a file, with
 the same writers PocketMai uses (`MaiDocuments`): `debug` is the JSON envelope
 plus the tools and settings the chat runs with.
