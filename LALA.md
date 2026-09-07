@@ -100,6 +100,12 @@ Three facts decide everything below:
 - [x] **Native `respond` in a text protocol** (`c36ca7b`). The text prompt
   offers a `respond` pseudo-tool; when a server returns it as a native call it
   was "not available to this agent". It is the final answer now.
+- [x] **Tool proxy made hybrid** (`9ffb9e3`, `e2a74f3`). The pure proxy
+  solved 5–8 of 13 tasks: the model called hidden tools by name (swallowed by
+  the server), escaped file bodies twice, and wrapped calls in every envelope
+  shape. The six common tools stay native, the rest sit behind `list-tools`
+  whose description is generated from them; 12/13 at two thirds of the native
+  tokens. `doc/proxy.md` has the study.
 - [x] **Tool output noise** (`8f4f777`). The call line showed raw JSON (a
   `files_write` printed the whole escaped file) and the result hid under a
   heading. Calls are one readable line (`→ files_read cli.py`,
@@ -206,33 +212,30 @@ reuse (append only, never touch old messages).
   (1–3 per 13 tasks), so the reference is almost always enough. Implement as a
   transcript edit (`AgentTranscriptEdit.rewrite`) applied by the runtime in
   `size` mode, not as a tool the model must remember to call.
-- [ ] **Let the model prune, too, but cheaply.** The context tools exist
-  (`AgentContextTools.swift`) and were never called in 900 model calls. They are
-  invisible to the model unless the group is enabled; if they stay, one
-  `context_forget ids` call should be enough, and the system prompt should say
-  when to use it. Otherwise remove them (negative LOC) in favour of the
-  automatic rewrite above.
-- [ ] **Tool results should carry what the next step needs, no more.**
-  `files_patch` returns a unified diff (good: no re-read needed, and the model
-  did not re-read after patches). `files_replace_range` returns a diff but the
-  model re-read the file after it every time to learn the new line numbers
-  (json run `03-add-flag`: 30 reads in a loop). Return the resulting line range
-  and a few lines of context, and make the description steer towards
-  `files_patch` for edits inside a file.
-- [ ] **`run_sh` results**: the `[stderr]` label is fine; the absolute cwd and
-  duration in structured content are gone now. Consider capping stdout in the
-  transcript at N lines with a "saved to …" tail for long outputs (test runs).
-- [ ] **Exploration costs turns.** `01-explain` needed `files_list ×2` +
-  `files_read ×4` = 6 turns (25k tokens) for four tiny files. Options: a
-  recursive `files_list` (tree with sizes, depth-limited), `files_read` taking
-  several paths or a glob (the glob support commit exists: say so in the
-  description or the model will not use it), and a system prompt that says
-  "grep first, read ranges, read one file at a time only when needed".
-- [ ] **Measure prefix stability after the sorted-keys fix**, then fix the
-  remaining sources: autocompact rewrites, `insertSystem` blocks refreshed per
-  prompt (project instructions), the memory block, and the text-protocol
-  prompt's position (it is inserted as a second system message after the
-  instructions; keep it there and never vary it during a run).
+- [x] **Context tools removed** (`150afc7`). Never called in 900+ model calls
+  while costing four schemas on every call of the default agent. The edit
+  types, the editor and the `transcriptEdited` event stay for the automatic
+  pruning above; the tools, their supervisor queue and the runtime drain are
+  gone (−400 lines).
+- [x] **Tool results carry what the next step needs** (`240c9a5`, `cc2e74a`).
+  `files_replace_range` names the resulting line range ("now lines 5-12 of
+  19") and its description steers to `files_patch`; `files_grep` says in its
+  text when it stopped at 100 matching lines (the structured flag no longer
+  reaches the model, and a proxy run had counted the 100 lines as the total).
+- [x] **`run_sh` keeps 24 KB per stream instead of 100 KB** (`41df7e2`). The
+  truncation note says how much was dropped; head, tail or grep get the rest.
+- [x] **Exploration nudges** (`dc3e68e`): `files_list` says it lists one folder
+  and points at `files_find` with `*` for the whole tree; `files_find` says so
+  too. No new tree tool: `files_find` already does it. Still open: a
+  `files_read` that takes several paths, and the system prompt line "grep
+  first, read ranges" (section 6).
+- [x] **Prefix stability measured after the fixes:** 0 of 66 consecutive
+  native requests and 0 of 88 text-protocol requests change their prefix (57 of
+  71 did before). Within a run nothing before the last message moves:
+  autocompact is off by default (`tokens: 0`), the project-instructions and
+  memory blocks are set between prompts and fixed for the run, and the
+  text-protocol prompt sits in a stable second system message. Add
+  `compare.py`'s prefix figure to every sweep (done in `analyze.py`).
 
 ## 6. The default prompt
 
