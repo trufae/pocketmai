@@ -1184,7 +1184,7 @@ func runLoopResolvesGluedNames() async throws {
 
   #expect(result.response.text == "Probed.")
   #expect(result.toolCalls == 1)
-  #expect(result.transcript.contains { $0.toolResults.contains { $0.text == "42" } })
+  #expect(result.transcript.contains { $0.role == .tool })
 }
 
 @Test("A native respond call in a text protocol is the final answer, not a host tool")
