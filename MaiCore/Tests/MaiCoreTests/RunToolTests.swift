@@ -199,3 +199,32 @@ private func call(
         depth: 0),
       modelTurn: 1))
 }
+
+@Test("Run tools reap every child: a finished, a killed, and a backgrounded run leave no zombie")
+func runToolLeavesNoZombies() async throws {
+  let tools = MaiRunTool.makeTools(configuration: MaiRunConfiguration())
+  // A run that ends by itself, one the timeout kills, and one whose script
+  // leaves a grandchild holding the pipes open after the shell has gone.
+  _ = try await call(shell(tools), ["command": .string("printf done")])
+  let killed = try await call(
+    shell(tools), ["command": .string("sleep 30"), "timeout_seconds": .integer(1)])
+  #expect(killed.structuredContent?.objectValue?["timedOut"] == .bool(true))
+  _ = try await call(shell(tools), ["command": .string("(sleep 2 &) ; printf spawned")])
+  // The termination handlers run on Foundation's queue a moment after exit.
+  try await Task.sleep(for: .seconds(3))
+
+  let listing = Process()
+  listing.executableURL = URL(fileURLWithPath: "/bin/ps")
+  listing.arguments = ["-axo", "pid,ppid,stat,command"]
+  let pipe = Pipe()
+  listing.standardOutput = pipe
+  try listing.run()
+  let data = pipe.fileHandleForReading.readDataToEndOfFile()
+  listing.waitUntilExit()
+  let me = String(ProcessInfo.processInfo.processIdentifier)
+  let zombies = String(decoding: data, as: UTF8.self).split(separator: "\n").filter { line in
+    let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+    return fields.count > 2 && fields[1] == me && fields[2].hasPrefix("Z")
+  }
+  #expect(zombies.isEmpty, "unreaped children: \(zombies)")
+}

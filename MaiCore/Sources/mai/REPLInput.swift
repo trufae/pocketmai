@@ -10,6 +10,8 @@ enum REPLEvent: Sendable {
   case turnFinished(Result<AgentResult, any Error>)
   case approval(ApprovalRequest, REPLApprovalReply)
   case supervisor(AgentSupervisorEvent)
+  /// One-second UI refresh while the input reader is blocked on the terminal.
+  case activityPulse
 }
 
 /// Answers one approval a tool call is waiting on, exactly once.
