@@ -100,23 +100,33 @@ public struct MaiStandardToolFactory: ConfiguredToolFactory {
       ToolGroupDefinition(
         id: "echo",
         displayName: "Echo",
-        description: MaiEchoTool.toolDefinition.description,
+        description:
+          "A test tool: echo returns the text it is given, to check that tool calling works end to end.",
         toolNames: [MaiEchoTool.name]),
       ToolGroupDefinition(
         id: "datetime",
         displayName: "Date & Time",
-        description: MaiCurrentTimeTool.toolDefinition.description,
+        description:
+          "Tell the model what day it is: current_time returns the current date and time as ISO-8601, "
+          + "so answers about today, deadlines, and elapsed time do not rely on the model's training date.",
         toolNames: [MaiCurrentTimeTool.name]),
       ToolGroupDefinition(
         id: "calc",
         displayName: "Calculator",
-        description: MaiCalculatorTool.toolDefinition.description,
+        description:
+          "Exact arithmetic: calc evaluates a numeric expression with +, -, *, /, and parentheses and "
+          + "returns the result, so sums, percentages, and conversions are computed instead of guessed.",
         toolNames: [MaiCalculatorTool.name]),
       ToolGroupDefinition(
         id: "files",
         displayName: "Files",
         description:
-          "List, find, grep, index, read, get or set functions, patch, write, append, rename, and delete in one workspace.",
+          "Work with the files of one workspace folder, confined to it. files_list and files_find locate "
+          + "files, files_grep searches their text, files_read and files_read_range return contents (PDF "
+          + "and DOCX as Markdown), files_read_index and files_get_function navigate code by symbol, and "
+          + "files_set_function, files_patch, files_replace_range, and files_write change it; files_rename "
+          + "and files_delete move or remove. Read before editing and prefer the smallest edit that does "
+          + "the job. With file changes disallowed the group is read-only.",
         toolNames: Set(MaiFileWorkspaceTool.toolNames),
         options: [
           .init(
@@ -133,7 +143,11 @@ public struct MaiStandardToolFactory: ConfiguredToolFactory {
       ToolGroupDefinition(
         id: "run",
         displayName: "Run",
-        description: "Run shell command lines and scripts on this computer.",
+        description:
+          "Run programs on this computer: run_sh executes a shell command line or script with the "
+          + "configured shell and returns its output and exit status, killing it after the default "
+          + "timeout unless the call sets one. Use it for builds, tests, git, and anything a person "
+          + "would type in a terminal.",
         toolNames: Set(MaiRunTool.toolNames),
         options: [
           .init(
@@ -151,7 +165,10 @@ public struct MaiStandardToolFactory: ConfiguredToolFactory {
       ToolGroupDefinition(
         id: "weather",
         displayName: "Weather",
-        description: MaiWeatherTool.toolDefinition.description,
+        description:
+          "Current weather and a 7-day forecast: weather looks up a city, place, or coordinates, or the "
+          + "configured default location when the call names none. Use it whenever the user asks about "
+          + "the weather instead of guessing.",
         toolNames: [MaiWeatherTool.name],
         options: [
           .init(
@@ -164,7 +181,11 @@ public struct MaiStandardToolFactory: ConfiguredToolFactory {
       ToolGroupDefinition(
         id: "web",
         displayName: "Web Search",
-        description: "Search the web and optionally fetch readable page content.",
+        description:
+          "Look things up on the web: web_search finds pages for a focused query (the configured "
+          + "provider decides where) and, when fetching is allowed, web_fetch returns the readable text "
+          + "of one URL. Search first, then fetch only the pages worth reading; use them for current or "
+          + "external facts the model cannot know.",
         toolNames: webTools,
         options: [
           .init(
@@ -190,7 +211,10 @@ public struct MaiStandardToolFactory: ConfiguredToolFactory {
       ToolGroupDefinition(
         id: "mastodon",
         displayName: "Mastodon",
-        description: "Search and read one Mastodon instance; optionally post and reply.",
+        description:
+          "Use Mastodon through the configured instance: the mastodon tool searches posts by keyword "
+          + "(toot_search), lists a user's recent posts (user_posts), and, when posting is allowed, "
+          + "publishes a status or a reply (post). The instance and API key are settings of this group.",
         toolNames: [MaiMastodonTool.name],
         options: [
           .init(
@@ -209,7 +233,9 @@ public struct MaiStandardToolFactory: ConfiguredToolFactory {
         id: "github",
         displayName: "GitHub",
         description:
-          "Browse public repositories, pull requests, commits, issues, releases, and CI.",
+          "Browse public GitHub repositories without cloning them: list and read files, commits, pull "
+          + "requests with their diffs, issues, releases, and CI runs with their logs. Use it to review "
+          + "a change, answer a question about a project, or fetch one file; nothing here writes to GitHub.",
         toolNames: Set(MaiGitHubTool.toolNames)),
     ].compactMap { group in
       let names = group.toolNames.intersection(available)

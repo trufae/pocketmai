@@ -13,8 +13,31 @@ public actor AgentRuntime {
     id: "agents",
     sourceID: "runtime",
     displayName: "Agents",
-    description: "Start, inspect, collect, and stop child agents.",
+    description:
+      "Delegate work to child agents that run with a context and tool set of their own. "
+      + "agent_start launches one with a brief and either waits for its answer or returns its pid; "
+      + "agent_status lists the children with their state and can read one's transcript; agent_result "
+      + "collects the answer of a child started without waiting; agent_stop ends a child and everything "
+      + "it started. Use them for independent subtasks, parallel research, or work whose tool output "
+      + "should not fill this conversation.",
     toolNames: agentToolNames)
+
+  /// The groups of the tools MaiCore itself provides, cut to the ones a host
+  /// has registered: `agents`, `chats`, `todo`, `context`, and `skills`. A
+  /// host's catalog starts with these; whatever else the runtime holds is
+  /// grouped by its name prefix.
+  public static func builtInToolGroups(for tools: [ToolDefinition]) -> [ToolGroupDefinition] {
+    let names = Set(tools.map(\.name))
+    var groups = [agentToolGroup]
+    for group in [MaiMemoryTools.group, MaiTodoTools.group, MaiContextTools.group] {
+      var group = group
+      group.toolNames = group.toolNames.intersection(names)
+      if !group.toolNames.isEmpty { groups.append(group) }
+    }
+    let skills = names.filter(MaiSkillTools.isSkillTool)
+    if !skills.isEmpty { groups.append(MaiSkillTools.group(toolNames: skills)) }
+    return groups
+  }
   /// Earlier spellings of `agent_start`. They are still executed so existing
   /// configurations and fine-tuned providers keep working, but they are no
   /// longer offered: six near-identical tools only confuse a model.
@@ -382,6 +405,49 @@ public actor AgentRuntime {
     while true {
       try Task.checkCancellation()
       try await holdWhilePaused(pid)
+      // Edits the agent asked for with the context tools land first, so the
+      // next turn already runs on the smaller conversation. A compaction the
+      // agent left for the runtime to write is summarized here, the way
+      // autocompact does it.
+      let edits = await supervisor.drainTranscriptEdits(pid)
+      if !edits.isEmpty {
+        var resolved: [AgentTranscriptEdit] = []
+        for edit in edits {
+          guard case .summarize(let ids, let focus) = edit else {
+            resolved.append(edit)
+            continue
+          }
+          let present = Set(transcript.map(\.id))
+          let selection = ids.filter { present.contains($0) }
+          guard !selection.isEmpty else { continue }
+          await emit(
+            .compactionStarted(
+              context,
+              estimatedTokens: AgentAutocompaction.estimatedTokens(
+                of: transcript, lastUsage: lastUsage)))
+          await supervisor.note(pid, activity: "compacting")
+          do {
+            let text = try await summaryText(
+              of: selection, in: transcript, focus: Self.requestedFocus(focus),
+              provider: provider, request: request, budget: budget, context: context, pid: pid,
+              totalUsage: &totalUsage, emit: emit)
+            resolved.append(.compact(messageIDs: selection, summary: text))
+          } catch is RunDeadlineExceeded {
+            return await pause(budget.timeInterruption)
+          } catch is CancellationError {
+            throw CancellationError()
+          } catch {
+            await emit(.compactionFailed(context, error.localizedDescription))
+          }
+        }
+        let applied = AgentTranscriptEditor.apply(resolved, to: transcript)
+        if !applied.report.isEmpty {
+          transcript = applied.messages
+          lastUsage = nil
+          await emit(.transcriptEdited(context, applied.report))
+          await supervisor.note(pid, transcript: transcript)
+        }
+      }
       // In size mode the bodies of files read two or more results ago make
       // way for a reference before every call; in cache mode nothing sent
       // is ever touched, so the server's prompt cache covers it.
@@ -412,21 +478,10 @@ public actor AgentRuntime {
           await emit(.compactionStarted(context, estimatedTokens: estimate))
           await supervisor.note(pid, activity: "compacting")
           do {
-            let summary = try await summarize(
-              selection, of: transcript, provider: provider, request: request, budget: budget,
-              context: context, pid: pid, emit: emit)
-            let usage =
-              summary.response.usage
-              ?? .estimated(
-                inputTokens: ModelCallStats.estimatedTokenCount(
-                  of: transcript.filter { selection.contains($0.id) }),
-                outputTokens: ModelCallStats.estimatedTokenCount(
-                  forCharacterCount: summary.response.message.text.count))
-            totalUsage = totalUsage.merging(usage)
-            await supervisor.note(pid, usage: totalUsage)
-            await budget.record(tokens: usage.totalTokens)
-            let text = summary.response.message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { throw CompactionError.emptySummary }
+            let text = try await summaryText(
+              of: selection, in: transcript, focus: AgentCompactionPrompt.automaticFocus,
+              provider: provider, request: request, budget: budget, context: context, pid: pid,
+              totalUsage: &totalUsage, emit: emit)
             let applied = AgentTranscriptEditor.apply(
               [.compact(messageIDs: selection, summary: text)], to: transcript)
             transcript = applied.messages
@@ -748,9 +803,53 @@ public actor AgentRuntime {
 
   /// Asks the run's own model for a summary of the selected messages, with
   /// the configured compaction prompt and the automatic focus.
+  /// The focus of a summary an agent asked for with `context_compact`: the
+  /// run is mid-task, as with autocompact, plus whatever the agent said must
+  /// survive.
+  private static func requestedFocus(_ focus: String) -> String {
+    let trimmed = focus.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return AgentCompactionPrompt.automaticFocus }
+    return AgentCompactionPrompt.automaticFocus
+      + "\nThe assistant asked that the summary keep, above all: " + trimmed
+  }
+
+  /// Asks the model for a summary of `selection`, accounts for the call, and
+  /// returns the text, for autocompact and for a compaction the agent left to
+  /// the runtime. An empty answer is an error: the run goes on uncompacted.
+  private func summaryText(
+    of selection: [String],
+    in transcript: [AgentMessage],
+    focus: String,
+    provider: any ChatProvider,
+    request: AgentRequest,
+    budget: RunBudget,
+    context: AgentEventContext,
+    pid: AgentPID,
+    totalUsage: inout TokenUsage?,
+    emit: @escaping AgentEventHandler
+  ) async throws -> String {
+    let summary = try await summarize(
+      selection, of: transcript, focus: focus, provider: provider, request: request,
+      budget: budget, context: context, pid: pid, emit: emit)
+    let usage =
+      summary.response.usage
+      ?? .estimated(
+        inputTokens: ModelCallStats.estimatedTokenCount(
+          of: transcript.filter { selection.contains($0.id) }),
+        outputTokens: ModelCallStats.estimatedTokenCount(
+          forCharacterCount: summary.response.message.text.count))
+    totalUsage = totalUsage.merging(usage)
+    await supervisor.note(pid, usage: totalUsage)
+    await budget.record(tokens: usage.totalTokens)
+    let text = summary.response.message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { throw CompactionError.emptySummary }
+    return text
+  }
+
   private func summarize(
     _ selection: [String],
     of transcript: [AgentMessage],
+    focus: String,
     provider: any ChatProvider,
     request: AgentRequest,
     budget: RunBudget,
@@ -761,7 +860,7 @@ public actor AgentRuntime {
     let selected = Set(selection)
     let prompt = AgentCompactionPrompt.render(
       transcript: AgentCompactionPrompt.transcript(of: transcript.filter { selected.contains($0.id) }),
-      focus: AgentCompactionPrompt.automaticFocus,
+      focus: focus,
       template: compactionTemplate)
     let call = try await complete(
       ProviderRequest(

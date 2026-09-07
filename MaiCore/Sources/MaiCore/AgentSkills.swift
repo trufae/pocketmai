@@ -299,6 +299,20 @@ public enum MaiSkillTools {
     name.hasPrefix(toolPrefix)
   }
 
+  /// What `/tools` shows for the family, over the skill tools a host holds.
+  public static func group(toolNames: Set<String>) -> ToolGroupDefinition {
+    ToolGroupDefinition(
+      id: groupID,
+      sourceID: "runtime",
+      displayName: "Skills",
+      description:
+        "Instructions for particular kinds of task, kept in SKILL.md folders and read only when "
+        + "needed: each skills_* tool is one skill, and calling it returns the instructions to follow, "
+        + "with any details passed as its argument. The model picks a skill when a task matches its "
+        + "description; /skills lists, shows, and enables them.",
+      toolNames: toolNames)
+  }
+
   public static func definition(for skill: AgentSkill) -> ToolDefinition {
     ToolDefinition(
       name: skill.toolName,

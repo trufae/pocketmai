@@ -1694,9 +1694,9 @@ func agentToolGroupPermission() async throws {
   #expect(AgentRuntime.agentToolNames.isDisjoint(with: names))
 }
 
-@Test("Subagents are disabled by default")
-func subagentsDisabledByDefault() async throws {
-  #expect(AgentRunLimits().maxSubagents == 0)
+@Test("Subagents use the default concurrency limit")
+func subagentsUseDefaultConcurrencyLimit() async throws {
+  #expect(AgentRunLimits().maxSubagents == 5)
   let provider = ScriptedProvider(responses: [
     ProviderResponse(message: .assistant("No delegation"), stopReason: .stop)
   ])
@@ -2110,7 +2110,9 @@ func configurationLoading() async throws {
   #expect(configuration.approvals.confirm == .allow)
   #expect(configuration.agents[0].limits == AgentRunLimits())
   #expect(configuration.agents[0].limits.maxModelTurns == 50)
-  #expect(configuration.agents[0].limits.maxToolCalls == 50)
+  #expect(configuration.agents[0].limits.maxToolCalls == 100)
+  #expect(configuration.agents[0].limits.maxSubagents == 5)
+  #expect(configuration.agents[0].limits.maxSubagentDepth == 5)
   #expect(configuration.agents[0].toolCallingStrategy == .json)
   #expect(configuration.agents[0].useToolProxy)
   #expect(configuration.agents[0].options.maxOutputTokens == 100)

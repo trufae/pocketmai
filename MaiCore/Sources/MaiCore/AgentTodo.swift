@@ -184,6 +184,19 @@ public enum MaiTodoTools {
   public static let doneName = "todo_done"
 
   public static let toolNames = [listName, addName, doneName]
+  public static let groupID = "todo"
+
+  /// What `/tools` shows for the family.
+  public static let group = ToolGroupDefinition(
+    id: groupID,
+    sourceID: "runtime",
+    displayName: "Todo",
+    description:
+      "Keep a task list for work of several steps, so nothing is lost across turns or chats: todo_add "
+      + "plans the items (one title per line), todo_list shows what is done and what is left, todo_done "
+      + "ticks items off by number or title. The list belongs to the project and persists between "
+      + "chats; a short task does not need one.",
+    toolNames: Set(toolNames))
 
   public static let definitions: [ToolDefinition] = [
     ToolDefinition(

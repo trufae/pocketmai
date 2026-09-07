@@ -198,6 +198,21 @@ public enum MaiMemoryTools {
   public static let readDocumentName = "chats_read_document"
 
   public static let toolNames = [listName, searchName, readName, readDocumentName]
+  public static let groupID = "chats"
+
+  /// What `/tools` shows for the family: what it is for and how the tools
+  /// are meant to be used together.
+  public static let group = ToolGroupDefinition(
+    id: groupID,
+    sourceID: "runtime",
+    displayName: "Chats",
+    description:
+      "Use other chats as a source of information: what an earlier conversation decided, a document "
+      + "attached to one, a command that worked. chats_list shows which chats are reachable (the memory "
+      + "scope decides: this project's or every project's), chats_search finds text in their messages "
+      + "and attached documents, chats_read returns one transcript, and chats_read_document one attached "
+      + "document in full. Start with chats_search or chats_list, then read only what matched.",
+    toolNames: Set(toolNames))
 
   private static let maxResults = 20
   private static let snippetContext = 90

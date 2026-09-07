@@ -46,6 +46,7 @@ public actor AgentSupervisor {
   /// Messages posted to a process that its run has not read yet, oldest first.
   private var inboxes: [AgentPID: [AgentQueuedMessage]] = [:]
   /// Context edits a process asked for and its run has not applied yet.
+  private var transcriptEdits: [AgentPID: [AgentTranscriptEdit]] = [:]
   /// Processes a person has held; their runs wait at the next turn boundary.
   private var paused: Set<AgentPID> = []
   private var nextPID = 1
@@ -252,6 +253,26 @@ public actor AgentSupervisor {
     guard let queue = inboxes.removeValue(forKey: pid), !queue.isEmpty else { return [] }
     noteInboxChanged(pid)
     return queue.map(\.message)
+  }
+
+  // MARK: - Context edits
+
+  /// Queues an edit of a process's own transcript, applied by its run before
+  /// the next model turn. Returns false when the pid is unknown.
+  @discardableResult
+  public func post(edit: AgentTranscriptEdit, to pid: AgentPID) -> Bool {
+    guard entries[pid] != nil else { return false }
+    transcriptEdits[pid, default: []].append(edit)
+    return true
+  }
+
+  public func pendingTranscriptEdits(_ pid: AgentPID) -> [AgentTranscriptEdit] {
+    transcriptEdits[pid] ?? []
+  }
+
+  /// Takes the queued edits, for the run to apply.
+  public func drainTranscriptEdits(_ pid: AgentPID) -> [AgentTranscriptEdit] {
+    transcriptEdits.removeValue(forKey: pid) ?? []
   }
 
   private func noteInboxChanged(_ pid: AgentPID) {
@@ -477,6 +498,7 @@ public actor AgentSupervisor {
   public func forget(_ pid: AgentPID) {
     entries[pid] = nil
     inboxes[pid] = nil
+    transcriptEdits[pid] = nil
     paused.remove(pid)
   }
 

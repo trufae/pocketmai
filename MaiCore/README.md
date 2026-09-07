@@ -395,17 +395,23 @@ REPL prints `✂ context: rewrote 1 message (12.3k → 2.1k chars)` when it prun
 
 Native tools are presented as plugin-defined capability groups instead of one
 checkbox per provider-visible function. `/tools` lists the groups, `/tools
-enable|disable GROUP` changes the active agent, and `/tools show GROUP` displays
-the expanded tool names and settings. `/tools set GROUP OPTION VALUE` persists
+enable|disable GROUP` changes the active agent, and `/tools show GROUP` says
+what the group is for and prints every tool with its description, how it is
+approved, and its parameters, then the group's settings — the same schema the
+model receives, readable. `/tools set GROUP OPTION VALUE` persists
 typed group settings and reloads the source; for example, Mastodon's instance,
 API-key environment variable, and write permission are configured this way.
 Visual mode renders the same descriptors as checkboxes and typed fields. Group
 selections live on each `AgentDefinition`, while source credentials and options
 live on `ConfiguredToolSource`, so every host uses the same configuration and
 plugin API. Older native plugins without group metadata are grouped by their
-tool-name prefix. MaiCore's runtime-native `agent_start`, `agent_status`,
-`agent_result`, and `agent_stop` tools appear together in the `agents` group;
-enable or disable that group independently on each agent.
+tool-name prefix and described by the first sentence of each tool. MaiCore's
+runtime-native families come with a description of their own that says what
+they are for and how the tools work together: `agent_start`, `agent_status`,
+`agent_result`, and `agent_stop` form the `agents` group, the `chats_*` tools
+`chats`, the `todo_*` tools `todo`, the `context_*` tools `context`, and the
+`skills_*` tools `skills` (`AgentRuntime.builtInToolGroups`); enable or
+disable each group independently on each agent.
 
 MCP tool names are namespaced as `<toolNamePrefix>::<remoteName>`, or
 `<server-id>::<remoteName>` when no prefix is configured. Connecting an enabled
@@ -466,6 +472,29 @@ agent use other chats as a source of information. `memory.scope` bounds them:
 `none` keeps other chats private, `project` allows this project's, and `all`
 crosses working directories. Enable them for an agent with `/tools enable
 chats`; each call asks for approval.
+
+### Context tools
+
+An agent can tidy its own conversation instead of carrying every detour to the
+end. `context_list` numbers the messages with their sizes and a preview;
+`context_remove` drops messages by number, range, `last N` (the most recent
+ones), or `all` (a tool call and its result always go together);
+`context_rewrite` replaces one message's text, for example a wrong instruction
+or a long tool result reduced to what matters; and `context_compact` replaces a
+stretch (`all` by default) with a summary — one the agent writes, or, when it
+leaves `summary` out, one the runtime asks the model for with the compaction
+prompt, guided by an optional `focus`, exactly as autocompact does. Edits are
+queued while the turn runs and applied before the next model call, so the
+following turn already sees the smaller context; the REPL prints
+`✂ context: removed 3 messages (12.3k → 2.1k chars)`. The system prompt, the
+latest user prompt, and the turn in progress cannot be touched, and a task
+that should start with no history at all belongs in a child agent
+(`agent_start`). The tools live in
+`MaiCore` (`MaiContextTools`), are part of the default agent's set, and
+`/tools enable context` adds them to another. The three editing tools ask for
+`confirm` approval; `/set yolo on` or `approvals.confirm = allow` lets an agent
+use them freely. The edited conversation is what gets saved, so what an agent
+removes is gone from the chat.
 
 ### Todo list
 

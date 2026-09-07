@@ -755,9 +755,9 @@ public struct AgentRunLimits: Codable, Equatable, Sendable {
 
   public init(
     maxModelTurns: Int = 50,
-    maxToolCalls: Int = 50,
-    maxSubagents: Int = 0,
-    maxSubagentDepth: Int = 2,
+    maxToolCalls: Int = 100,
+    maxSubagents: Int = 5,
+    maxSubagentDepth: Int = 5,
     maxTotalTokens: Int? = nil,
     maxSeconds: Int? = nil
   ) {
@@ -777,9 +777,9 @@ public struct AgentRunLimits: Codable, Equatable, Sendable {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     self.init(
       maxModelTurns: try container.decodeIfPresent(Int.self, forKey: .maxModelTurns) ?? 50,
-      maxToolCalls: try container.decodeIfPresent(Int.self, forKey: .maxToolCalls) ?? 50,
-      maxSubagents: try container.decodeIfPresent(Int.self, forKey: .maxSubagents) ?? 0,
-      maxSubagentDepth: try container.decodeIfPresent(Int.self, forKey: .maxSubagentDepth) ?? 2,
+      maxToolCalls: try container.decodeIfPresent(Int.self, forKey: .maxToolCalls) ?? 100,
+      maxSubagents: try container.decodeIfPresent(Int.self, forKey: .maxSubagents) ?? 5,
+      maxSubagentDepth: try container.decodeIfPresent(Int.self, forKey: .maxSubagentDepth) ?? 5,
       maxTotalTokens: try container.decodeIfPresent(Int.self, forKey: .maxTotalTokens),
       maxSeconds: try container.decodeIfPresent(Int.self, forKey: .maxSeconds))
   }
@@ -835,7 +835,7 @@ public struct AgentAutocompact: Codable, Equatable, Sendable {
   /// turns it off.
   public var tokens: Int
 
-  public init(tokens: Int = 0) {
+  public init(tokens: Int = 64_000) {
     self.tokens = max(0, tokens)
   }
 
@@ -845,7 +845,7 @@ public struct AgentAutocompact: Codable, Equatable, Sendable {
 
   public init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
-    self.init(tokens: try container.decodeIfPresent(Int.self, forKey: .tokens) ?? 0)
+    self.init(tokens: try container.decodeIfPresent(Int.self, forKey: .tokens) ?? 64_000)
   }
 }
 

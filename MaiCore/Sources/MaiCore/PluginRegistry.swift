@@ -138,6 +138,30 @@ public struct ToolGroupDefinition: Codable, Equatable, Sendable {
 
   public var catalogID: String { sourceID.isEmpty ? id : "\(sourceID)/\(id)" }
 
+  /// The groups a host lists: `known` as given, then one inferred group per
+  /// name prefix for every tool none of them claims, sorted by display name.
+  public static func catalog(
+    known: [ToolGroupDefinition],
+    tools: [ToolDefinition]
+  ) -> [ToolGroupDefinition] {
+    let claimed = Set(known.flatMap(\.toolNames))
+    var ungrouped = inferred(from: tools.filter { !claimed.contains($0.name) })
+    for index in ungrouped.indices { ungrouped[index].sourceID = "runtime" }
+    return (known + ungrouped).sorted {
+      $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+    }
+  }
+
+  /// A description for a group nobody described: each tool's name and the
+  /// first sentence of what it does, so a listing says what the family is
+  /// for rather than which names it holds.
+  static func summary(of definitions: [ToolDefinition]) -> String {
+    definitions.sorted { $0.name < $1.name }.map { definition in
+      let sentence = ToolGroupHelp.firstSentence(of: definition.description)
+      return sentence.isEmpty ? definition.name : "\(definition.name): \(sentence)"
+    }.joined(separator: " ")
+  }
+
   public static func inferred(from tools: [any AgentTool]) -> [ToolGroupDefinition] {
     inferred(from: tools.map(\.definition))
   }
@@ -149,16 +173,87 @@ public struct ToolGroupDefinition: Codable, Equatable, Sendable {
     }
     return grouped.map { id, members in
       let names = Set(members.map(\.name))
-      let description =
-        members.count == 1
-        ? members[0].description
-        : "Provides \(names.sorted().joined(separator: ", "))."
+      let description = members.count == 1 ? members[0].description : summary(of: members)
       return ToolGroupDefinition(
         id: id,
         displayName: id.replacingOccurrences(of: "_", with: " ").capitalized,
         description: description,
         toolNames: names)
     }.sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
+  }
+}
+
+/// The text `/tools show GROUP` prints below its heading: what the group is
+/// for, then every tool with what it does, how it is approved, and the
+/// parameters it takes — the schema the model receives, in a form a person
+/// can read.
+public enum ToolGroupHelp {
+  public static func lines(for group: ToolGroupDefinition, tools: [ToolDefinition]) -> [String] {
+    var lines: [String] = []
+    let description = group.description.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !description.isEmpty { lines.append(description) }
+    let byName = Dictionary(tools.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+    for name in group.toolNames.sorted() {
+      lines.append("")
+      if let tool = byName[name] {
+        lines.append(contentsOf: self.lines(for: tool))
+      } else {
+        lines.append("\(name)  [not registered]")
+      }
+    }
+    return lines
+  }
+
+  public static func lines(for tool: ToolDefinition) -> [String] {
+    var lines = ["\(tool.name)  [\(traits(of: tool.annotations).joined(separator: ", "))]"]
+    let description = tool.description.trimmingCharacters(in: .whitespacesAndNewlines)
+    for line in description.split(separator: "\n", omittingEmptySubsequences: false) {
+      lines.append("  " + line)
+    }
+    let parameters = tool.parameters
+    guard !parameters.isEmpty else {
+      lines.append("  Parameters: none.")
+      return lines
+    }
+    for parameter in parameters.filter(\.required) + parameters.filter({ !$0.required }) {
+      var line =
+        "  \(parameter.name) (\(parameter.type), \(parameter.required ? "required" : "optional"))"
+      let detail = parameter.description.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !detail.isEmpty { line += ": \(detail)" }
+      lines.append(line)
+    }
+    return lines
+  }
+
+  /// What a tool may do and how it is approved, as `/tools show` tags it.
+  public static func traits(of annotations: ToolAnnotations) -> [String] {
+    var traits: [String] = []
+    if annotations.readOnly {
+      traits.append("read-only")
+    } else {
+      traits.append(annotations.destructive ? "destructive" : "modifies")
+    }
+    switch annotations.approval {
+    case .automatic: traits.append("no approval")
+    case .confirm: traits.append("asks approval")
+    case .dangerous: traits.append("dangerous, asks approval")
+    }
+    return traits
+  }
+
+  /// The first sentence of a description: up to the first period that ends
+  /// a word, so "1-50. Default: 20." stops after the range.
+  public static func firstSentence(of description: String) -> String {
+    let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
+    var index = trimmed.startIndex
+    while let dot = trimmed[index...].firstIndex(of: ".") {
+      let next = trimmed.index(after: dot)
+      if next == trimmed.endIndex || trimmed[next].isWhitespace {
+        return String(trimmed[..<next])
+      }
+      index = next
+    }
+    return trimmed.split(separator: "\n").first.map(String.init) ?? trimmed
   }
 }
 

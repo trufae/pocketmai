@@ -551,10 +551,10 @@ struct SessionProfile {
         MaiWebFetchTool.name,
         MaiMastodonTool.name,
       ] + MaiFileWorkspaceTool.toolNames + MaiRunTool.toolNames + MaiGitHubTool.toolNames
-        + MaiTodoTools.toolNames)
+        + MaiTodoTools.toolNames + MaiContextTools.toolNames)
     toolGroupNames = [
       "echo", "datetime", "calc", "files", "run", "weather", "web", "mastodon", "github", "todo",
-      MaiSkillTools.groupID,
+      "context", MaiSkillTools.groupID,
     ]
     subagentNames = []
     self.stream = stream
@@ -929,6 +929,9 @@ struct MaiCLI {
         environment: environment)
       try await registerMemoryTools(in: runtime, state: memoryState)
       try await registerTodoTools(in: runtime, state: todoState)
+      for tool in MaiContextTools.makeTools(supervisor: runtime.supervisor) {
+        try await runtime.register(tool: tool)
+      }
       try await registerSkillTools(in: runtime, state: skillState)
       try await synchronizeToolGroupSelections(
         configuration: &configuration,
@@ -5436,7 +5439,9 @@ struct MaiCLI {
           "\(enabled) \(group.id) — \(group.displayName) [\(group.toolNames.count) tool\(group.toolNames.count == 1 ? "" : "s")]"
         )
       }
-      await terminal.line("Use /tools show GROUP to inspect tool names and settings.")
+      await terminal.line(
+        "Use /tools show GROUP to see what a group is for, each tool with its parameters, and its settings."
+      )
       return
     }
 
@@ -5472,12 +5477,25 @@ struct MaiCLI {
           "Disabled tool group '\(group.id)' for agent \(session.profile.agentID).")
       }
     case "show":
-      await terminal.line("\(group.displayName): \(group.description)")
-      await terminal.line("Tools: \(group.toolNames.sorted().joined(separator: ", "))")
+      let count = group.toolNames.count
+      let state = isToolGroupEnabled(group, profile: session.profile) ? "enabled" : "disabled"
+      await terminal.line(
+        "\(group.displayName) (\(group.catalogID)): \(count) tool\(count == 1 ? "" : "s"), \(state) for agent \(session.profile.agentID)"
+      )
+      for line in ToolGroupHelp.lines(for: group, tools: await runtime.availableTools()) {
+        await terminal.line(line)
+      }
+      guard !group.options.isEmpty else { return }
       let options = configuredOptions(for: group, configuration: configuration)
+      await terminal.line("")
+      await terminal.line("Settings, changed with /tools set \(group.id) OPTION VALUE:")
       for option in group.options {
         let value = options[option.id] ?? option.defaultValue
-        await terminal.line("\(option.id) = \(displayedOption(value, kind: option.kind))")
+        var line = "  \(option.id) = \(displayedOption(value, kind: option.kind))  \(option.label)."
+        if let help = option.help?.trimmingCharacters(in: .whitespacesAndNewlines), !help.isEmpty {
+          line += " \(help)"
+        }
+        await terminal.line(line)
       }
     case "set", "config":
       guard fields.count == 4,
@@ -5732,21 +5750,15 @@ struct MaiCLI {
     plugins: PluginRegistry,
     configuration: MaiConfiguration?
   ) async throws -> [ToolGroupDefinition] {
-    var groups: [ToolGroupDefinition] = [AgentRuntime.agentToolGroup]
+    let tools = await runtime.availableTools()
+    var groups = AgentRuntime.builtInToolGroups(for: tools)
     for source in configuration?.toolSources.filter(\.enabled) ?? [] {
       groups.append(
         contentsOf: try await plugins.toolGroups(
           kind: source.kind,
           context: source.context(environment: ProcessInfo.processInfo.environment)))
     }
-    let tools = await runtime.availableTools()
-    let groupedNames = Set(groups.flatMap(\.toolNames))
-    var ungrouped = ToolGroupDefinition.inferred(
-      from: tools.filter { !groupedNames.contains($0.name) })
-    for index in ungrouped.indices { ungrouped[index].sourceID = "runtime" }
-    return (groups + ungrouped).sorted {
-      $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
-    }
+    return ToolGroupDefinition.catalog(known: groups, tools: tools)
   }
 
   private static func resolveToolGroup(
@@ -8307,7 +8319,7 @@ struct MaiCLI {
       groupNames.formUnion(
         [
           "echo", "datetime", "calc", "files", "run", "weather", "web", "mastodon", "github",
-          "todo",
+          "todo", "context",
         ])
     }
     for group in groupNames {
@@ -8472,13 +8484,13 @@ struct MaiCLI {
               MaiWebFetchTool.name,
               MaiMastodonTool.name,
             ] + MaiFileWorkspaceTool.toolNames + MaiRunTool.toolNames + MaiGitHubTool.toolNames
-              + MaiTodoTools.toolNames),
+              + MaiTodoTools.toolNames + MaiContextTools.toolNames),
           toolGroupNames: [
             "echo", "datetime", "calc", "files", "run", "weather", "web", "mastodon",
-            "github", "todo",
+            "github", "todo", "context",
           ],
           subagentNames: ["researcher"],
-          limits: AgentRunLimits(maxSubagents: 4),
+          limits: AgentRunLimits(),
           useToolProxy: true),
         AgentDefinition(
           id: "researcher",
@@ -8835,7 +8847,7 @@ struct MaiCLI {
   private static let toolHelp = """
     Tool group commands:
       /tools list                    List logical tool groups
-      /tools show GROUP              Show tools and configurable options
+      /tools show GROUP              What the group is for, each tool with its parameters, and its settings
       /tools enable|disable GROUP    Change the current agent's allowed groups
       /tools set GROUP OPTION VALUE  Configure a tool group and reload its tools
       /tools unset GROUP OPTION      Restore an option's default

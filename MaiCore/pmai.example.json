@@ -187,9 +187,9 @@
       "useToolProxy": true,
       "limits": {
         "maxModelTurns": 50,
-        "maxToolCalls": 50,
-        "maxSubagents": 4,
-        "maxSubagentDepth": 2
+        "maxToolCalls": 100,
+        "maxSubagents": 5,
+        "maxSubagentDepth": 5
       },
       "description": "General assistant with the full tool set.",
       "toolDelegation": "subagent",

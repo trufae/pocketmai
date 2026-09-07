@@ -237,7 +237,7 @@ reuse (append only, never touch old messages).
 - [x] **Prefix stability measured after the fixes:** 0 of 66 consecutive
   native requests and 0 of 88 text-protocol requests change their prefix (57 of
   71 did before). Within a run nothing before the last message moves:
-  autocompact is off by default (`tokens: 0`), the project-instructions and
+  autocompact defaults to 64k tokens, the project-instructions and
   memory blocks are set between prompts and fixed for the run, and the
   text-protocol prompt sits in a stable second system message. Add
   `compare.py`'s prefix figure to every sweep (done in `analyze.py`).
@@ -268,7 +268,7 @@ reuse (append only, never touch old messages).
 - [ ] **Unknown argument keys are dropped silently**, then the error says "No
   fields were given" (`Tooling.swift:321`). Name the unknown keys so the model
   can fix the shape in one turn (this is how the nested envelope hid).
-- [ ] **`maxModelTurns`/`maxToolCalls` default 50** means a runaway run costs
+- [ ] **`maxModelTurns` default 50 and `maxToolCalls` default 100** means a runaway run costs
   ~200k tokens before stopping. With the guards above 20–25 is enough for
   these tasks; make the default smaller or budget by tokens.
 

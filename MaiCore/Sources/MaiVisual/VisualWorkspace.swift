@@ -201,7 +201,7 @@ public final class VisualWorkspace {
     agents = await runtime.availableAgents()
     await refreshAgentTree()
     await refreshUsageStats()
-    var groups: [ToolGroupDefinition] = [AgentRuntime.agentToolGroup]
+    var groups = AgentRuntime.builtInToolGroups(for: tools)
     for source in configuration.toolSources where source.enabled {
       do {
         groups.append(
@@ -213,13 +213,7 @@ public final class VisualWorkspace {
           "warning: tool groups for '\(source.id)' are unavailable: \(error.localizedDescription)"
       }
     }
-    let groupedNames = Set(groups.flatMap(\.toolNames))
-    var ungrouped = ToolGroupDefinition.inferred(
-      from: tools.filter { !groupedNames.contains($0.name) })
-    for index in ungrouped.indices { ungrouped[index].sourceID = "runtime" }
-    toolGroups = (groups + ungrouped).sorted {
-      $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
-    }
+    toolGroups = ToolGroupDefinition.catalog(known: groups, tools: tools)
   }
 
   @discardableResult

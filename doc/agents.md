@@ -174,7 +174,7 @@ implicitly.
   discarded afterwards. Which tools an agent has is always its definition's
   list, whatever its depth in the tree.
 
-The switch is off by default. Turning it on changes how the main agent thinks
+Autocompact starts at 64k tokens by default. Changing it changes how the main agent thinks
 about its work, costs an extra model round-trip per delegated task, and is worth
 it only when tool output is bulky. It is set per agent with `/set delegation`,
 persisted into the agent's definition, and readable and writable from the iOS
