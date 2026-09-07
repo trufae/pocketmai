@@ -1160,6 +1160,40 @@ func runLoopResolvesGluedNames() async throws {
   #expect(result.transcript.contains { $0.toolResults.contains { $0.text == "42" } })
 }
 
+@Test("A native respond call in a text protocol is the final answer, not a host tool")
+func nativeRespondCallIsFinal() async throws {
+  let provider = ScriptedProvider(
+    responses: [
+      ProviderResponse(
+        message: AgentMessage(
+          role: .assistant,
+          content: [
+            .toolCall(
+              ToolCall(
+                id: "r1", name: AgentToolLoopPolicy.responseToolName,
+                arguments: .object(["action": .string("final"), "content": .string("Done.")])))
+          ]),
+        stopReason: .toolCall)
+    ],
+    capabilities: [.streaming])
+  let runtime = AgentRuntime()
+  try await runtime.register(provider)
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "probe", description: "Probe")) { _, _ in
+      Issue.record("respond must not run a host tool")
+      return ToolOutput(text: "unexpected")
+    })
+
+  let result = try await runtime.run(
+    AgentRequest(
+      provider: "scripted", model: "fixture", messages: [.user("finish")],
+      toolNames: ["probe"], toolCallingStrategy: .json))
+
+  #expect(result.response.text == "Done.")
+  #expect(result.modelTurns == 1)
+  #expect(result.toolCalls == 0)
+}
+
 @Test("A call without reported usage is estimated, marked as such, and still counts against the budget")
 func estimatedUsage() async throws {
   let provider = ScriptedProvider(responses: [

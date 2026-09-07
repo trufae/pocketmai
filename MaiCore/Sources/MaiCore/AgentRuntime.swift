@@ -552,6 +552,17 @@ public actor AgentRuntime {
       // calls are as good as a text block and run below; reading only the text
       // would mistake the turn for one without a call and repeat the repair
       // feedback until the turn limit.
+      // The text protocols offer a `respond` pseudo-tool; a server may hand it
+      // back as a native call. It is the final answer, not a host tool.
+      if textToolMode != nil, providerResponse.message.toolCalls.count == 1,
+        let respond = providerResponse.message.toolCalls.first,
+        respond.name == AgentToolLoopPolicy.responseToolName
+      {
+        let content = respond.arguments.objectValue?["content"]?.coercedStringValue ?? ""
+        providerResponse.message = .assistant(content)
+        providerResponse.stopReason = .stop
+        if !content.isEmpty { await emit(.provider(context, .textDelta(content))) }
+      }
       if let textToolMode, !toolBudgetExhausted, providerResponse.message.toolCalls.isEmpty {
         let decision = AgentToolLoopPolicy.evaluate(
           response: providerResponse.message.text,
