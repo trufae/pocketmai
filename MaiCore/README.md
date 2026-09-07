@@ -443,9 +443,12 @@ Todo tool settings. The item, the Markdown form, and the tools live in
 `AgentTodo.swift`, so both hosts behave the same.
 
 `todo_list` shows the numbered list, `todo_add` appends pending items (one per
-line adds several at once), and `todo_done` ticks one off by its number or a
-title fragment. The list persists across chats, and every call reads the file
-afresh, so editing it by hand is fine. The tools run without asking for
+line adds several at once), and `todo_done` ticks off one or several by number
+or title fragment, separated by commas or newlines. Both answer in one line,
+not with the whole list, and their descriptions tell the model to plan only
+work of five or more steps: ticking off seven steps one call at a time cost a
+benchmark run more tokens than the edits themselves. The list persists across
+chats, and every call reads the file afresh, so editing it by hand is fine. The tools run without asking for
 approval; they are part of the default agent's tool set, and `/tools enable
 todo` adds them to another. Naming `todo` (or `chats`) in an agent's
 `toolGroupNames` is enough: the group is expanded into tool names at startup

@@ -188,30 +188,29 @@ public enum MaiTodoTools {
   public static let definitions: [ToolDefinition] = [
     ToolDefinition(
       name: listName,
-      description:
-        "List the todo items of this project, numbered, with a checkbox showing which are done. Call it to see what is left and to get the numbers todo_done takes.",
+      description: "List this project's todo items, numbered, [x] marking the done ones.",
       parameters: [],
       annotations: ToolAnnotations(
         readOnly: true, idempotent: true, openWorld: false, approval: .automatic)),
     ToolDefinition(
       name: addName,
       description:
-        "Add pending todo items to this project. Use it to plan multi-step work before starting; one title per line adds several items at once. The list persists across chats.",
+        "Add todo items for work of five or more steps, one title per line; skip it for shorter tasks. The list persists across chats.",
       parameters: [
         ToolParameterDef(
           name: "title", type: "string",
-          description: "Task to add. Separate several tasks with newlines.",
+          description: "Tasks to add, one per line.",
           required: true)
       ],
       annotations: ToolAnnotations(
         readOnly: false, idempotent: false, openWorld: false, approval: .automatic)),
     ToolDefinition(
       name: doneName,
-      description: "Mark one todo item done by its number from todo_list or by part of its title.",
+      description: "Mark todo items done, several at once.",
       parameters: [
         ToolParameterDef(
           name: "task", type: "string",
-          description: "Item number as shown by todo_list, or a fragment of its title.",
+          description: "Item numbers or title fragments, separated by newlines or commas.",
           required: true)
       ],
       annotations: ToolAnnotations(
@@ -260,37 +259,66 @@ public enum MaiTodoTools {
     for title in titles {
       if list.add(title) != nil { added.append(title) } else { skipped.append(title) }
     }
-    var lines: [String] = []
+    // One line: the numbers the items got, and how many are open. The full
+    // list is a todo_list call away and need not ride along on every add.
+    var parts: [String] = []
     if added.count == 1 {
-      lines.append("Added: \(added[0]) (#\(list.items.count))")
+      parts.append("Added: \(added[0]) (#\(list.items.count)).")
     } else if !added.isEmpty {
-      lines.append("Added \(added.count) items.")
+      let first = list.items.count - added.count + 1
+      parts.append("Added \(added.count) items. (#\(first)-#\(list.items.count))")
     }
     if !skipped.isEmpty {
-      lines.append("Already listed: \(skipped.joined(separator: "; "))")
+      parts.append("Already listed: \(skipped.joined(separator: "; ")).")
     }
-    lines.append(list.listing)
-    return lines.joined(separator: "\n")
+    parts.append("\(list.pendingCount) pending.")
+    return parts.joined(separator: " ")
   }
 
+  /// Several items at once, by number or title fragment, answered in one line:
+  /// a model ticking off seven steps one call at a time, each call returning
+  /// the whole list, spent more tokens on bookkeeping than on the work.
   private static func markDone(arguments: [String: JSONValue], list: inout AgentTodoList) -> String
   {
-    let query =
-      (arguments["task"]?.stringValue ?? arguments["title_or_id"]?.stringValue
-      ?? arguments["id"]?.stringValue ?? arguments["title"]?.stringValue
-      ?? arguments["number"].flatMap { $0.intValue.map(String.init) ?? $0.stringValue }
-      ?? "")
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !query.isEmpty else { return "Error: task is required." }
-    guard let index = list.index(matching: query) else {
-      return list.isEmpty
-        ? "Error: the todo list is empty."
-        : "Error: no todo matched '\(query)'.\n\(list.listing)"
+    var queries = arguments["tasks"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    if queries.isEmpty {
+      let text =
+        arguments["task"]?.stringValue ?? arguments["title_or_id"]?.stringValue
+        ?? arguments["id"]?.stringValue ?? arguments["title"]?.stringValue
+        ?? arguments["number"].flatMap { $0.intValue.map(String.init) ?? $0.stringValue }
+        ?? ""
+      queries = text.split { $0 == "\n" || $0 == "," }.map(String.init)
     }
-    let item = list.items[index]
-    if item.isDone { return "Already done: \(item.title)\n\(list.listing)" }
-    list.markDone(at: index)
-    return "Marked done: \(item.title)\n\(list.listing)"
+    queries = queries.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    guard !queries.isEmpty else { return "Error: task is required." }
+    guard !list.isEmpty else { return "Error: the todo list is empty." }
+    var done: [String] = []
+    var already: [String] = []
+    var unmatched: [String] = []
+    for query in queries {
+      guard let index = list.index(matching: query) else {
+        unmatched.append(query)
+        continue
+      }
+      let item = list.items[index]
+      if item.isDone {
+        already.append(item.title)
+      } else {
+        list.markDone(at: index)
+        done.append(item.title)
+      }
+    }
+    var parts: [String] = []
+    if !done.isEmpty { parts.append("Done: \(done.joined(separator: "; ")).") }
+    if !already.isEmpty { parts.append("Already done: \(already.joined(separator: "; ")).") }
+    if !unmatched.isEmpty {
+      parts.append("No todo matched: \(unmatched.joined(separator: "; ")).")
+    }
+    if done.isEmpty && already.isEmpty {
+      return "Error: no todo matched '\(queries.joined(separator: ", "))'."
+    }
+    parts.append("\(list.pendingCount) pending.")
+    return parts.joined(separator: " ")
   }
 
   /// Models sometimes send the list the way people write it; the bullet is

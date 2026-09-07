@@ -142,14 +142,18 @@ func todoTools() {
 
   let done = MaiTodoTools.execute(
     name: "todo_done", arguments: ["task": .string("2")], list: &list)
-  #expect(done.hasPrefix("Marked done: Port the tool"))
-  #expect(done.contains("2. [x] Port the tool"))
+  #expect(done == "Done: Port the tool. 3 pending.")
+  #expect(list.items[1].isDone)
   #expect(
     MaiTodoTools.execute(name: "todo_done", arguments: ["task": .string("port")], list: &list)
       .hasPrefix("Already done: Port the tool"))
   #expect(
     MaiTodoTools.execute(name: "todo_done", arguments: ["number": .number(4)], list: &list)
-      .hasPrefix("Marked done: Update docs"))
+      .hasPrefix("Done: Update docs."))
+  // Several items in one call, by number and by fragment, answered in one line.
+  #expect(
+    MaiTodoTools.execute(name: "todo_done", arguments: ["task": .string("1, tests")], list: &list)
+      == "Done: Read the code; Write tests. 0 pending.")
   #expect(
     MaiTodoTools.execute(name: "todo_done", arguments: ["task": .string("nope")], list: &list)
       .hasPrefix("Error: no todo matched 'nope'."))
@@ -158,8 +162,8 @@ func todoTools() {
       == "Error: task is required.")
 
   let listed = MaiTodoTools.execute(name: "todo_list", arguments: [:], list: &list)
-  #expect(listed.hasPrefix("Todo (2 pending, 2 done):"))
-  #expect(listed.contains("1. [ ] Read the code"))
+  #expect(listed.hasPrefix("Todo (0 pending, 4 done):"))
+  #expect(listed.contains("1. [x] Read the code"))
   #expect(listed.contains("4. [x] Update docs"))
   #expect(
     MaiTodoTools.execute(name: "todo_nope", arguments: [:], list: &list)
@@ -189,7 +193,7 @@ func todoFileBackedTools() async throws {
   try Data("- [ ] Ship it\n- [ ] Announce it\n".utf8).write(to: url)
   let done = try await byName["todo_done"]!.call(
     arguments: .object(["task": .string("announce")]), context: context)
-  #expect(done.text.hasPrefix("Marked done: Announce it"))
+  #expect(done.text.hasPrefix("Done: Announce it"))
   #expect(try String(contentsOf: url, encoding: .utf8) == "- [ ] Ship it\n- [x] Announce it\n")
 
   let missing = try await byName["todo_done"]!.call(
