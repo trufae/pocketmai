@@ -1555,29 +1555,29 @@ public actor AgentRuntime {
       "context": .object([
         "type": .string("string"),
         "description": .string(
-          "What the agent must know and cannot discover on its own: facts already established, decisions already made, paths already found. It cannot see this conversation."
+          "What it cannot discover on its own: facts, decisions, and paths already found. It cannot see this conversation."
         ),
       ]),
       "task": .object([
         "type": .string("string"),
-        "description": .string("The single thing the agent should do."),
+        "description": .string("The single thing to do."),
       ]),
       "output": .object([
         "type": .string("string"),
         "description": .string(
-          "What to return and in what shape, for example \"a list of file paths, one per line, no prose\". You are the consumer, so be specific."
+          "What to return and in what shape, for example \"file paths, one per line, no prose\"."
         ),
       ]),
       "wait": .object([
         "type": .string("boolean"),
         "description": .string(
-          "Wait for the answer (default). Pass false to get a pid immediately and collect it later with \(Self.agentResultToolName)."
+          "Wait for the answer (default); false returns a pid to collect with \(Self.agentResultToolName)."
         ),
       ]),
       "tools": .object([
         "type": .string("array"),
         "items": .object(["type": .string("string")]),
-        "description": .string("Optional subset of the agent's tools to allow."),
+        "description": .string("Subset of the agent's tools to allow."),
       ]),
     ]
     if !names.isEmpty {
@@ -1599,8 +1599,8 @@ public actor AgentRuntime {
 
     let startDescription =
       delegating
-      ? "Run a task in a child agent that has your tools. Its steps and tool output stay in its own transcript and only the answer comes back, so use it for work whose output would be bulky here; small calls you can make yourself."
-      : "Run one task in a child agent with a transcript of its own, so its intermediate steps never enter this conversation. Available agents: \(names.joined(separator: ", "))."
+      ? "Run a task in a child agent with your tools; only its answer enters this conversation. Use it for work with bulky tool output, not for small calls."
+      : "Run one task in a child agent with a transcript of its own; only its answer comes back. Agents: \(names.joined(separator: ", "))."
 
     return [
       ToolDefinition(
@@ -1621,25 +1621,22 @@ public actor AgentRuntime {
       ToolDefinition(
         name: Self.agentStatusToolName,
         description:
-          "List your child agents and what they are doing, without waiting: one line per agent, its pid first (#2) and its name after. Omit pid for your direct children; pass tree for the whole subtree. With pid and log, read that agent's own transcript, which is where the work of a stopped or failed child is.",
+          "List your child agents and their state, one line each, pid first (#2). With pid and log, read that agent's transcript.",
         inputSchema: .object([
           "type": .string("object"),
           "properties": .object([
             "pid": .object([
               "type": .string("string"),
-              "description": .string(
-                "One agent's pid: the number after # in the listing (2 for '#2 main.worker'), as returned by \(Self.agentStartToolName). Names are not identifiers."
-              ),
+              "description": .string("An agent's pid, the number after # (2 for '#2 main.worker')."),
             ]),
             "tree": .object([
               "type": .string("boolean"),
-              "description": .string("Include grandchildren and deeper."),
+              "description": .string("Include grandchildren."),
             ]),
             "log": .object([
               "type": .string("integer"),
               "description": .string(
-                "With pid: also return that agent's transcript, the last N messages (1-200; true means \(Self.defaultLogMessages)), tool calls and results included."
-              ),
+                "With pid: also return the last N messages of its transcript (1-200)."),
             ]),
           ]),
           "additionalProperties": .bool(false),
@@ -1653,15 +1650,13 @@ public actor AgentRuntime {
       ToolDefinition(
         name: Self.agentResultToolName,
         description:
-          "Take the answer from a child started with wait false, by its pid. Waits for it to finish unless wait is false. A child that stopped without answering returns the error and the end of its transcript instead; \(Self.agentStatusToolName) with log reads more of it.",
+          "Take the answer of a child started with wait false, by pid; waits for it unless wait is false. A failed child returns its error and the end of its transcript.",
         inputSchema: .object([
           "type": .string("object"),
           "properties": .object([
             "pid": .object([
               "type": .string("string"),
-              "description": .string(
-                "The pid returned by \(Self.agentStartToolName), the number \(Self.agentStatusToolName) shows after # (2 for '#2 main.worker'). Names are not identifiers."
-              ),
+              "description": .string("The pid returned by \(Self.agentStartToolName)."),
             ]),
             "wait": .object([
               "type": .string("boolean"),
@@ -1680,14 +1675,13 @@ public actor AgentRuntime {
       ToolDefinition(
         name: Self.agentStopToolName,
         description:
-          "Stop a child agent and everything it started, when its answer is no longer needed.",
+          "Stop a child agent and everything it started.",
         inputSchema: .object([
           "type": .string("object"),
           "properties": .object([
             "pid": .object([
               "type": .string("string"),
-              "description": .string(
-                "The pid to stop: the number \(Self.agentStatusToolName) shows after #."),
+              "description": .string("The pid to stop."),
             ]),
             "reason": .object([
               "type": .string("string"),
