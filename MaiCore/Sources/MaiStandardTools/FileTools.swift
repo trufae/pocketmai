@@ -147,7 +147,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
       return ToolDefinition(
         name: operation.rawValue,
         description:
-          "List a folder of the workspace '\(workspaceName)'. Paths are relative to the current directory or absolute inside it. The last component may be a pattern such as src/*.c.",
+          "List one folder of the workspace '\(workspaceName)'. Paths are relative to the current directory or absolute inside it. The last component may be a pattern such as src/*.c; for the whole tree use files_find with query *.",
         parameters: [
           ToolParameterDef(
             name: "path",
@@ -161,7 +161,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
       return ToolDefinition(
         name: operation.rawValue,
         description:
-          "Find files and folders by approximate name or glob, skipping ignored, hidden, build, and dependency paths.",
+          "Find files and folders by approximate name or glob (* lists the whole tree), skipping ignored, hidden, build, and dependency paths.",
         parameters: [
           ToolParameterDef(
             name: "query",
