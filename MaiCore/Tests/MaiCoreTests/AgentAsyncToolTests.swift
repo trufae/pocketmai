@@ -504,3 +504,83 @@ func optionalFalseIsKeptUnlessItIsTheDefault() throws {
     apiName: nil)
   #expect(AgentTooling.normalized(call: echo, tools: [quiet]).argumentValues["verbose"] == nil)
 }
+
+@Test("Every child spends a tool budget of its own, so a late child is not left without tools")
+func childrenSpendTheirOwnToolBudgets() async throws {
+  // The parent may make two tool calls in all, and each child makes two of
+  // its own. Summed across the tree, as budgets once were, the first child's
+  // second call would already have been refused and the second child could
+  // not have been started at all.
+  let provider = FixtureProvider { request in
+    let results = request.messages.flatMap(\.toolResults)
+    guard agentName(of: request) != nil else {
+      switch results.count {
+      case 0:
+        return ProviderResponse(
+          message: AgentMessage(
+            role: .assistant, content: [.toolCall(startCall(id: "first", task: "Probe twice as A"))]),
+          stopReason: .toolCall)
+      case 1:
+        return ProviderResponse(
+          message: AgentMessage(
+            role: .assistant, content: [.toolCall(startCall(id: "second", task: "Probe twice as B"))]),
+          stopReason: .toolCall)
+      default:
+        return ProviderResponse(
+          message: .assistant("root got " + results.map(\.text).joined(separator: ", ")),
+          stopReason: .stop)
+      }
+    }
+    let brief = request.messages.last { $0.role == .user }?.text ?? ""
+    let name = brief.contains("as A") ? "A" : "B"
+    guard results.count < 2 else {
+      return ProviderResponse(
+        message: .assistant("\(name) probed " + results.map(\.text).joined(separator: "+")),
+        stopReason: .stop)
+    }
+    return ProviderResponse(
+      message: AgentMessage(
+        role: .assistant,
+        content: [
+          .toolCall(
+            ToolCall(
+              id: "\(name)-\(results.count + 1)", name: "probe",
+              arguments: .object(["n": .integer(results.count + 1)])))
+        ]),
+      stopReason: .toolCall)
+  }
+  let runtime = AgentRuntime(approvalHandler: AllowAllApprovals())
+  try await runtime.register(provider)
+  try await runtime.register(
+    tool: ClosureTool(
+      definition: ToolDefinition(
+        name: "probe",
+        description: "Probe once",
+        inputSchema: .object([
+          "type": .string("object"),
+          "properties": .object(["n": .object(["type": .string("integer")])]),
+        ]),
+        annotations: ToolAnnotations(approval: .automatic))
+    ) { arguments, _ in
+      ToolOutput(text: "p\(Int(arguments.objectValue?["n"]?.coercedNumberValue ?? 0))")
+    })
+
+  var request = delegatingRequest(prompt: "probe twice, twice")
+  request.toolNames = AgentRuntime.agentToolNames.union(["probe"])
+  request.limits = AgentRunLimits(
+    maxModelTurns: 6, maxToolCalls: 2, maxSubagents: 1, maxSubagentDepth: 1)
+  let result = try await runtime.run(request) { _ in }
+
+  #expect(result.response.text == "root got A probed p1+p2, B probed p1+p2")
+  #expect(result.toolCalls == 2, "the parent paid for its two starts and nothing else")
+  let parentResults = result.transcript.flatMap(\.toolResults)
+  #expect(parentResults.count == 2 && parentResults.allSatisfy { !$0.isError })
+  let children = await runtime.supervisor.processes().filter { $0.depth == 1 }
+  #expect(children.count == 2)
+  #expect(children.allSatisfy { $0.state == .completed && $0.toolCalls == 2 })
+  // Neither child was ever told its budget was spent.
+  let probeResults = await provider.requests
+    .filter { $0.tools.contains { $0.name == "probe" } }
+    .flatMap { $0.messages.flatMap(\.toolResults) }
+  #expect(!probeResults.isEmpty && probeResults.allSatisfy { !$0.isError })
+}

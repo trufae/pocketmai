@@ -358,3 +358,107 @@ public struct AgentProcessTree: Equatable, Sendable {
     }
   }
 }
+
+/// One process of a chat's runs as a host keeps it once the session that ran
+/// it is over: what `AgentProcessInfo` knew, plus the transcript. Chat files
+/// carry these so a resumed chat can still list, read, and export the agents
+/// its earlier runs started; the debug export carries the same records.
+///
+/// Pids are session-scoped, so `pid` and `parent` are only what they were
+/// when the record was written. `runID` is the durable identity, and
+/// `parentRunID` names the record a child hangs off — nil for a direct child
+/// of the chat's own process — so a tree restores under fresh pids.
+public struct AgentProcessRecord: Codable, Equatable, Sendable, Identifiable {
+  public var runID: UUID
+  public var parentRunID: UUID?
+  public var pid: AgentPID
+  public var parent: AgentPID?
+  public var agentID: String
+  public var displayName: String
+  public var task: String
+  public var state: AgentProcessState
+  public var depth: Int
+  public var startedAt: Date
+  public var updatedAt: Date
+  public var finishedAt: Date?
+  public var modelTurns: Int
+  public var toolCalls: Int
+  public var usage: TokenUsage?
+  public var failure: String?
+  public var messages: [AgentMessage]
+
+  public var id: UUID { runID }
+
+  public init(process: AgentProcessInfo, messages: [AgentMessage], parentRunID: UUID? = nil) {
+    runID = process.runID
+    self.parentRunID = parentRunID
+    pid = process.pid
+    parent = process.parent
+    agentID = process.agentID
+    displayName = process.displayName
+    task = process.task
+    state = process.state
+    depth = process.depth
+    startedAt = process.startedAt
+    updatedAt = process.updatedAt
+    finishedAt = process.finishedAt
+    modelTurns = process.modelTurns
+    toolCalls = process.toolCalls
+    usage = process.usage
+    failure = process.failure
+    self.messages = messages
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case runID, parentRunID, pid, parent, agentID, displayName, task, state, depth
+    case startedAt, updatedAt, finishedAt, modelTurns, toolCalls, usage, failure, messages
+  }
+
+  /// Records written before `runID`, `parentRunID`, and `updatedAt` existed
+  /// still decode: such a record gets an identity of its own and hangs off
+  /// the chat's process.
+  public init(from decoder: any Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    runID = try container.decodeIfPresent(UUID.self, forKey: .runID) ?? UUID()
+    parentRunID = try container.decodeIfPresent(UUID.self, forKey: .parentRunID)
+    pid = try container.decode(AgentPID.self, forKey: .pid)
+    parent = try container.decodeIfPresent(AgentPID.self, forKey: .parent)
+    agentID = try container.decode(String.self, forKey: .agentID)
+    displayName = try container.decodeIfPresent(String.self, forKey: .displayName) ?? agentID
+    task = try container.decodeIfPresent(String.self, forKey: .task) ?? ""
+    state = try container.decode(AgentProcessState.self, forKey: .state)
+    depth = try container.decodeIfPresent(Int.self, forKey: .depth) ?? 1
+    startedAt = try container.decode(Date.self, forKey: .startedAt)
+    finishedAt = try container.decodeIfPresent(Date.self, forKey: .finishedAt)
+    updatedAt =
+      try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? finishedAt ?? startedAt
+    modelTurns = try container.decodeIfPresent(Int.self, forKey: .modelTurns) ?? 0
+    toolCalls = try container.decodeIfPresent(Int.self, forKey: .toolCalls) ?? 0
+    usage = try container.decodeIfPresent(TokenUsage.self, forKey: .usage)
+    failure = try container.decodeIfPresent(String.self, forKey: .failure)
+    messages = try container.decodeIfPresent([AgentMessage].self, forKey: .messages) ?? []
+  }
+
+  /// `saved` brought up to date with `current`, the records of the processes
+  /// a supervisor holds right now: a process in both is replaced by its
+  /// current copy, one only in `current` is appended, and one only in
+  /// `saved` — forgotten by the table since it was written — is kept as it
+  /// was. Parents stay before children when both inputs have them so.
+  public static func merging(
+    saved: [AgentProcessRecord],
+    current: [AgentProcessRecord]
+  ) -> [AgentProcessRecord] {
+    var merged = saved
+    var indexByRunID: [UUID: Int] = [:]
+    for (index, record) in merged.enumerated() { indexByRunID[record.runID] = index }
+    for record in current {
+      if let index = indexByRunID[record.runID] {
+        merged[index] = record
+      } else {
+        indexByRunID[record.runID] = merged.count
+        merged.append(record)
+      }
+    }
+    return merged
+  }
+}

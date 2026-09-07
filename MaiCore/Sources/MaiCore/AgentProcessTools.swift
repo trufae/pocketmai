@@ -793,7 +793,13 @@ public enum AgentProcessTools {
     }
     guard let handle = await supervisor.handle(pid) else {
       let info = await supervisor.info(pid)
-      let reason = info?.failure ?? "it produced no result"
+      // A completed process with no result and no run was restored from a
+      // saved chat: its answer is in its transcript, and it will not run again.
+      let reason =
+        info?.failure
+        ?? (info?.state == .completed
+          ? "it finished in an earlier session, and its transcript is all that is left"
+          : "it produced no result")
       var message = "agent \(pid) is not available: \(reason)."
       if !(await supervisor.transcript(pid)).isEmpty {
         let excerpt = await transcriptExcerpt(pid, last: 6, supervisor: supervisor)

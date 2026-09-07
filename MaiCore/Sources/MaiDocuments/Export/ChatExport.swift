@@ -45,40 +45,9 @@ public enum ChatExportFormat: String, CaseIterable, Sendable {
 /// One process a run of this chat started, with its own transcript. The
 /// chat's messages hold only the parent's `agent_*` call and the child's
 /// answer; what the child was told, which tools it called, and how it ended
-/// are here, so a debug export shows the whole run.
-public struct ChatExportSubagent: Codable, Equatable, Sendable {
-  public var pid: AgentPID
-  public var parent: AgentPID?
-  public var agentID: String
-  public var displayName: String
-  public var task: String
-  public var state: AgentProcessState
-  public var depth: Int
-  public var startedAt: Date
-  public var finishedAt: Date?
-  public var modelTurns: Int
-  public var toolCalls: Int
-  public var usage: TokenUsage?
-  public var failure: String?
-  public var messages: [AgentMessage]
-
-  public init(process: AgentProcessInfo, messages: [AgentMessage]) {
-    pid = process.pid
-    parent = process.parent
-    agentID = process.agentID
-    displayName = process.displayName
-    task = process.task
-    state = process.state
-    depth = process.depth
-    startedAt = process.startedAt
-    finishedAt = process.finishedAt
-    modelTurns = process.modelTurns
-    toolCalls = process.toolCalls
-    usage = process.usage
-    failure = process.failure
-    self.messages = messages
-  }
-}
+/// are here, so a debug export shows the whole run. It is the record a chat
+/// file keeps for the same purpose, so an export and a saved chat agree.
+public typealias ChatExportSubagent = AgentProcessRecord
 
 /// What the host knows about how the chat was run, for the debug export: the
 /// tools the model was offered, the child agents its runs started, and

@@ -136,6 +136,24 @@ func chatExportsToEveryFormat() throws {
     ChatExportDebug.self,
     from: Data(#"{"provider":"hello","toolDefinitions":[],"settings":{}}"#.utf8))
   #expect(older.subagents.isEmpty)
+
+  // A subagent written before records carried run ids still decodes, and
+  // the records a chat file keeps are the same shape as the export's.
+  let legacyChild = try decoder.decode(
+    ChatExportDebug.self,
+    from: Data(
+      #"{"provider":"hello","subagents":[{"pid":2,"parent":1,"agentID":"helper","displayName":"helper","task":"add up","state":"completed","depth":1,"startedAt":"2026-09-07T10:00:00Z","finishedAt":"2026-09-07T10:00:05Z","modelTurns":1,"toolCalls":0,"messages":[]}]}"#
+        .utf8))
+  #expect(legacyChild.subagents.first?.agentID == "helper")
+  #expect(legacyChild.subagents.first?.parentRunID == nil)
+  #expect(legacyChild.subagents.first?.updatedAt == legacyChild.subagents.first?.finishedAt)
+  var kept = chat
+  kept.subagents = withChildren.subagents
+  let keptEnvelope = try decoder.decode(
+    ChatExportEnvelope.self,
+    from: try ChatExport.data(for: kept, format: .json, generator: "pmai"))
+  #expect(keptEnvelope.chat.subagents.map(\.runID) == withChildren.subagents.map(\.runID))
+  #expect(keptEnvelope.chat.subagents.first?.messages == withChildren.subagents.first?.messages)
 }
 
 @Test("Export file names come from the title and formats accept common spellings")

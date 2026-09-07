@@ -41,6 +41,11 @@ public struct AgentChat: StoredChat, Equatable {
   public var isArchived: Bool
   /// The session this chat presents to providers; see `ChatSession`.
   public var sessionID: String
+  /// The agents this chat's runs started, parents before children, each
+  /// with its own transcript: what `/agents tree` and `/agents log` show
+  /// once the chat is resumed, and what the debug export carries. Hosts
+  /// bring these up to date from the supervisor as runs end.
+  public var subagents: [AgentProcessRecord]
 
   public init(
     id: UUID = UUID(),
@@ -51,7 +56,8 @@ public struct AgentChat: StoredChat, Equatable {
     createdAt: Date = Date(),
     updatedAt: Date = Date(),
     isArchived: Bool = false,
-    sessionID: String? = nil
+    sessionID: String? = nil,
+    subagents: [AgentProcessRecord] = []
   ) {
     self.id = id
     self.title = title
@@ -62,11 +68,12 @@ public struct AgentChat: StoredChat, Equatable {
     self.updatedAt = updatedAt
     self.isArchived = isArchived
     self.sessionID = sessionID ?? ChatSession.newID()
+    self.subagents = subagents
   }
 
   private enum CodingKeys: String, CodingKey {
     case id, title, primaryAgent, messages, pendingContent, createdAt, updatedAt, isArchived
-    case sessionID
+    case sessionID, subagents
   }
 
   public init(from decoder: Decoder) throws {
@@ -83,6 +90,8 @@ public struct AgentChat: StoredChat, Equatable {
     createdAt = try container.decode(Date.self, forKey: .createdAt)
     updatedAt = try container.decode(Date.self, forKey: .updatedAt)
     isArchived = try container.decodeIfPresent(Bool.self, forKey: .isArchived) ?? false
+    subagents =
+      try container.decodeIfPresent([AgentProcessRecord].self, forKey: .subagents) ?? []
   }
 
   /// The title shown to people; empty titles fall back to the placeholder.
@@ -143,13 +152,19 @@ public struct AgentChat: StoredChat, Equatable {
     resettingTranscript: Bool = true
   ) {
     primaryAgent = agent
-    if resettingTranscript { messages = Self.initialHistory(for: agent) }
+    if resettingTranscript {
+      messages = Self.initialHistory(for: agent)
+      subagents.removeAll()
+    }
     pendingContent.removeAll()
     touch()
   }
 
+  /// A cleared conversation keeps nothing of its runs: the agents they
+  /// started go with the messages.
   public mutating func resetTranscript() {
     messages = Self.initialHistory(for: primaryAgent)
+    subagents.removeAll()
     pendingContent.removeAll()
     touch()
   }

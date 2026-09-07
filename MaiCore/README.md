@@ -249,7 +249,9 @@ upgrading a store cannot lose a chat. `AgentProject`, `AgentProjectIndex`, and
 PocketMai folder colors always were.
 `-l` lists saved chats for the current project, and `-r INDEX|ID|TITLE` (or
 `--resume`) reopens one; `-r` without a selector reopens the most recently
-updated chat. `/chat list`
+updated chat. A chat is saved with the agents its runs started and their
+transcripts, so a reopened chat lists them under `/agents tree`, `/agents log
+PID` reads one, and `/agents clear` drops them (see `doc/agents.md`). `/chat list`
 shows the earlier chats grouped by day (Today, Yesterday, This week, Last week,
 then dates), newest first, with their agent, size, and last-update time, and
 lists archived chats last; `/chat list active` and `/chat list archived` narrow

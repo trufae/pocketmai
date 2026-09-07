@@ -91,9 +91,14 @@ makes a tree, not a two-level parent/child split:
     └── #5  worker  approval?    waiting on write_file
 ```
 
-Depth is bounded by `limits.maxSubagentDepth`; the turn, token, and time
-budgets are shared across the whole tree through a single `RunBudget`, so a
-runaway grandchild cannot outspend its grandparent's budget. Concurrency is
+Depth is bounded by `limits.maxSubagentDepth`. The turn, tool, token, and time
+budgets belong to one agent, not to its whole tree: every child receives a
+fresh `RunBudget` from its own definition, so a parent that has handed out a
+hundred tool calls through its children can still start another child, and
+that child can still call its tools. Budgets used to be summed across the
+tree, which is what left a late child with no tool calls at all. What bounds
+the tree as a whole is the parent's own allowance — each `agent_start` is one
+of its tool calls — together with the depth and the concurrency. Concurrency is
 bounded by `limits.maxSubagents` per parent agent, and a child started past it
 is **queued** rather than refused: the supervisor registers it in the `queued`
 state and admits it, oldest first, when a sibling ends. A queued child holds no
@@ -154,6 +159,48 @@ instead of run. A child that pauses reports to its parent as an error carrying
 its last message, and shows as `stopped` in the tree. Failed model calls are
 repeated under the agent's `retry` policy first, each announced with
 `AgentEvent.retrying`.
+
+## Saved with the chat
+
+The process table lives for one session, but a chat does not. What a child
+was told, which tools it called, and how it ended would otherwise be gone the
+moment pmai exits, and `pmai -r` would reopen a chat whose runs had started a
+dozen agents with nothing to show for them but the answers folded into the
+main transcript.
+
+So a chat file carries an `AgentProcessRecord` for every process its runs
+started: what `AgentProcessInfo` knew — agent, task, state, depth, turns,
+tools, tokens, failure, timestamps — plus the transcript. It is the same shape
+the debug export writes as `subagents`, so an export and a saved chat agree.
+Pids are session-scoped, so a record keeps them only as they were; `runID` is
+its durable identity, and `parentRunID` names the record it hangs off (nil
+for a direct child of the chat's own process), which is what lets a tree
+restore under fresh pids.
+
+`AgentSupervisor.records(under:)` takes the subtree of a chat's process as
+records, parents before children, and `AgentProcessRecord.merging(saved:current:)`
+folds them into what the chat already holds: a process the table still has
+replaces its saved copy, a new one is appended, and one the table has since
+forgotten — past its retention, or from an earlier session — stays as saved.
+pmai does this whenever it writes the workspace: at the end of every turn,
+before `/chat` and every other command, at exit, and after a one-shot run.
+
+`AgentSupervisor.restore(_:under:)` puts records back under a chat's process
+with fresh pids, once per chat and session, without ever running them: a
+process that was still running when it was saved is listed as `killed` with
+"its run ended with the session that started it" as its reason. From there
+they are ordinary finished processes. `/agents tree` lists them, `/agents log
+PID` and `agent_status` with `log` read their transcripts, `agent_result`
+explains that the answer is in the transcript rather than waiting, and `/chat
+info` counts them. pmai restores them as soon as a chat is opened — at start
+with `-r`, or on `/chat use` — and says so.
+
+Records are purged two ways. `/agents clear` forgets the finished processes
+and drops every record of the chat at the prompt that the table no longer
+holds, so what stays in the file is what the tree still shows. `/clear` and
+`/chat clear` drop them with the conversation, and forget the finished
+processes under the chat so the next save does not bring them back; children
+still running keep going and are saved again when they end.
 
 ## Autocompact
 
@@ -357,11 +404,12 @@ forwards only depth-0 events to the editor.
 /agent tools|model|prompt|provider ID VALUE   change one saved setup
 /agent remove ID              drop a setup; subagent lists and the default follow
 /edit agent [ID]              edit a setup as JSON in $EDITOR
-/agents log PID               that process's transcript
+/agents log PID               that process's transcript, saved ones included
 /agents stop PID              pause a process and everything under it at their next step
 /agents continue PID          let a paused process go on; queued messages reach it then
 /agents kill PID [REASON]     end a process and everything under it
-/agents clear                 forget finished processes; the tree keeps only running ones
+/agents clear                 forget finished processes, and drop the ones saved with
+                              this chat; the tree keeps only running ones
 /agents focus PID|main        send what you type to one process, or back to the chat
 @PID TEXT                     one message to one process, focus unchanged
 /queue                        what is waiting for each process's next turn

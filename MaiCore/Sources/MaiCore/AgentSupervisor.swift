@@ -30,7 +30,10 @@ public struct AgentQueuedMessage: Equatable, Sendable, Identifiable {
 ///
 /// `AgentRuntime` writes to it as runs progress; hosts read it for `/agents`,
 /// follow `events` for notifications, and call `stop` to kill a subtree.
-/// Nothing here is persisted — pids are session-scoped by design.
+/// Nothing here is persisted — pids are session-scoped by design. A host that
+/// wants a chat's agents back after a restart saves `records(under:)` with
+/// the chat and hands them to `restore(_:under:)`, which lists them again
+/// under fresh pids without ever running them.
 public actor AgentSupervisor {
   private struct Entry {
     var info: AgentProcessInfo
@@ -177,6 +180,84 @@ public actor AgentSupervisor {
     let removable = removableFinished()
     for process in removable { forget(process.pid) }
     return removable.map(\.pid)
+  }
+
+  /// Forgets the finished processes under `pid` that nothing depends on any
+  /// more, keeping `pid` itself, so a chat whose conversation was cleared
+  /// lists only what still runs for it. Returns the pids dropped.
+  @discardableResult
+  public func clearFinished(under pid: AgentPID) -> [AgentPID] {
+    let within = Set(tree().subtree(of: pid).dropFirst().map(\.pid))
+    let removable = removableFinished().filter { within.contains($0.pid) }
+    for process in removable { forget(process.pid) }
+    return removable.map(\.pid)
+  }
+
+  // MARK: - Saving and restoring
+
+  /// The processes under `pid`, parents before children, as records a host
+  /// saves with its chat: what the table knows of each, plus its transcript.
+  /// `parentRunID` names a record's parent among them; nil marks a direct
+  /// child of `pid`, whose own run id changes with every turn.
+  public func records(under pid: AgentPID) -> [AgentProcessRecord] {
+    let snapshot = tree()
+    return snapshot.subtree(of: pid).dropFirst().map { process in
+      let parentRunID = process.parent.flatMap { $0 == pid ? nil : snapshot.info($0)?.runID }
+      return AgentProcessRecord(
+        process: process,
+        messages: entries[process.pid]?.transcript ?? [],
+        parentRunID: parentRunID)
+    }
+  }
+
+  /// What a restored process that was still running when its record was
+  /// written says for itself: the session that ran it is gone.
+  public static let restoredWhileRunning = "its run ended with the session that started it"
+
+  /// Puts records a host saved back in the table under `parent` — a chat's
+  /// own process — with fresh pids, so they are listed, read, and exported
+  /// like the processes of this session. Records come parents before
+  /// children, and a child whose `parentRunID` is not among them hangs off
+  /// `parent`. A process that was still running when it was saved is listed
+  /// as cancelled, with `restoredWhileRunning` as its reason, since the run
+  /// that owned it is gone; nothing restored is ever run again. Answers the
+  /// pids given, in the records' order; an unknown `parent` restores nothing.
+  @discardableResult
+  public func restore(_ records: [AgentProcessRecord], under parent: AgentPID) -> [AgentPID] {
+    guard let root = entries[parent] else { return [] }
+    var pidsByRunID: [UUID: AgentPID] = [:]
+    var assigned: [AgentPID] = []
+    for record in records {
+      let pid = AgentPID(nextPID)
+      nextPID += 1
+      let parentPID = record.parentRunID.flatMap { pidsByRunID[$0] } ?? parent
+      let depth = (entries[parentPID]?.info.depth ?? root.info.depth) + 1
+      let ended = record.state.isTerminal
+      let info = AgentProcessInfo(
+        pid: pid,
+        parent: parentPID,
+        runID: record.runID,
+        agentID: record.agentID,
+        displayName: record.displayName,
+        task: record.task,
+        state: ended ? record.state : .cancelled,
+        depth: depth,
+        startedAt: record.startedAt,
+        runStartedAt: record.startedAt,
+        updatedAt: record.updatedAt,
+        finishedAt: record.finishedAt ?? record.updatedAt,
+        modelTurns: record.modelTurns,
+        toolCalls: record.toolCalls,
+        usage: record.usage,
+        failure: ended ? record.failure : Self.restoredWhileRunning,
+        isCollected: true)
+      entries[pid] = Entry(info: info, transcript: record.messages)
+      pidsByRunID[record.runID] = pid
+      assigned.append(pid)
+      publish(.started(info))
+    }
+    pruneFinished()
+    return assigned
   }
 
   // MARK: - Inbox

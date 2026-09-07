@@ -610,6 +610,11 @@ struct REPLSession {
   var createdAt: Date
   var updatedAt: Date
   var isArchived: Bool
+  /// The agents this chat's runs started, with their transcripts, as saved
+  /// with the chat. The REPL brings them up to date from the supervisor as
+  /// runs end and puts them back in the process table when the chat is
+  /// reopened, so `/agents tree` and `/agents log` outlive the session.
+  var subagents: [AgentProcessRecord]
   #if PMAI_HAS_VISUAL
     /// Conversations and panes left behind by the last `/visual` session.
     var visualSnapshot: VisualWorkspaceSnapshot?
@@ -633,6 +638,7 @@ struct REPLSession {
     self.createdAt = createdAt
     self.updatedAt = updatedAt
     isArchived = false
+    subagents = []
   }
 
   init(chat: AgentChat) {
@@ -645,6 +651,7 @@ struct REPLSession {
     createdAt = chat.createdAt
     updatedAt = chat.updatedAt
     isArchived = chat.isArchived
+    subagents = chat.subagents
   }
 
   var chat: AgentChat {
@@ -657,7 +664,8 @@ struct REPLSession {
       createdAt: createdAt,
       updatedAt: updatedAt,
       isArchived: isArchived,
-      sessionID: sessionID)
+      sessionID: sessionID,
+      subagents: subagents)
   }
 
   /// Names a placeholder chat after its first message; chosen titles stay.
@@ -669,10 +677,13 @@ struct REPLSession {
     title = derived
   }
 
+  /// A cleared conversation keeps nothing of its runs: the agents they
+  /// started go with the messages.
   mutating func reset(profile: SessionProfile? = nil) {
     if let profile { self.profile = profile }
     history.replaceAll(with: Self.initialHistory(for: self.profile))
     pendingContent.removeAll()
+    subagents.removeAll()
     touch()
   }
 
@@ -1042,6 +1053,11 @@ struct MaiCLI {
           runtime: runtime,
           process: &oneShotProcess,
           terminal: terminal)
+        if let process = oneShotProcess {
+          session.subagents = AgentProcessRecord.merging(
+            saved: session.subagents,
+            current: await runtime.supervisor.records(under: process))
+        }
         workspace.upsert(session.chat, selecting: true)
         try store.commit(&workspace)
         if !succeeded { exit(1) }
@@ -1551,6 +1567,10 @@ struct MaiCLI {
     // turns ago is still the current run's child, so it stays collectable,
     // and a message typed while a turn runs has a pid to wait in.
     var chatProcessIDs: [UUID: AgentPID] = [:]
+    // Chats whose saved agents were put back in the process table this
+    // session: once is enough, and clearing the table must not bring them
+    // back.
+    var restoredChatIDs: Set<UUID> = []
     await terminal.line("pmai — MaiCore agent REPL")
     await terminal.line(
       "Project: \(project.displayName) · \(abbreviatedPath(project.workingDirectory)) · /project shows more"
@@ -1690,6 +1710,50 @@ struct MaiCLI {
       let pid = await runtime.allocateProcess(agentID: session.profile.agentID, task: session.title)
       chatProcessIDs[session.id] = pid
       return pid
+    }
+
+    /// Brings every chat's saved agents up to date with the process table:
+    /// what runs under a chat's process, live or finished, replaces its
+    /// saved copy, and what the table has since forgotten stays as saved.
+    /// Called wherever the workspace is about to be written.
+    func recordSubagents() async {
+      for (chatID, pid) in chatProcessIDs {
+        let current = await runtime.supervisor.records(under: pid)
+        if chatID == session.id {
+          session.subagents = AgentProcessRecord.merging(
+            saved: session.subagents, current: current)
+        } else if var chat = workspace.chats.first(where: { $0.id == chatID }) {
+          chat.subagents = AgentProcessRecord.merging(saved: chat.subagents, current: current)
+          workspace.upsert(chat)
+        }
+      }
+    }
+
+    /// Puts the agents saved with the chat at the prompt back in the process
+    /// table, once per chat and session, so `/agents tree` and `/agents log`
+    /// show what earlier runs started before the chat's next turn.
+    func restoreSavedSubagents() async {
+      guard restoredChatIDs.insert(session.id).inserted, !session.subagents.isEmpty else {
+        return
+      }
+      let pid = await mainProcess()
+      let restored = await runtime.supervisor.restore(session.subagents, under: pid)
+      // Idle between turns, like a chat that has already run: listed as done,
+      // cleared with the rest, and reopened by its next turn.
+      await runtime.supervisor.complete(pid)
+      guard !restored.isEmpty else { return }
+      await terminal.line(
+        "\(restored.count) agent\(restored.count == 1 ? "" : "s") from earlier runs of this chat: /agents tree lists them, /agents log PID reads one, /agents clear drops them."
+      )
+    }
+
+    /// Drops the agents saved with the chat at the prompt that the process
+    /// table no longer holds, after `/agents clear`. Answers how many went.
+    func dropForgottenSubagents() async -> Int {
+      let known = Set(await runtime.supervisor.processes().map(\.runID))
+      let before = session.subagents.count
+      session.subagents.removeAll { !known.contains($0.runID) }
+      return before - session.subagents.count
     }
 
     func beginTurn(_ request: AgentRequest, process pid: AgentPID, kind: REPLTurnKind) async {
@@ -2014,6 +2078,7 @@ struct MaiCLI {
       }
     }
 
+    await restoreSavedSubagents()
     reader.start()
     await releaseReader(workspace: workspace)
 
@@ -2073,11 +2138,24 @@ struct MaiCLI {
             // A chat whose idle process went with them gets a fresh one at
             // its next turn; nothing it said is lost, the session has it.
             chatProcessIDs = chatProcessIDs.filter { !cleared.contains($0.value) }
-            await terminal.line(
-              cleared.isEmpty
-                ? "No finished agents to clear."
-                : "Cleared \(cleared.count) finished agent\(cleared.count == 1 ? "" : "s"); /agents tree lists what still runs."
-            )
+            // Clearing is also how the agents saved with this chat are
+            // purged: what stays in its file is what the table still holds.
+            let dropped = await dropForgottenSubagents()
+            if dropped > 0 {
+              workspace.upsert(session.chat, selecting: true)
+              await saveWorkspace(&workspace, store: store, terminal: terminal)
+            }
+            let summary =
+              switch (cleared.count, dropped) {
+              case (0, 0): "No finished agents to clear."
+              case (let count, 0):
+                "Cleared \(count) finished agent\(count == 1 ? "" : "s"); /agents tree lists what still runs."
+              case (0, let dropped):
+                "Dropped \(dropped) agent\(dropped == 1 ? "" : "s") saved with this chat."
+              case (let count, let dropped):
+                "Cleared \(count) finished agent\(count == 1 ? "" : "s") and dropped \(dropped) saved with this chat; /agents tree lists what still runs."
+              }
+            await terminal.line(summary)
             await refreshStatus()
             await releaseIfIdle(workspace: workspace)
             continue
@@ -2145,6 +2223,7 @@ struct MaiCLI {
             continue
           }
           if name == "/chat" {
+            await recordSubagents()
             workspace.upsert(session.chat, selecting: true)
             await handleWorkspaceChatCommand(
               argument,
@@ -2152,13 +2231,16 @@ struct MaiCLI {
               workspace: &workspace,
               runtime: runtime,
               configuration: configuration,
+              chatProcess: chatProcessIDs[session.id],
               terminal: terminal)
+            await restoreSavedSubagents()
             workspace.upsert(session.chat, selecting: true)
             await saveWorkspace(&workspace, store: store, terminal: terminal)
             await noteTurnEffects(since: before)
             await releaseIfIdle(workspace: workspace)
             continue
           }
+          await recordSubagents()
           #if PMAI_HAS_VISUAL
             if text == "/visual" {
               workspace.upsert(session.chat, selecting: true)
@@ -2196,6 +2278,7 @@ struct MaiCLI {
             workspace.upsert(session.chat, selecting: true)
           #endif
           await saveWorkspace(&workspace, store: store, terminal: terminal)
+          await restoreSavedSubagents()
           await noteTurnEffects(since: before)
           await releaseIfIdle(workspace: workspace)
           continue
@@ -2281,6 +2364,9 @@ struct MaiCLI {
           }
         }
         if let turn, turn.chatID != nil {
+          // The agents the run started, and earlier ones still going, are
+          // saved with their chat as they stand now.
+          await recordSubagents()
           if atPrompt {
             session.touch()
             workspace.upsert(session.chat, selecting: true)
@@ -2368,6 +2454,7 @@ struct MaiCLI {
     supervisorFeed.cancel()
     continuation.finish()
     await visual.approvalHandler.setPrompter(nil)
+    await recordSubagents()
     workspace.upsert(session.chat, selecting: true)
     await saveWorkspace(&workspace, store: store, terminal: terminal, closing: true)
     await terminal.attach(screen: nil)
@@ -2754,6 +2841,7 @@ struct MaiCLI {
         session: &session,
         runtime: runtime,
         compactPrompt: configuration?.prompts?.compact,
+        chatProcess: chatProcess,
         terminal: terminal)
     case "/edit":
       await handleEditCommand(
@@ -2899,6 +2987,9 @@ struct MaiCLI {
     #endif
     case "/clear":
       session.reset()
+      // The agents the cleared runs started leave the table with them, so
+      // the next save does not bring them back; running ones stay.
+      if let chatProcess { await runtime.supervisor.clearFinished(under: chatProcess) }
       await terminal.line("Conversation cleared.")
     case "/queue":
       await terminal.line("The message queue lives at the terminal prompt.\n" + queueHelp)
@@ -6885,28 +6976,22 @@ struct MaiCLI {
       await terminal.line(exportHelp)
       return
     }
-    let chat = session.chat
+    var chat = session.chat
     guard chat.hasConversation else {
       await terminal.line("Nothing to export yet: this chat has no messages.")
       return
+    }
+    // The agents of this chat's runs as they stand: what the process table
+    // holds now, live or finished, over what was saved with the chat.
+    if let process {
+      chat.subagents = AgentProcessRecord.merging(
+        saved: chat.subagents, current: await runtime.supervisor.records(under: process))
     }
     var debug: ChatExportDebug?
     if format == .debug {
       let profile = session.profile
       let tools = await runtime.availableTools().filter { profile.toolNames.contains($0.name) }
       let provider = await runtime.availableProviders().first { $0.id == profile.provider }
-      // The children of this chat's process, parents before children. Their
-      // transcripts live only in the supervisor, so the export is the one
-      // place they can be kept from.
-      var subagents: [ChatExportSubagent] = []
-      if let process {
-        let tree = await runtime.supervisor.tree()
-        for child in tree.subtree(of: process).dropFirst() {
-          subagents.append(
-            ChatExportSubagent(
-              process: child, messages: await runtime.supervisor.transcript(child.pid)))
-        }
-      }
       debug = ChatExportDebug(
         provider: profile.provider.rawValue,
         providerDisplayName: provider?.displayName,
@@ -6930,7 +7015,7 @@ struct MaiCLI {
           "ctx.compact": autocompactSetting(profile.autocompact),
           "ctx.strategy": profile.context.rawValue,
         ],
-        subagents: subagents)
+        subagents: chat.subagents)
     }
     let current = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
     var target: URL
@@ -7326,6 +7411,7 @@ struct MaiCLI {
     workspace: inout AgentChatWorkspace,
     runtime: AgentRuntime,
     configuration: MaiConfiguration?,
+    chatProcess: AgentPID? = nil,
     terminal: TerminalWriter
   ) async {
     let parts = argument.split(maxSplits: 2, whereSeparator: \Character.isWhitespace).map(
@@ -7488,6 +7574,7 @@ struct MaiCLI {
         session: &session,
         runtime: runtime,
         compactPrompt: configuration?.prompts?.compact,
+        chatProcess: chatProcess,
         terminal: terminal)
     case "log", "edit", "remove", "rm", "undo", "trim", "compact", "clear", "help":
       await handleChatCommand(
@@ -7495,6 +7582,7 @@ struct MaiCLI {
         session: &session,
         runtime: runtime,
         compactPrompt: configuration?.prompts?.compact,
+        chatProcess: chatProcess,
         terminal: terminal)
     default:
       await terminal.line("Unknown /chat action '\(action)'.\n\n\(chatHelp)")
@@ -7775,6 +7863,13 @@ struct MaiCLI {
     if !chat.pendingContent.isEmpty {
       lines.append("Pending:  \(chat.pendingContent.count) attachment(s) queued")
     }
+    if !chat.subagents.isEmpty {
+      let running = chat.subagents.filter { !$0.state.isTerminal }.count
+      lines.append(
+        "Agents:   \(chat.subagents.count) started by its runs"
+          + (running > 0 ? ", \(running) still running when last saved" : "")
+          + " (/agents tree lists them)")
+    }
     return lines.joined(separator: "\n")
   }
 
@@ -7810,6 +7905,7 @@ struct MaiCLI {
     session: inout REPLSession,
     runtime: AgentRuntime,
     compactPrompt: String?,
+    chatProcess: AgentPID? = nil,
     terminal: TerminalWriter
   ) async {
     let parts = argument.split(maxSplits: 2, whereSeparator: \Character.isWhitespace).map(
@@ -7889,6 +7985,7 @@ struct MaiCLI {
         terminal: terminal)
     case "clear":
       session.reset()
+      if let chatProcess { await runtime.supervisor.clearFinished(under: chatProcess) }
       await terminal.line("Conversation cleared.")
     case "help":
       await terminal.line(chatHelp)
@@ -8363,7 +8460,9 @@ struct MaiCLI {
           pendingContent: conversation.pendingContent,
           createdAt: old?.createdAt ?? Date(),
           updatedAt: untouched ? old!.updatedAt : Date(),
-          isArchived: old?.isArchived ?? false)
+          isArchived: old?.isArchived ?? false,
+          sessionID: conversation.sessionID,
+          subagents: old?.subagents ?? [])
       }
       return AgentChatWorkspace(chats: chats, selectedChatID: focusedID)
     }
@@ -8811,6 +8910,9 @@ struct MaiCLI {
     Start with -l to list saved chats, then -r INDEX|ID|TITLE to reopen one;
     -r without a selector reopens the most recently updated chat. Chats
     belong to the project rooted at the start directory; /project shows it.
+    A chat is saved with the agents its runs started and their transcripts:
+    reopening it lists them under /agents tree, /agents log PID reads one,
+    /chat info counts them, and /agents clear drops them from the chat.
     """
 
   private static let projectHelp = """
@@ -8966,7 +9068,7 @@ struct MaiCLI {
       /agents                    List definitions, then the running process tree
       /agents list               Definitions only
       /agents tree               The running process tree only
-      /agents clear              Forget finished processes; only running ones stay listed
+      /agents clear              Forget finished processes, and drop the ones saved with this chat
       /agents use ID             Switch this chat to a definition
       /agents show [ID]          Show one definition in full
       /agents describe ID TEXT   Set the one-line purpose a model reads to pick it
@@ -8989,7 +9091,7 @@ struct MaiCLI {
 
     A definition's tools are its own, whatever its depth in the tree: give a
     subagent its groups the same way. Named prompts are managed with /prompt.
-      /agents log PID            Print a running or finished agent's own transcript
+      /agents log PID            Print a running, finished, or saved agent's own transcript
       /agents stop PID           Pause an agent and everything it started at their next step
       /agents continue PID       Let a paused agent go on; queued messages reach it then
       /agents kill PID [REASON]  End an agent and everything it started
@@ -9044,16 +9146,17 @@ struct MaiCLI {
         --base-url URL      ad-hoc OpenAI-compatible endpoint
         --api-key KEY       prefer an environment variable or config reference
         --system TEXT       override agent instructions
-        --max-tool-calls N  tool calls allowed per run (default 50)
-        --max-turns N       model turns allowed per run (default 50)
-        --max-subagents N   concurrent background agents (default 0/off)
+        --max-tool-calls N  tool calls allowed per agent run (default 100)
+        --max-turns N       model turns allowed per agent run (default 50)
+        --max-subagents N   children an agent may run at once (default 5)
         --image PATH        attach an image (repeatable)
         --stdin             attach standard input as a text file (git diff | pmai --stdin "review it")
         --no-stream         disable response streaming
         -y, --yolo          permit all tool calls without prompting for this run
                             (/set yolo on saves the choice for every run)
         -l, --list          list saved chats in this project and exit
-        -r, --resume [CHAT] reopen CHAT (list index, ID, or title), or the latest chat
+        -r, --resume [CHAT] reopen CHAT (list index, ID, or title), or the latest chat,
+                            with the agents its runs started
         --markdown          render replies as markdown even when piped
         --no-markdown       print replies verbatim
         -h, --help          show this help
