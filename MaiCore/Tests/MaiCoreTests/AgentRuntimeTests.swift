@@ -184,8 +184,26 @@ func toolProxyCatalogAndCap() {
   }
   let definitions = ToolProxy.definitions(for: catalog)
   #expect(definitions.map(\.name) == [ToolProxy.listName, ToolProxy.callName])
-  #expect(definitions[0].description.contains("files_op1, files_op2"))
-  #expect(ToolProxy.definitions.first?.description.contains("Enabled tools") == false)
+  #expect(
+    definitions[0].description.contains(
+      "files_op1 (Work with files, operation 1); files_op2 (Work with files, operation 2)"))
+  #expect(ToolProxy.definitions.first?.description.contains("They are:") == false)
+
+  // Hybrid: the common tools stay native, the rest sit behind the two proxy tools.
+  let hybridCatalog = [
+    ToolDefinition(name: "files_read", description: "Read a text file. PDF and DOCX are converted."),
+    ToolDefinition(name: "weather", description: "Look up a forecast; needs a city."),
+  ]
+  let hybrid = ToolProxy.definitions(for: hybridCatalog)
+  #expect(hybrid.map(\.name) == ["files_read", ToolProxy.listName, ToolProxy.callName])
+  #expect(hybrid[1].description.contains("weather (Look up a forecast)"))
+  #expect(!hybrid[1].description.contains("files_read"))
+  #expect(
+    ToolProxy.definitions(for: hybridCatalog, exposing: []).map(\.name)
+      == [ToolProxy.listName, ToolProxy.callName])
+  #expect(
+    ToolProxy.definitions(for: hybridCatalog, exposing: ["files_read", "weather"]).map(\.name)
+      == ["files_read", "weather"])
 
   let listing = ToolProxy.listTools(arguments: ["keywords": .string("files")], definitions: catalog)
   let detailed = listing.components(separatedBy: "\n").filter { $0.hasPrefix("- files_op") }
@@ -858,7 +876,7 @@ func proxiedToolLoop() async throws {
   #expect(result.transcript.flatMap(\.toolResults).first?.text == "HELLO")
   let offered = await provider.requests.first?.tools ?? []
   #expect(offered.map(\.name) == [ToolProxy.listName, ToolProxy.callName])
-  #expect(offered.first?.description.contains("Enabled tools:") == true)
+  #expect(offered.first?.description.contains("They are: uppercase") == true)
 }
 
 @Test("Providers without native tools use the JSON fallback without leaking protocol text")

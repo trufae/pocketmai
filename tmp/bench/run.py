@@ -79,7 +79,7 @@ def make_config(port, model, variant, instructions, strategy="automatic"):
         "model": model,
         "toolGroupNames": groups,
         "toolCallingStrategy": strategy,
-        "useToolProxy": variant == "proxy",
+        "useToolProxy": variant in ("proxy", "hybrid"),
         "toolDelegation": "subagent" if variant == "subagent" else "inline",
         "limits": {
             "maxModelTurns": 40,
@@ -91,6 +91,8 @@ def make_config(port, model, variant, instructions, strategy="automatic"):
     }
     if variant == "subagent":
         agent["toolGroupNames"] = groups + ["agents"]
+    if variant == "proxy":
+        agent["proxyExposedTools"] = []  # the pure proxy; "hybrid" keeps the default exposed set
     return {
         "version": 1,
         "defaultAgent": "coder",
@@ -233,7 +235,7 @@ def run_case(name, args, upstream, key):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("cases", nargs="*")
-    parser.add_argument("--variant", default="inline", choices=["inline", "proxy", "subagent"])
+    parser.add_argument("--variant", default="inline", choices=["inline", "proxy", "hybrid", "subagent"])
     parser.add_argument("--model")
     parser.add_argument("--run-id")
     parser.add_argument("--timeout", type=int, default=900)

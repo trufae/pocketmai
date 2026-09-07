@@ -11,48 +11,102 @@ public enum ToolProxy {
   /// whole catalog.
   public static let detailedMatches = 6
 
-  /// The two proxy tools, named for the catalog they stand in for. A model
-  /// that only sees "list-tools" and "call-tool" does not know it can read
-  /// files or run commands, and declines the task instead of looking.
-  public static func definitions(for catalog: [ToolDefinition]) -> [ToolDefinition] {
-    let names = catalog.map(\.name).sorted().joined(separator: ", ")
-    let enabled = names.isEmpty ? "" : " Enabled tools: \(names)."
-    return [
-      ToolDefinition(
-        name: listName,
-        description:
-          "Describe enabled tools and their arguments, searched by capability, tool name, or argument name.\(enabled)",
-        parameters: [
-          ToolParameterDef(
-            name: "keywords",
-            type: "string",
-            description: "Space-separated task, tool, capability, or argument keywords.",
-            required: true)
-        ],
-        annotations: ToolAnnotations(
-          readOnly: true, idempotent: true, openWorld: false, approval: .automatic)),
-      ToolDefinition(
-        name: callName,
-        description:
-          "Call one enabled tool by exact name with JSON arguments. Use list-tools first when its arguments are not known.",
-        parameters: [
-          ToolParameterDef(
-            name: "name",
-            type: "string",
-            description: "Exact tool name from the enabled tools.",
-            required: true),
-          ToolParameterDef(
-            name: "arguments",
-            type: "object",
-            description: "JSON object with arguments for the selected tool. Use {} when none.",
-            required: true),
-        ],
-        annotations: ToolAnnotations(approval: .automatic)),
-    ]
+  /// Tools most coding work touches every few turns. With the proxy on, an
+  /// agent offers these natively unless its definition names another set; the
+  /// rest stay behind list-tools and call-tool. A model calling the common
+  /// tools by their own schema makes far fewer mistakes than one wrapping
+  /// every call in an envelope, and the six schemas cost about 1k tokens.
+  public static let defaultExposedNames: Set<String> = [
+    "files_read", "files_grep", "files_patch", "files_write", "files_list", "run_sh",
+  ]
+
+  /// Tools shown at most in the list-tools description before "and N more".
+  static let maximumDescribedTools = 40
+
+  /// The definitions a proxied run offers: the exposed tools as they are,
+  /// then list-tools and call-tool for the rest. `exposed` nil means
+  /// `defaultExposedNames`; an empty set is the pure proxy.
+  public static func definitions(
+    for catalog: [ToolDefinition],
+    exposing exposed: Set<String>? = nil
+  ) -> [ToolDefinition] {
+    let hidden = hiddenDefinitions(in: catalog, exposing: exposed)
+    let visible = catalog.filter { !hidden.contains($0) }
+    guard !hidden.isEmpty else { return visible }
+    return visible + [listDefinition(for: hidden), callDefinition]
   }
 
-  /// The proxy tools without a catalog to name.
-  public static var definitions: [ToolDefinition] { definitions(for: []) }
+  /// The proxy tools without a catalog to describe.
+  public static var definitions: [ToolDefinition] { [listDefinition(for: []), callDefinition] }
+
+  /// The tools of `catalog` that sit behind the proxy.
+  public static func hiddenDefinitions(
+    in catalog: [ToolDefinition],
+    exposing exposed: Set<String>?
+  ) -> [ToolDefinition] {
+    let names = exposed ?? defaultExposedNames
+    return catalog.filter { !names.contains($0.name) }
+  }
+
+  /// Appended to repair feedback in a proxied run: a model that calls a hidden
+  /// tool by its own name gets nothing back from the server, and needs to be
+  /// told the way in.
+  public static let repairHint =
+    "Tools not offered directly run through \(callName): {\"name\": TOOL, \"arguments\": {…}}; \(listName) describes their arguments."
+
+  /// list-tools, describing what it reaches: each hidden tool's name and the
+  /// start of its description, so the model knows what exists without paying
+  /// for the schemas until it needs one.
+  static func listDefinition(for hidden: [ToolDefinition]) -> ToolDefinition {
+    var description =
+      "Describe the arguments of the tools reachable through \(callName), by name or keyword."
+    if !hidden.isEmpty {
+      let shown = hidden.prefix(maximumDescribedTools).map { "\($0.name) (\(blurb($0.description)))" }
+      description += " They are: " + shown.joined(separator: "; ")
+      if hidden.count > shown.count { description += "; and \(hidden.count - shown.count) more" }
+      description += "."
+    }
+    return ToolDefinition(
+      name: listName,
+      description: description,
+      parameters: [
+        ToolParameterDef(
+          name: "keywords",
+          type: "string",
+          description: "Space-separated tool, capability, or argument keywords.",
+          required: true)
+      ],
+      annotations: ToolAnnotations(
+        readOnly: true, idempotent: true, openWorld: false, approval: .automatic))
+  }
+
+  static let callDefinition = ToolDefinition(
+    name: callName,
+    description:
+      "Call one of the tools \(listName) describes, by exact name, with JSON arguments; they cannot be called directly. Use \(listName) first when the arguments are unknown.",
+    parameters: [
+      ToolParameterDef(
+        name: "name",
+        type: "string",
+        description: "Exact tool name.",
+        required: true),
+      ToolParameterDef(
+        name: "arguments",
+        type: "object",
+        description: "JSON object with arguments for the selected tool. Use {} when none.",
+        required: true),
+    ],
+    annotations: ToolAnnotations(approval: .automatic))
+
+  /// The first clause of a description, cut to a few words.
+  static func blurb(_ description: String) -> String {
+    let clause =
+      description.split(whereSeparator: { $0 == "." || $0 == ";" || $0 == ":" }).first.map(String.init)
+      ?? description
+    let trimmed = clause.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count > 48 else { return trimmed }
+    return String(trimmed.prefix(48)).trimmingCharacters(in: .whitespaces) + "…"
+  }
 
   public static func listTools(
     arguments: [String: AgentToolArgumentValue],

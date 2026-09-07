@@ -484,6 +484,7 @@ struct SessionProfile {
   var options: GenerationOptions
   var toolCallingStrategy: ToolCallingStrategy
   var useToolProxy: Bool
+  var proxyExposedTools: Set<String>?
   var toolDelegation: AgentToolDelegation
   var retry: AgentRetryPolicy
   var autocompact: AgentAutocompact
@@ -507,6 +508,7 @@ struct SessionProfile {
     options = definition.options
     toolCallingStrategy = definition.toolCallingStrategy
     useToolProxy = definition.useToolProxy
+    proxyExposedTools = definition.proxyExposedTools
     toolDelegation = definition.toolDelegation
     retry = definition.retry
     autocompact = definition.autocompact
@@ -544,6 +546,7 @@ struct SessionProfile {
     options = .init()
     toolCallingStrategy = .automatic
     useToolProxy = false
+    proxyExposedTools = nil
     toolDelegation = .inline
     retry = .init()
     autocompact = .init()
@@ -569,6 +572,7 @@ struct SessionProfile {
       options: options,
       toolCallingStrategy: toolCallingStrategy,
       useToolProxy: useToolProxy,
+      proxyExposedTools: proxyExposedTools,
       toolDelegation: toolDelegation,
       retry: retry,
       autocompact: autocompact)
@@ -1703,6 +1707,7 @@ struct MaiCLI {
       stream: profile.stream,
       toolCallingStrategy: profile.toolCallingStrategy,
       useToolProxy: profile.useToolProxy,
+      proxyExposedTools: profile.proxyExposedTools,
       toolDelegation: profile.toolDelegation,
       retry: profile.retry,
       autocompact: profile.autocompact)
@@ -2420,6 +2425,7 @@ struct MaiCLI {
         stream: profile.stream,
         toolCallingStrategy: profile.toolCallingStrategy,
         useToolProxy: profile.useToolProxy,
+        proxyExposedTools: profile.proxyExposedTools,
         toolDelegation: profile.toolDelegation,
         retry: profile.retry,
         autocompact: profile.autocompact)
@@ -2473,6 +2479,7 @@ struct MaiCLI {
       stream: profile.stream,
       toolCallingStrategy: profile.toolCallingStrategy,
       useToolProxy: profile.useToolProxy,
+      proxyExposedTools: profile.proxyExposedTools,
       toolDelegation: profile.toolDelegation,
       retry: profile.retry,
       autocompact: profile.autocompact)
@@ -5296,7 +5303,9 @@ struct MaiCLI {
 
     if action == "list" || fields.isEmpty {
       if session.profile.useToolProxy {
-        await terminal.line("Tool proxy enabled: models see list-tools and call-tool.")
+        await terminal.line(
+          "Tool proxy \(toolProxySetting(session.profile)): models see \(session.profile.proxyExposedTools?.isEmpty == true ? "only" : "the common tools plus") list-tools and call-tool."
+        )
       }
       for group in groups {
         let enabled = isToolGroupEnabled(group, profile: session.profile) ? "*" : " "
@@ -5980,7 +5989,7 @@ struct MaiCLI {
 
   private static func listToolSettings(_ profile: SessionProfile, terminal: TerminalWriter) async {
     await terminal.line("tool.calling = \(profile.toolCallingStrategy.rawValue)")
-    await terminal.line("tool.proxy = \(profile.useToolProxy ? "on" : "off")")
+    await terminal.line("tool.proxy = \(toolProxySetting(profile))")
   }
 
   /// `/set yolo [on|off]`: permits every tool call without asking. The choice
@@ -6033,16 +6042,31 @@ struct MaiCLI {
     terminal: TerminalWriter
   ) async {
     guard parts.count > 1 else {
-      await terminal.line("tool.proxy = \(session.profile.useToolProxy ? "on" : "off")")
+      await terminal.line("tool.proxy = \(toolProxySetting(session.profile))")
       return
     }
-    guard parts.count == 2, let enabled = booleanSetting(parts[1]) else {
-      await terminal.line("Usage: /set tool.proxy <on|off>")
-      return
+    // on (or hybrid) keeps the common tools native and proxies the rest;
+    // all hides every tool behind list-tools and call-tool.
+    let value: String
+    switch parts.count == 2 ? parts[1].lowercased() : "" {
+    case "all":
+      session.profile.useToolProxy = true
+      session.profile.proxyExposedTools = []
+      value = "all"
+    case "hybrid":
+      session.profile.useToolProxy = true
+      session.profile.proxyExposedTools = nil
+      value = "on"
+    case let word:
+      guard let enabled = booleanSetting(word) else {
+        await terminal.line("Usage: /set tool.proxy <on|all|off>")
+        return
+      }
+      session.profile.useToolProxy = enabled
+      if enabled { session.profile.proxyExposedTools = nil }
+      value = enabled ? "on" : "off"
     }
-    session.profile.useToolProxy = enabled
     session.touch()
-    let value = enabled ? "on" : "off"
     guard configuration != nil, configurationPath != nil else {
       await terminal.line("Set tool.proxy = \(value) for this chat.")
       return
@@ -6133,6 +6157,12 @@ struct MaiCLI {
 
   private static func durationSetting(_ seconds: Double) -> String {
     seconds == seconds.rounded() ? "\(Int(seconds))s" : "\(seconds)s"
+  }
+
+  /// `off`, `on` (the common tools native, the rest proxied) or `all`.
+  private static func toolProxySetting(_ profile: SessionProfile) -> String {
+    guard profile.useToolProxy else { return "off" }
+    return profile.proxyExposedTools?.isEmpty == true ? "all" : "on"
   }
 
   private static func autocompactSetting(_ autocompact: AgentAutocompact) -> String {
@@ -6547,6 +6577,8 @@ struct MaiCLI {
           "toolCallingStrategy": profile.toolCallingStrategy.rawValue,
           "toolDelegation": profile.toolDelegation.rawValue,
           "useToolProxy": profile.useToolProxy ? "true" : "false",
+          "proxyExposedTools": profile.proxyExposedTools.map { $0.sorted().joined(separator: ", ") }
+            ?? "default",
           "subagentNames": profile.subagentNames.sorted().joined(separator: ", "),
           "limits.maxToolCalls": String(profile.limits.maxToolCalls),
           "limits.maxModelTurns": String(profile.limits.maxModelTurns),
@@ -7798,6 +7830,7 @@ struct MaiCLI {
     chat.primaryAgent.subagentNames = configured.subagentNames
     chat.primaryAgent.toolDelegation = configured.toolDelegation
     chat.primaryAgent.useToolProxy = configured.useToolProxy
+    chat.primaryAgent.proxyExposedTools = configured.proxyExposedTools
     guard previousInstructions != configured.instructions else { return }
     var transcript = AgentTranscript(messages: chat.messages)
     if let index = transcript.messages.firstIndex(where: {

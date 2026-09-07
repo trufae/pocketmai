@@ -318,7 +318,8 @@ public actor AgentRuntime {
     let concreteDefinitions = try visibleDefinitions(for: request)
     let definitions =
       request.useToolProxy && !concreteDefinitions.isEmpty
-      ? ToolProxy.definitions(for: concreteDefinitions) : concreteDefinitions
+      ? ToolProxy.definitions(for: concreteDefinitions, exposing: request.proxyExposedTools)
+      : concreteDefinitions
     let supportsNativeTools = provider.descriptor.capabilities.contains(.nativeToolCalling)
     if request.toolCallingStrategy == .native, !definitions.isEmpty, !supportsNativeTools {
       throw AgentRuntimeError.nativeToolCallingUnavailable(request.provider)
@@ -507,8 +508,9 @@ public actor AgentRuntime {
         // request twice and then failing the whole run threw the work away.
         consecutiveEmptyReplies += 1
         if consecutiveEmptyReplies >= Self.maximumEmptyReplies { repeatGuardTripped = true }
-        let feedback = AgentToolLoopPolicy.repairFeedbackAfterToolResult(
+        var feedback = AgentToolLoopPolicy.repairFeedbackAfterToolResult(
           mode: textToolMode ?? .native)
+        if request.useToolProxy { feedback += "\n" + ToolProxy.repairHint }
         transcript.append(.assistant(feedback))
         await supervisor.note(pid, transcript: transcript)
         continue
@@ -833,22 +835,16 @@ public actor AgentRuntime {
     budget: RunBudget,
     emit: @escaping AgentEventHandler
   ) async throws -> ToolResult {
-    if request.useToolProxy,
-      call.name != ToolProxy.listName && call.name != ToolProxy.callName
-    {
-      let result = ToolResult(
-        callID: call.id,
-        text: "Error: proxy mode does not expose tool '\(call.name)'.",
-        isError: true)
-      await emit(.toolFinished(context, result))
-      return result
-    }
+    // A proxied model that names a hidden tool directly still gets it run:
+    // the proxy saves tokens, it is not a permission boundary.
     if request.useToolProxy, call.name == ToolProxy.listName {
       await emit(.toolStarted(context, call))
       let result = ToolResult(
         callID: call.id,
         text: ToolProxy.listTools(
-          arguments: call.arguments.objectValue ?? [:], definitions: definitions))
+          arguments: call.arguments.objectValue ?? [:],
+          definitions: ToolProxy.hiddenDefinitions(
+            in: definitions, exposing: request.proxyExposedTools)))
       await emit(.toolFinished(context, result))
       return result
     }
@@ -1429,6 +1425,7 @@ public actor AgentRuntime {
       options: request.options,
       toolCallingStrategy: request.toolCallingStrategy,
       useToolProxy: request.useToolProxy,
+      proxyExposedTools: request.proxyExposedTools,
       toolDelegation: .inline,
       retry: request.retry,
       autocompact: request.autocompact)
@@ -1724,6 +1721,7 @@ public actor AgentRuntime {
       stream: definition.stream,
       toolCallingStrategy: definition.toolCallingStrategy,
       useToolProxy: definition.useToolProxy,
+      proxyExposedTools: definition.proxyExposedTools,
       toolDelegation: definition.toolDelegation,
       retry: definition.retry,
       autocompact: definition.autocompact)
