@@ -26,6 +26,33 @@ import MaiVisionOCR
 @_silgen_name("system")
 private func posixSystem(_ command: UnsafePointer<CChar>) -> CInt
 
+/// Swift discovers argv from the initial process stack on ELF targets. Termux
+/// may execute downloaded binaries as `linker64 PROGRAM ARGS...` to satisfy
+/// Android's app-data execution policy. Bionic hides that extra linker argument
+/// from C programs, but Swift can still recover the original kernel argv and
+/// mistake PROGRAM for a positional prompt. Normalize the procfs command line
+/// to the argv the loaded program is meant to see.
+private func platformCommandLineArguments() -> [String] {
+  #if canImport(Android)
+    let url = URL(fileURLWithPath: "/proc/self/cmdline")
+    if let data = try? Data(contentsOf: url), !data.isEmpty {
+      var fields = data.split(separator: 0, omittingEmptySubsequences: false)
+      if fields.last?.isEmpty == true { fields.removeLast() }
+      if !fields.isEmpty {
+        var arguments = fields.map { String(decoding: $0, as: UTF8.self) }
+        if arguments.count >= 2 {
+          let launcher = URL(fileURLWithPath: arguments[0]).lastPathComponent
+          if launcher == "linker" || launcher == "linker64" {
+            arguments.removeFirst()
+          }
+        }
+        return arguments
+      }
+    }
+  #endif
+  return CommandLine.arguments
+}
+
 private struct CLIOptions {
   var configPath: String?
   /// Root holding the project index and shared state; nil follows PMAI_HOME or ~/.pmai.
@@ -851,7 +878,8 @@ private actor TerminalApprovalHandler: ApprovalHandler {
 @main
 struct MaiCLI {
   static func main() async {
-    if CommandLine.arguments.dropFirst().contains(where: { $0 == "--help" || $0 == "-h" }) {
+    let commandLineArguments = platformCommandLineArguments()
+    if commandLineArguments.dropFirst().contains(where: { $0 == "--help" || $0 == "-h" }) {
       printUsage()
       return
     }
@@ -859,7 +887,7 @@ struct MaiCLI {
     do {
       let environment = ProcessInfo.processInfo.environment
       let options = try CLIOptions(
-        arguments: Array(CommandLine.arguments.dropFirst()),
+        arguments: Array(commandLineArguments.dropFirst()),
         environment: environment)
       if options.printConfig {
         FileHandle.standardOutput.write(try sampleConfiguration().encoded())
