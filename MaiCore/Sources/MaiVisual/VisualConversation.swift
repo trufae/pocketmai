@@ -17,6 +17,8 @@ public struct VisualCommandOutput: Equatable, Sendable {
 @MainActor @Observable
 public final class VisualConversation: Identifiable {
   nonisolated public let id: UUID
+  /// The session the chat presents to providers; see `ChatSession`.
+  nonisolated public let sessionID: String
   public var title: String
   public var profile: AgentDefinition
   public var transcript: AgentTranscript
@@ -39,6 +41,7 @@ public final class VisualConversation: Identifiable {
 
   public init(seed: VisualConversationSeed, hasCustomTitle: Bool = true) {
     id = seed.id
+    sessionID = seed.sessionID
     title = seed.title
     profile = seed.profile
     transcript = AgentTranscript(messages: seed.messages)
@@ -52,7 +55,8 @@ public final class VisualConversation: Identifiable {
       title: title,
       profile: profile,
       messages: transcript.messages,
-      pendingContent: pendingContent)
+      pendingContent: pendingContent,
+      sessionID: sessionID)
   }
 
   public var visibleMessages: [AgentMessage] {
@@ -150,7 +154,8 @@ public final class VisualConversation: Identifiable {
       toolCallingStrategy: profile.toolCallingStrategy,
       useToolProxy: profile.useToolProxy,
       retry: profile.retry,
-      autocompact: profile.autocompact)
+      autocompact: profile.autocompact,
+      sessionID: sessionID)
   }
 
   func appendUserMessage(_ text: String) {

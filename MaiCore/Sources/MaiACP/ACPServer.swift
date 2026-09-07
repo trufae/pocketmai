@@ -123,7 +123,8 @@ public actor ACPServer {
       stream: true,
       toolCallingStrategy: agent.toolCallingStrategy,
       useToolProxy: agent.useToolProxy,
-      toolDelegation: agent.toolDelegation)
+      toolDelegation: agent.toolDelegation,
+      sessionID: id)
 
     let sessionID = id
     let task = Task { [runtime] in

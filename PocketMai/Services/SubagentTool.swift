@@ -176,6 +176,9 @@ enum SubagentTool {
     child.folderID = conversation.folderID
     child.workingFolder = conversation.workingFolder
     child.languageOverrideIdentifier = conversation.languageOverrideIdentifier
+    // The child works in the session of the chat that started the tree, so a
+    // per-session provider header carries one value for all of them.
+    child.sessionID = conversation.sessionID
     child.showThinking = false
     child.isPinned = false
 

@@ -1,4 +1,5 @@
 import AVFoundation
+import MaiCore
 import Speech
 import SwiftUI
 import UIKit
@@ -17,19 +18,24 @@ struct EndpointProviderPreset {
   let authMethods: [EndpointAuthMethod]
   let oauthDefaults: OAuthPresetDefaults?
   let preferredAuthMethod: EndpointAuthMethod?
+  /// Headers the provider needs on every request. They are filled in when the
+  /// preset is picked and sent for any endpoint at this URL that lacks them.
+  let headers: [String: String]
 
   init(
     name: String,
     url: String,
     authMethods: [EndpointAuthMethod] = [.apiKey],
     oauthDefaults: OAuthPresetDefaults? = nil,
-    preferredAuthMethod: EndpointAuthMethod? = nil
+    preferredAuthMethod: EndpointAuthMethod? = nil,
+    headers: [String: String] = [:]
   ) {
     self.name = name
     self.url = url
     self.authMethods = authMethods
     self.oauthDefaults = oauthDefaults
     self.preferredAuthMethod = preferredAuthMethod
+    self.headers = headers
   }
 
   var tag: String {
@@ -105,8 +111,14 @@ let endpointProviderPresets: [EndpointProviderPreset] = [
   EndpointProviderPreset(name: "Ollama", url: "http://localhost:11434/v1"),
   EndpointProviderPreset(name: "Ollama Cloud", url: "https://ollama.com/v1"),
   EndpointProviderPreset(name: "OpenRouter", url: "https://openrouter.ai/api/v1"),
-  EndpointProviderPreset(name: "OpenCode Zen", url: "https://opencode.ai/zen/v1"),
-  EndpointProviderPreset(name: "OpenCode Go", url: "https://opencode.ai/zen/go/v1"),
+  // OpenCode meters the Go plan per session and rejects requests that do not
+  // present a stable session id, so both presets send the chat's.
+  EndpointProviderPreset(
+    name: "OpenCode Zen", url: "https://opencode.ai/zen/v1",
+    headers: openCodeSessionHeaders),
+  EndpointProviderPreset(
+    name: "OpenCode Go", url: "https://opencode.ai/zen/go/v1",
+    headers: openCodeSessionHeaders),
   EndpointProviderPreset(name: "Hugging Face", url: "https://router.huggingface.co/v1"),
   EndpointProviderPreset(
     name: "Anthropic",
@@ -132,6 +144,20 @@ let endpointProviderPresets: [EndpointProviderPreset] = [
   EndpointProviderPreset(name: "Cerebras", url: "https://api.cerebras.ai/v1"),
   EndpointProviderPreset(name: "NVIDIA", url: "https://integrate.api.nvidia.com/v1"),
 ]
+
+let openCodeSessionHeaders = ["x-opencode-session": ProviderHeaders.sessionPlaceholder]
+
+extension OpenAIEndpoint {
+  /// The headers every request sends: the endpoint's own, plus the ones the
+  /// preset at its URL requires that the user has not set themselves, so an
+  /// endpoint saved before presets carried headers works too.
+  var effectiveHeaders: [String: String] {
+    guard let preset = EndpointNameResolution.providerPreset(forBaseURL: baseURL) else {
+      return headers
+    }
+    return preset.headers.merging(headers) { _, own in own }
+  }
+}
 
 private let customProviderTag = "__custom__"
 
@@ -3106,12 +3132,20 @@ private struct EndpointDetailView: View {
   @State private var isSigningIn = false
   @State private var showAdvancedOAuthConfiguration = false
   @State private var showOllamaScanner = false
+  /// The headers as typed, one `Name: value` per line. The text is the source
+  /// of truth while editing, since a half-typed line has no dictionary form.
+  @State private var headersText: String
   private let onSave: ((OpenAIEndpoint) -> Void)?
 
   init(endpoint: Binding<OpenAIEndpoint>, onSave: ((OpenAIEndpoint) -> Void)? = nil) {
     self._savedEndpoint = endpoint
     self._endpoint = State(initialValue: endpoint.wrappedValue)
+    self._headersText = State(initialValue: Self.headersText(for: endpoint.wrappedValue.headers))
     self.onSave = onSave
+  }
+
+  private static func headersText(for headers: [String: String]) -> String {
+    ProviderHeaders.lines(headers).joined(separator: "\n")
   }
 
   var body: some View {
@@ -3181,6 +3215,20 @@ private struct EndpointDetailView: View {
       }
 
       Section {
+        TextEditor(text: $headersText)
+          .font(.system(.body, design: .monospaced))
+          .textInputAutocapitalization(.never)
+          .autocorrectionDisabled()
+          .frame(minHeight: 72)
+      } header: {
+        Text("Custom Headers")
+      } footer: {
+        Text(
+          "One header per line as Name: value, sent with every request. \(ProviderHeaders.sessionPlaceholder) becomes the chat's session id, which OpenCode needs in x-opencode-session."
+        )
+      }
+
+      Section {
         modelField
         reasoningLevelField
       } header: {
@@ -3210,6 +3258,7 @@ private struct EndpointDetailView: View {
     }
     .onAppear(perform: normalizeAuthForSelectedProvider)
     .onChange(of: endpoint.baseURL) { _, _ in normalizeAuthForSelectedProvider() }
+    .onChange(of: headersText) { _, text in endpoint.headers = ProviderHeaders.parse(text) }
     .sheet(isPresented: $showOllamaScanner) {
       OllamaPortScanView(
         initialRange: OllamaNetworkScanner.defaultRange(),
@@ -3632,6 +3681,7 @@ private struct EndpointDetailView: View {
 
   private func saveEndpointAndDismiss() {
     normalizeAuthForSelectedProvider()
+    endpoint.headers = ProviderHeaders.parse(headersText)
     if let message = EndpointNameResolution.validationMessage(
       for: endpoint,
       in: store.settings.openAIEndpoints)
@@ -3644,6 +3694,7 @@ private struct EndpointDetailView: View {
     }
     let connectionChanged =
       endpoint.baseURL != savedEndpoint.baseURL || endpoint.apiKey != savedEndpoint.apiKey
+      || endpoint.headers != savedEndpoint.headers
     savedEndpoint = endpoint
     onSave?(endpoint)
     if connectionChanged {
@@ -3712,6 +3763,8 @@ private struct EndpointDetailView: View {
         let oldAuthMethod = endpoint.authMethod
         let oldBaseURL = endpoint.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         endpoint.baseURL = preset.url
+        applyPresetHeaders(
+          preset, replacing: EndpointNameResolution.providerPreset(forBaseURL: oldBaseURL))
         if let preferredAuthMethod = preset.preferredAuthMethod,
           preset.authMethods.contains(preferredAuthMethod)
         {
@@ -3733,6 +3786,23 @@ private struct EndpointDetailView: View {
         }
       }
     )
+  }
+
+  /// Fills in the headers a preset needs, keeping any the user already set,
+  /// and drops what the previous preset added unless the user changed it.
+  private func applyPresetHeaders(
+    _ preset: EndpointProviderPreset, replacing previous: EndpointProviderPreset?
+  ) {
+    var headers = ProviderHeaders.parse(headersText)
+    for (name, value) in previous?.headers ?? [:] where headers[name] == value {
+      headers.removeValue(forKey: name)
+    }
+    headers.merge(preset.headers) { own, _ in own }
+    // Rewriting the text would drop a half-typed line, so only do it when the
+    // preset actually changed something.
+    if headers != ProviderHeaders.parse(headersText) {
+      headersText = Self.headersText(for: headers)
+    }
   }
 
   private var authMethodBinding: Binding<EndpointAuthMethod> {

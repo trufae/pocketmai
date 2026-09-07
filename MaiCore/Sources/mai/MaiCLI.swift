@@ -601,6 +601,8 @@ struct SessionProfile {
 
 struct REPLSession {
   var id: UUID
+  /// The session the chat presents to providers; see `ChatSession`.
+  var sessionID: String
   var title: String
   var profile: SessionProfile
   var history: AgentTranscript
@@ -619,9 +621,11 @@ struct REPLSession {
     profile: SessionProfile,
     pendingContent: [ContentPart] = [],
     createdAt: Date = Date(),
-    updatedAt: Date = Date()
+    updatedAt: Date = Date(),
+    sessionID: String? = nil
   ) {
     self.id = id
+    self.sessionID = sessionID ?? ChatSession.newID()
     self.title = title ?? profile.agentID
     self.profile = profile
     history = AgentTranscript(messages: Self.initialHistory(for: profile))
@@ -633,6 +637,7 @@ struct REPLSession {
 
   init(chat: AgentChat) {
     id = chat.id
+    sessionID = chat.sessionID
     title = chat.title
     profile = SessionProfile(definition: chat.primaryAgent)
     history = AgentTranscript(messages: chat.messages)
@@ -651,7 +656,8 @@ struct REPLSession {
       pendingContent: pendingContent,
       createdAt: createdAt,
       updatedAt: updatedAt,
-      isArchived: isArchived)
+      isArchived: isArchived,
+      sessionID: sessionID)
   }
 
   /// Names a placeholder chat after its first message; chosen titles stay.
@@ -681,11 +687,13 @@ struct REPLSession {
         title: title,
         profile: profile.agentDefinition,
         messages: history.messages,
-        pendingContent: pendingContent)
+        pendingContent: pendingContent,
+        sessionID: sessionID)
     }
 
     mutating func adopt(_ conversation: VisualConversationSeed) {
       id = conversation.id
+      sessionID = conversation.sessionID
       title = conversation.title
       profile = SessionProfile(definition: conversation.profile)
       history.replaceAll(with: conversation.messages)
@@ -1741,7 +1749,8 @@ struct MaiCLI {
         toolDelegation: profile.toolDelegation,
         retry: profile.retry,
         autocompact: profile.autocompact,
-        context: profile.context)
+        context: profile.context,
+        sessionID: session.sessionID)
     }
 
     /// Picks a paused or interrupted task up where it stopped: the history is
@@ -2460,7 +2469,8 @@ struct MaiCLI {
         toolDelegation: profile.toolDelegation,
         retry: profile.retry,
         autocompact: profile.autocompact,
-        context: profile.context)
+        context: profile.context,
+        sessionID: session.sessionID)
       let existingProcess = process
       let task = Task {
         try await runtime.run(request, process: existingProcess) { event in
@@ -2743,9 +2753,11 @@ struct MaiCLI {
         argument,
         session: &session,
         runtime: runtime,
+        plugins: plugins,
         memory: visual.memory,
         configuration: &configuration,
         configurationPath: visual.configurationPath,
+        providerBaseURLs: visual.providerBaseURLs,
         terminal: terminal)
     case "/provider":
       await handleProviderCommand(
@@ -3464,7 +3476,8 @@ struct MaiCLI {
       toolChoice: .none,
       options: profile.options,
       limits: profile.limits,
-      stream: false)
+      stream: false,
+      sessionID: session.sessionID)
     await terminal.line(
       "Learning from \(everyChat ? "\(chats.count) chat\(chats.count == 1 ? "" : "s")" : "this chat")…"
     )
@@ -3822,9 +3835,11 @@ struct MaiCLI {
     _ argument: String,
     session: inout REPLSession,
     runtime: AgentRuntime,
+    plugins: PluginRegistry,
     memory: MemoryState,
     configuration: inout MaiConfiguration?,
     configurationPath: String?,
+    providerBaseURLs: ProviderBaseURLStore,
     terminal: TerminalWriter
   ) async {
     let target = argument.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3855,6 +3870,16 @@ struct MaiCLI {
         runtime: runtime,
         configuration: &configuration,
         configurationPath: configurationPath,
+        terminal: terminal)
+
+    case "provider":
+      await editConfiguredProvider(
+        named: actionArgument.isEmpty ? session.profile.provider.rawValue : actionArgument,
+        runtime: runtime,
+        plugins: plugins,
+        configuration: &configuration,
+        configurationPath: configurationPath,
+        providerBaseURLs: providerBaseURLs,
         terminal: terminal)
 
     case "compact":
@@ -4139,13 +4164,22 @@ struct MaiCLI {
   ) async {
     let fields = argument.split(whereSeparator: \Character.isWhitespace).map(String.init)
     guard !fields.isEmpty else {
+      let configured = configuration?.providers.first {
+        $0.id == session.profile.provider.rawValue
+      }
       let baseURL =
         providerBaseURLs.url(for: session.profile.provider.rawValue)?.absoluteString
-        ?? configuration?.providers.first {
-          $0.id == session.profile.provider.rawValue
-        }?.baseURL?.absoluteString ?? "-"
+        ?? configured?.baseURL?.absoluteString ?? "-"
       await terminal.line("Current provider: \(session.profile.provider) — \(baseURL)")
-      await terminal.line("Use /baseurl URL to change its endpoint.")
+      if let configured {
+        let names = (Array(configured.headers.keys) + Array(configured.headerEnvironment.keys))
+          .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        if !names.isEmpty {
+          await terminal.line("Headers: \(names.joined(separator: ", "))")
+        }
+      }
+      await terminal.line(
+        "Use /baseurl URL to change its endpoint, or /edit provider to edit it as JSON.")
       return
     }
 
@@ -5221,6 +5255,54 @@ struct MaiCLI {
         try applyDefinition(definition, to: &session)
       }
       await terminal.line("Agent '\(id)' saved to \(configurationPath).")
+    } catch {
+      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
+    }
+  }
+
+  /// Opens one configured provider as JSON, the way `/edit agent` opens an
+  /// agent, and rebuilds it in the live runtime once the file is saved, so a
+  /// new header or base URL takes effect without a restart.
+  private static func editConfiguredProvider(
+    named id: String,
+    runtime: AgentRuntime,
+    plugins: PluginRegistry,
+    configuration: inout MaiConfiguration?,
+    configurationPath: String?,
+    providerBaseURLs: ProviderBaseURLStore,
+    terminal: TerminalWriter
+  ) async {
+    guard var draft = configuration, let configurationPath else {
+      await terminal.line("error: No writable configuration is active.", to: .standardError)
+      return
+    }
+    guard let index = draft.providers.firstIndex(where: { $0.id == id }) else {
+      await terminal.line("Unknown configured provider '\(id)'. /providers lists them.")
+      return
+    }
+    do {
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      let data = try encoder.encode(draft.providers[index])
+      guard
+        let edited = await editTemporaryData(
+          data, suffix: "provider-\(id).json", terminal: terminal)
+      else { return }
+      let provider = try JSONDecoder().decode(ConfiguredProvider.self, from: edited)
+      guard provider.id == id else {
+        await terminal.line("Keep the id '\(id)'; /edit config adds providers.")
+        return
+      }
+      let built = try await plugins.makeProvider(
+        from: provider, environment: ProcessInfo.processInfo.environment)
+      try await runtime.register(built, replacingExisting: true)
+      draft.providers[index] = provider
+      try draft.save(to: URL(fileURLWithPath: configurationPath))
+      configuration = draft
+      if let baseURL = provider.baseURL {
+        providerBaseURLs.set(baseURL, for: id)
+      }
+      await terminal.line("Provider '\(id)' saved to \(configurationPath) and reloaded.")
     } catch {
       await terminal.line("error: \(error.localizedDescription)", to: .standardError)
     }
@@ -7155,6 +7237,20 @@ struct MaiCLI {
         return
       }
       await terminal.line(chatInfo(chat, workspace: workspace, selectedID: session.id))
+    case "session":
+      switch rest.lowercased() {
+      case "":
+        await terminal.line("Session: \(session.sessionID)")
+      case "new":
+        // A fresh session for the same chat: a backend that meters by session
+        // sees a new one from the next message on, and nothing else changes.
+        session.sessionID = ChatSession.newID()
+        session.touch()
+        workspace.upsert(session.chat, selecting: true)
+        await terminal.line("Session: \(session.sessionID) (new)")
+      default:
+        await terminal.line("Usage: /chat session [new]")
+      }
     case "rename":
       guard !rest.isEmpty else {
         await terminal.line("Usage: /chat rename TITLE")
@@ -7505,6 +7601,7 @@ struct MaiCLI {
       "Title:    \(chat.displayTitle)",
       "Index:    \(index)",
       "ID:       \(chat.id.uuidString)",
+      "Session:  \(chat.sessionID)",
       "Agent:    \(chat.primaryAgent.id) (\(chat.primaryAgent.provider) / \(chat.primaryAgent.model))",
       "Messages: \(count) conversation, \(chat.messages.count) total",
       "Started:  \(ChatDatePresentation.timestamp(chat.createdAt))",
@@ -7698,7 +7795,8 @@ struct MaiCLI {
       stream: false,
       toolCallingStrategy: .automatic,
       useToolProxy: false,
-      retry: profile.retry)
+      retry: profile.retry,
+      sessionID: session.sessionID)
     await terminal.line("Compacting conversation…")
     do {
       let result = try await runtime.run(request) { _ in }
@@ -8071,7 +8169,8 @@ struct MaiCLI {
           title: chat.title,
           profile: chat.primaryAgent,
           messages: chat.messages,
-          pendingContent: chat.pendingContent)
+          pendingContent: chat.pendingContent,
+          sessionID: chat.sessionID)
       }
       return VisualWorkspaceSnapshot(
         conversations: conversations,
@@ -8152,11 +8251,13 @@ struct MaiCLI {
       "/skills reload", "/help skills",
       "/mcp list",
       "/mcp add ", "/mcp enable ", "/mcp disable ",
-      "/edit prompt", "/edit compact", "/edit config", "/edit mcps", "/chat compact ",
+      "/edit prompt", "/edit compact", "/edit config", "/edit mcps", "/edit provider",
+      "/chat compact ",
       "/image tiny ", "/image small ", "/image medium ", "/image big ", "/image full ",
       "/image ocr ", "/attach ", "/attach clear", "/copy", "/help copy", "/clear", "/chat list",
       "/chat list active", "/chat list archived", "/chat list all", "/chat new ",
-      "/chat use ", "/chat next", "/chat previous", "/chat info", "/chat rename ",
+      "/chat use ", "/chat next", "/chat previous", "/chat info", "/chat session",
+      "/chat session new", "/chat rename ",
       "/chat archive", "/chat unarchive ", "/chat close confirm", "/chat messages",
       "/chat log", "/chat edit ", "/chat remove ", "/chat undo", "/chat trim ",
       "/chat clear", "/project", "/project info", "/project list", "/project name ",
@@ -8188,6 +8289,7 @@ struct MaiCLI {
     for provider in configuration?.providers ?? [] {
       values.append("/provider \(provider.id)")
       values.append("/models \(provider.id)")
+      values.append("/edit provider \(provider.id)")
     }
     for skill in skills {
       values.append("/skills show \(skill.name)")
@@ -8513,7 +8615,8 @@ struct MaiCLI {
       /chat new --agent ID [TITLE]  Start a fresh chat using a configured agent
       /chat use INDEX|ID|TITLE      Switch to a chat by list index, ID prefix, or title
       /chat next|previous           Cycle through chats
-      /chat info [INDEX|ID|TITLE]   Show a chat's agent, size, and timestamps
+      /chat info [INDEX|ID|TITLE]   Show a chat's agent, session, size, and timestamps
+      /chat session [new]           Show the session id providers see, or start a fresh one
       /chat rename TITLE            Rename the active chat
       /chat archive [INDEX|ID|TITLE]  Archive a chat; archiving the active one starts fresh
       /chat unarchive INDEX|ID|TITLE  Return an archived chat to the active list
@@ -8573,6 +8676,7 @@ struct MaiCLI {
     /edit prompt [NAME]      Edit/create a named system prompt (current when omitted)
     /edit NAME               Edit an existing named system prompt
     /edit agent [ID]         Edit a saved agent as JSON (current when omitted)
+    /edit provider [ID]      Edit a configured provider as JSON (current when omitted)
     /edit compact            Edit the global chat-compaction prompt template
     /edit memory             Edit this project's durable memory notes
     /edit memory-prompt      Edit the template /memory learn uses
@@ -8586,8 +8690,14 @@ struct MaiCLI {
     {{memory}} are optional. The delegation template must contain {{task}};
     {{context}}, {{output}}, {{agent}}, and {{cwd}} are optional.
     Clearing it restores the built-in default. Uses $EDITOR, then $VISUAL, then
-    vim. Agent limits and tool-calling strategy apply immediately; provider,
-    plugin, tool, and MCP changes require a restart.
+    vim. Agent limits and tool-calling strategy apply immediately, and an edited
+    provider is rebuilt in place; other provider, plugin, tool, and MCP changes
+    made through /edit config require a restart.
+
+    A provider's "headers" is an object of names to values or an array of
+    "Name: value" strings, sent with every request. A value may contain
+    {{session}}, which becomes the session id of the chat a request belongs
+    to (/chat session shows it; OpenCode Zen needs it in x-opencode-session).
     """
 
   private static let memoryHelp = """

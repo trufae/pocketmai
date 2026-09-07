@@ -1,5 +1,24 @@
 import Foundation
 
+/// The session a chat presents to backends that meter or route by session,
+/// such as OpenCode Zen through its `x-opencode-session` header. A chat is
+/// given one when it is created, keeps it in its file, and can be given a
+/// fresh one at any time without losing anything else; every provider call
+/// the chat makes, including those of the child agents it starts, carries it
+/// wherever a configured header says `{{session}}`.
+public enum ChatSession {
+  /// A fresh session id for a new chat.
+  public static func newID() -> String {
+    UUID().uuidString.lowercased()
+  }
+
+  /// The session of a chat saved before sessions existed: derived from the
+  /// chat id, so every load agrees on it without rewriting the file.
+  public static func legacyID(for chatID: UUID) -> String {
+    chatID.uuidString.lowercased()
+  }
+}
+
 /// A durable chat transcript associated with one primary agent definition.
 /// Providers remain normalized in `MaiConfiguration`; the agent's provider ID
 /// resolves the endpoint, credentials, and provider-specific options.
@@ -20,6 +39,8 @@ public struct AgentChat: StoredChat, Equatable {
   public var updatedAt: Date
   /// Archived chats are kept for reference but listed apart from active ones.
   public var isArchived: Bool
+  /// The session this chat presents to providers; see `ChatSession`.
+  public var sessionID: String
 
   public init(
     id: UUID = UUID(),
@@ -29,7 +50,8 @@ public struct AgentChat: StoredChat, Equatable {
     pendingContent: [ContentPart] = [],
     createdAt: Date = Date(),
     updatedAt: Date = Date(),
-    isArchived: Bool = false
+    isArchived: Bool = false,
+    sessionID: String? = nil
   ) {
     self.id = id
     self.title = title
@@ -39,15 +61,20 @@ public struct AgentChat: StoredChat, Equatable {
     self.createdAt = createdAt
     self.updatedAt = updatedAt
     self.isArchived = isArchived
+    self.sessionID = sessionID ?? ChatSession.newID()
   }
 
   private enum CodingKeys: String, CodingKey {
     case id, title, primaryAgent, messages, pendingContent, createdAt, updatedAt, isArchived
+    case sessionID
   }
 
   public init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     id = try container.decode(UUID.self, forKey: .id)
+    sessionID =
+      try container.decodeIfPresent(String.self, forKey: .sessionID)
+      ?? ChatSession.legacyID(for: id)
     title = try container.decode(String.self, forKey: .title)
     primaryAgent = try container.decode(AgentDefinition.self, forKey: .primaryAgent)
     messages = try container.decode([AgentMessage].self, forKey: .messages)

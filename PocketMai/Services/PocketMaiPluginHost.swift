@@ -30,6 +30,7 @@ actor PocketMaiPluginHost {
         displayName: endpoint.name,
         baseURL: baseURL,
         apiKey: endpoint.apiKey,
+        headers: endpoint.effectiveHeaders,
         timeout: requestTimeout),
       environment: [:])
     guard let provider = provider as? MaiOpenAI.OpenAICompatibleProvider else {

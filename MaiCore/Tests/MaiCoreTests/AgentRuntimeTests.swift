@@ -286,6 +286,22 @@ func repeatedCallWithdrawsTools() async throws {
   #expect(result.transcript.contains { $0.toolResults.contains { $0.text.contains("already run 3 times") } })
 }
 
+@Test("A run's session id reaches every provider request it makes")
+func sessionIDReachesProviderRequests() async throws {
+  let provider = ScriptedProvider(responses: [
+    ProviderResponse(message: .assistant("done"), stopReason: .stop)
+  ])
+  let runtime = AgentRuntime()
+  try await runtime.register(provider)
+
+  _ = try await runtime.run(
+    AgentRequest(
+      provider: "scripted", model: "fixture", messages: [.user("hi")], sessionID: "chat-1"))
+
+  let requests = await provider.requests
+  #expect(requests.map(\.sessionID) == ["chat-1"])
+}
+
 @Test("Tool result previews show the text first, bound lines and length, and strip control characters")
 func toolResultPreview() {
   let result = ToolResult(
@@ -616,6 +632,44 @@ func openAIModelCatalog() async throws {
   #expect(request.url?.absoluteString == "https://models.example.test/v1/models")
   #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer secret")
   #expect(request.value(forHTTPHeaderField: "X-Workspace") == "test")
+}
+
+@Test("OpenAI-compatible provider fills {{session}} in configured headers per request")
+func openAIConversationHeader() async throws {
+  let recorder = URLRequestRecorder()
+  StubURLProtocol.install(forHost: "session.example.test") { request in
+    recorder.record(request, body: try requestBodyData(request))
+    return try httpResponse(
+      request,
+      contentType: "application/json",
+      body: #"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#
+    )
+  }
+  defer { StubURLProtocol.reset(host: "session.example.test") }
+
+  let provider = OpenAICompatibleProvider(
+    configuration: .init(
+      baseURL: try #require(URL(string: "https://session.example.test/v1")),
+      additionalHeaders: ["x-opencode-session": "{{session}}", "X-Tenant": "acme"]),
+    session: stubSession())
+
+  _ = try await provider.complete(
+    ProviderRequest(
+      model: "test-model", messages: [.user("hi")], stream: false, sessionID: "chat-1"))
+  var request = try #require(recorder.request)
+  #expect(request.value(forHTTPHeaderField: "x-opencode-session") == "chat-1")
+  #expect(request.value(forHTTPHeaderField: "X-Tenant") == "acme")
+
+  // Requests made outside any chat share one id for the life of the provider.
+  _ = try await provider.complete(
+    ProviderRequest(model: "test-model", messages: [.user("hi")], stream: false))
+  request = try #require(recorder.request)
+  let standalone = try #require(request.value(forHTTPHeaderField: "x-opencode-session"))
+  #expect(!standalone.isEmpty && standalone != "chat-1" && standalone != "{{session}}")
+  _ = try await provider.complete(
+    ProviderRequest(model: "test-model", messages: [.user("again")], stream: false))
+  request = try #require(recorder.request)
+  #expect(request.value(forHTTPHeaderField: "x-opencode-session") == standalone)
 }
 
 @Test("OpenAI-compatible provider lists voices and synthesizes speech")
@@ -1742,10 +1796,13 @@ func toolDelegationRunsToolsInAChild() async throws {
       toolNames: AgentRuntime.agentToolNames.union(["read_file"]),
       toolGroupNames: [AgentRuntime.agentToolGroup.id],
       limits: AgentRunLimits(maxModelTurns: 4, maxToolCalls: 4, maxSubagents: 2),
-      toolDelegation: .subagent))
+      toolDelegation: .subagent,
+      sessionID: "chat-1"))
 
   #expect(result.response.text == "Parser.swift holds the parser.")
   let requests = await provider.requests
+  // The child works for the same chat, so a per-conversation header matches.
+  #expect(requests.count > 1 && requests.allSatisfy { $0.sessionID == "chat-1" })
   // The orchestrator keeps its own tools and is offered the agent family besides.
   let parentTools = Set(requests[0].tools.map(\.name))
   #expect(

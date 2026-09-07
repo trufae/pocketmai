@@ -83,7 +83,7 @@ public struct ConfiguredProvider: Codable, Equatable, Identifiable, Sendable {
       apiKey: try container.decodeIfPresent(String.self, forKey: .apiKey),
       apiKeyEnvironment: try container.decodeIfPresent(String.self, forKey: .apiKeyEnvironment),
       apiKeyFile: try container.decodeIfPresent(String.self, forKey: .apiKeyFile),
-      headers: try container.decodeIfPresent([String: String].self, forKey: .headers) ?? [:],
+      headers: try ProviderHeaders.decode(from: container, forKey: .headers),
       headerEnvironment: try container.decodeIfPresent(
         [String: String].self,
         forKey: .headerEnvironment) ?? [:],
@@ -311,7 +311,7 @@ public struct ConfiguredMCPServer: Codable, Equatable, Identifiable, Sendable {
       args: try container.decodeIfPresent([String].self, forKey: .args) ?? [],
       env: try container.decodeIfPresent([String: String].self, forKey: .env) ?? [:],
       cwd: try container.decodeIfPresent(String.self, forKey: .cwd),
-      headers: try container.decodeIfPresent([String: String].self, forKey: .headers) ?? [:],
+      headers: try ProviderHeaders.decode(from: container, forKey: .headers),
       headerEnvironment: try container.decodeIfPresent(
         [String: String].self,
         forKey: .headerEnvironment) ?? [:],

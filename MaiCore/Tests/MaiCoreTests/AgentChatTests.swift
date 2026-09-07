@@ -28,6 +28,25 @@ func agentChatPrimaryAgent() {
   #expect(chat.messages.first?.text == "Review carefully.")
 }
 
+@Test("Chats keep the session minted for them, and files from before sessions derive one")
+func agentChatSession() throws {
+  let chat = AgentChat(title: "Work", primaryAgent: chatAgent)
+  #expect(!chat.sessionID.isEmpty)
+  #expect(chat.sessionID != AgentChat(primaryAgent: chatAgent).sessionID)
+  #expect(AgentChat(primaryAgent: chatAgent, sessionID: "kept").sessionID == "kept")
+
+  let data = try JSONEncoder().encode(chat)
+  #expect(try JSONDecoder().decode(AgentChat.self, from: data).sessionID == chat.sessionID)
+
+  var object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+  object.removeValue(forKey: "sessionID")
+  let legacy = try JSONSerialization.data(withJSONObject: object)
+  #expect(
+    try JSONDecoder().decode(AgentChat.self, from: legacy).sessionID
+      == ChatSession.legacyID(for: chat.id))
+  #expect(ChatSession.legacyID(for: chat.id) == chat.id.uuidString.lowercased())
+}
+
 @Test("Chat workspaces switch, update, remove, and persist chats")
 func agentChatWorkspaceRoundTrip() throws {
   // Files keep millisecond precision, so round-trip checks use aligned dates.

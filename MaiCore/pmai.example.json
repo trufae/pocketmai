@@ -38,6 +38,16 @@
       "baseURL": "http://127.0.0.1:8080/v1"
     },
     {
+      "id": "opencode",
+      "kind": "openAICompatible",
+      "displayName": "OpenCode Go",
+      "baseURL": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnvironment": "OPENCODE_API_KEY",
+      "headers": [
+        "x-opencode-session: {{session}}"
+      ]
+    },
+    {
       "id": "gemini",
       "kind": "acp",
       "displayName": "Gemini (ACP)",

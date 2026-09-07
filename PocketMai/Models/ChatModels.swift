@@ -1463,6 +1463,10 @@ struct Conversation: Identifiable, Codable, Equatable, Sendable {
   var folderID: String = ConversationFolder.defaultID
   var languageOverrideIdentifier: String? = nil
   var workingFolder: WorkingFolderReference? = nil
+  /// The session this conversation presents to providers, minted by MaiCore
+  /// when the conversation is created and kept in its file; a child agent's
+  /// transient conversation carries its parent's. See `ChatSession`.
+  var sessionID: String = ChatSession.newID()
 
   var isArchived: Bool {
     get { folderID == ConversationFolder.archivedID }
@@ -1499,11 +1503,14 @@ struct Conversation: Identifiable, Codable, Equatable, Sendable {
     case isArchived
     case languageOverrideIdentifier
     case workingFolder
+    case sessionID
   }
 
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     id = try container.decode(UUID.self, forKey: .id)
+    sessionID =
+      (try? container.decode(String.self, forKey: .sessionID)) ?? ChatSession.legacyID(for: id)
     title = try container.decode(String.self, forKey: .title)
     messages = try container.decode([ChatMessage].self, forKey: .messages)
     createdAt = try container.decode(Date.self, forKey: .createdAt)
@@ -1574,6 +1581,7 @@ struct Conversation: Identifiable, Codable, Equatable, Sendable {
       Self.normalizedLanguageOverride(languageOverrideIdentifier),
       forKey: .languageOverrideIdentifier)
     try container.encodeIfPresent(workingFolder, forKey: .workingFolder)
+    try container.encode(sessionID, forKey: .sessionID)
   }
 
   var displayTitle: String {
@@ -1693,6 +1701,10 @@ struct OpenAIEndpoint: Identifiable, Codable, Equatable, Sendable {
   var oauthAccessTokenExpiresAt: Date?
   var oauthAuthorizeURL: String
   var oauthTokenURL: String
+  /// Custom HTTP headers sent with every request to this endpoint. A value
+  /// may contain `{{session}}`, which MaiCore replaces with the chat's
+  /// session id; see `ProviderHeaders` and `ChatSession`.
+  var headers: [String: String]
 
   init(
     id: UUID = UUID(),
@@ -1711,7 +1723,8 @@ struct OpenAIEndpoint: Identifiable, Codable, Equatable, Sendable {
     oauthRefreshToken: String = "",
     oauthAccessTokenExpiresAt: Date? = nil,
     oauthAuthorizeURL: String = "",
-    oauthTokenURL: String = ""
+    oauthTokenURL: String = "",
+    headers: [String: String] = [:]
   ) {
     self.id = id
     self.name = name
@@ -1730,6 +1743,7 @@ struct OpenAIEndpoint: Identifiable, Codable, Equatable, Sendable {
     self.oauthAccessTokenExpiresAt = oauthAccessTokenExpiresAt
     self.oauthAuthorizeURL = oauthAuthorizeURL
     self.oauthTokenURL = oauthTokenURL
+    self.headers = headers
   }
 
   enum CodingKeys: String, CodingKey {
@@ -1737,6 +1751,7 @@ struct OpenAIEndpoint: Identifiable, Codable, Equatable, Sendable {
     case authMethod, oauthIssuer, oauthClientID, oauthAudience, oauthScope, oauthRedirectURI
     case oauthRefreshToken, oauthAccessTokenExpiresAt
     case oauthAuthorizeURL, oauthTokenURL
+    case headers
   }
 
   init(from decoder: Decoder) throws {
@@ -1760,6 +1775,9 @@ struct OpenAIEndpoint: Identifiable, Codable, Equatable, Sendable {
       try? c.decode(Date.self, forKey: .oauthAccessTokenExpiresAt)
     oauthAuthorizeURL = (try? c.decode(String.self, forKey: .oauthAuthorizeURL)) ?? ""
     oauthTokenURL = (try? c.decode(String.self, forKey: .oauthTokenURL)) ?? ""
+    // The same forms a pmai configuration accepts, so a provider JSON written
+    // by hand imports too.
+    headers = (try? ProviderHeaders.decode(from: c, forKey: .headers)) ?? [:]
   }
 
   func encode(to encoder: Encoder) throws {
@@ -1781,20 +1799,25 @@ struct OpenAIEndpoint: Identifiable, Codable, Equatable, Sendable {
     try c.encodeIfPresent(oauthAccessTokenExpiresAt, forKey: .oauthAccessTokenExpiresAt)
     try c.encode(oauthAuthorizeURL, forKey: .oauthAuthorizeURL)
     try c.encode(oauthTokenURL, forKey: .oauthTokenURL)
+    if !headers.isEmpty {
+      try c.encode(headers, forKey: .headers)
+    }
   }
 
   /// Identifies the fields that affect model/voice discovery, so a cached fetch
   /// can be reused until the URL or credentials actually change.
   var connectionSignature: String {
-    [
-      baseURL,
-      apiKey,
-      authMethod.rawValue,
-      oauthClientID,
-      oauthRefreshToken,
-      oauthTokenURL,
-      oauthIssuer,
-    ].joined(separator: "\u{1}")
+    (
+      [
+        baseURL,
+        apiKey,
+        authMethod.rawValue,
+        oauthClientID,
+        oauthRefreshToken,
+        oauthTokenURL,
+        oauthIssuer,
+      ] + ProviderHeaders.lines(headers)
+    ).joined(separator: "\u{1}")
   }
 
   static let openAIAuthDefaults = OAuthPresetDefaults(

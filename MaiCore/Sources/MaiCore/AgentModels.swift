@@ -694,6 +694,10 @@ public struct ProviderRequest: Codable, Sendable {
   public var responseFormat: ResponseFormat
   public var options: GenerationOptions
   public var stream: Bool
+  /// The session of the chat this request belongs to (see `ChatSession`), for
+  /// transports whose headers carry it (`{{session}}` in a configured
+  /// header). Nil for a request outside any chat, such as a one-shot prompt.
+  public var sessionID: String?
 
   public init(
     model: String,
@@ -702,7 +706,8 @@ public struct ProviderRequest: Codable, Sendable {
     toolChoice: ToolChoice = .automatic,
     responseFormat: ResponseFormat = .text,
     options: GenerationOptions = .init(),
-    stream: Bool = true
+    stream: Bool = true,
+    sessionID: String? = nil
   ) {
     self.model = model
     self.messages = messages
@@ -711,6 +716,7 @@ public struct ProviderRequest: Codable, Sendable {
     self.responseFormat = responseFormat
     self.options = options
     self.stream = stream
+    self.sessionID = sessionID
   }
 }
 
@@ -1039,6 +1045,10 @@ public struct AgentRequest: Sendable {
   public var retry: AgentRetryPolicy
   public var autocompact: AgentAutocompact
   public var context: AgentContextMode
+  /// The session of the chat this run belongs to (see `ChatSession`). Every
+  /// provider call the run makes, and every child it starts, carries it, so a
+  /// header configured with `{{session}}` sends one value for the whole chat.
+  public var sessionID: String?
 
   public init(
     agentID: String = "main",
@@ -1059,7 +1069,8 @@ public struct AgentRequest: Sendable {
     toolDelegation: AgentToolDelegation = .inline,
     retry: AgentRetryPolicy = .init(),
     autocompact: AgentAutocompact = .init(),
-    context: AgentContextMode = .cache
+    context: AgentContextMode = .cache,
+    sessionID: String? = nil
   ) {
     self.agentID = agentID
     self.provider = provider
@@ -1080,6 +1091,7 @@ public struct AgentRequest: Sendable {
     self.retry = retry
     self.autocompact = autocompact
     self.context = context
+    self.sessionID = sessionID
   }
 }
 

@@ -33,6 +33,10 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
   public let descriptor: ProviderDescriptor
   private let configuration: Configuration
   private let session: URLSession
+  /// What `{{session}}` becomes for a request made outside any chat: one
+  /// session for the life of this provider, so such requests still present a
+  /// stable session to a backend that requires one.
+  private let standaloneSessionID = ChatSession.newID()
 
   public init(
     configuration: Configuration,
@@ -217,13 +221,15 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     urlRequest.httpMethod = "POST"
     urlRequest.timeoutInterval = max(1, configuration.requestTimeout)
     urlRequest.httpBody = try JSONEncoder().encode(JSONValue.object(body))
-    applyHeaders(to: &urlRequest)
+    applyHeaders(to: &urlRequest, sessionID: request.sessionID)
     urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
     return urlRequest
   }
 
-  private func applyHeaders(to request: inout URLRequest) {
-    for (name, value) in configuration.additionalHeaders {
+  private func applyHeaders(to request: inout URLRequest, sessionID: String? = nil) {
+    let headers = ProviderHeaders.expand(
+      configuration.additionalHeaders, sessionID: sessionID ?? standaloneSessionID)
+    for (name, value) in headers {
       request.setValue(value, forHTTPHeaderField: name)
     }
     let key = configuration.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

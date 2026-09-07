@@ -1540,7 +1540,8 @@ enum OpenAICompatibleProvider {
             messages: coreMessages,
             tools: coreTools,
             options: coreOptions,
-            stream: request.conversation.usesStreaming)
+            stream: request.conversation.usesStreaming,
+            sessionID: request.conversation.sessionID)
         ) { event in
           await accumulator.consume(event)
         }

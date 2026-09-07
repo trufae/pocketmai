@@ -481,7 +481,8 @@ public actor AgentRuntime {
         toolChoice: definitions.isEmpty || !offersTools ? .none : request.toolChoice,
         responseFormat: request.responseFormat,
         options: request.options,
-        stream: usesTextToolProtocol ? false : request.stream)
+        stream: usesTextToolProtocol ? false : request.stream,
+        sessionID: request.sessionID)
       let call: ProviderCall
       let repairsEmptyReply = localToolCalls > 0 && localModelTurns < request.limits.maxModelTurns
       do {
@@ -770,7 +771,8 @@ public actor AgentRuntime {
         toolChoice: .none,
         responseFormat: .text,
         options: request.options,
-        stream: false),
+        stream: false,
+        sessionID: request.sessionID),
       with: provider, retry: request.retry, budget: budget, context: context, pid: pid,
       emit: emit
     ) { _ in }
@@ -1050,7 +1052,10 @@ public actor AgentRuntime {
       agent: definition.id,
       workingDirectory: FileManager.default.currentDirectoryPath,
       template: delegationTemplate)
-    let childRequest = self.request(for: definition, messages: [.user(prompt)])
+    // A child works in the session of the chat that started it, so a
+    // per-session header carries the same value for the whole tree.
+    let childRequest = self.request(
+      for: definition, messages: [.user(prompt)], sessionID: request.sessionID)
     let childRunID = UUID()
     let childDepth = depth + 1
     // A child past the concurrency limit is not refused: it is registered as
@@ -1263,7 +1268,8 @@ public actor AgentRuntime {
 
   private func request(
     for definition: AgentDefinition,
-    messages: [AgentMessage]
+    messages: [AgentMessage],
+    sessionID: String? = nil
   ) -> AgentRequest {
     var transcript = messages
     let instructions = definition.instructions.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1289,7 +1295,8 @@ public actor AgentRuntime {
       toolDelegation: definition.toolDelegation,
       retry: definition.retry,
       autocompact: definition.autocompact,
-      context: definition.context)
+      context: definition.context,
+      sessionID: sessionID)
   }
 
   static let toolBudgetExhaustedPrompt =

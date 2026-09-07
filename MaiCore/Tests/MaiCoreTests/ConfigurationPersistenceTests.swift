@@ -202,3 +202,40 @@ func providerAPIKeyFile() throws {
   #expect(decoded.apiKeyFile == keyFile.path)
   #expect(decoded == fileOnly)
 }
+
+@Test("Provider headers decode from an object, from lines, or from one line")
+func providerHeaderForms() throws {
+  func decode(_ headers: String) throws -> ConfiguredProvider {
+    try JSONDecoder().decode(
+      ConfiguredProvider.self,
+      from: Data(#"{"id":"p","kind":"openAICompatible","headers":\#(headers)}"#.utf8))
+  }
+  let expected = ["x-opencode-session": "{{session}}", "X-Tenant": "acme"]
+  #expect(
+    try decode(#"{"x-opencode-session":"{{session}}","X-Tenant":"acme"}"#).headers
+      == expected)
+  #expect(
+    try decode(
+      ##"["x-opencode-session: {{session}}", " X-Tenant:acme ", "# note", "junk", ""]"##
+    ).headers == expected)
+  #expect(try decode(#""X-Tenant: acme""#).headers == ["X-Tenant": "acme"])
+  #expect(try decode("[]").headers == [:])
+  #expect(
+    try JSONDecoder().decode(
+      ConfiguredProvider.self, from: Data(#"{"id":"p","kind":"openAICompatible"}"#.utf8)
+    ).headers == [:])
+  #expect(throws: DecodingError.self) { try decode("42") }
+
+  // Saving writes the object form, which reads back unchanged.
+  let saved = try JSONEncoder().encode(try decode(#"["X-Tenant: acme"]"#))
+  #expect(
+    try JSONDecoder().decode(ConfiguredProvider.self, from: saved).headers == ["X-Tenant": "acme"])
+
+  #expect(
+    ProviderHeaders.lines(expected) == ["x-opencode-session: {{session}}", "X-Tenant: acme"])
+  #expect(
+    ProviderHeaders.parse("X-A: 1\n\nX-B: two: three\n") == ["X-A": "1", "X-B": "two: three"])
+  #expect(
+    ProviderHeaders.expand(expected, sessionID: "chat-1")
+      == ["x-opencode-session": "chat-1", "X-Tenant": "acme"])
+}

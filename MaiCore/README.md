@@ -192,6 +192,33 @@ Configuration is discovered in this order: `--config`, `PMAI_CONFIG`,
 of being stored directly in JSON; a provider's `apiKeyFile` names a file
 holding the key, read whenever the provider is built.
 
+A provider's `headers` are sent with every request, for proxies that want a
+tenant or routing header and for backends that need one. They are written as
+an object of names to values or as `"Name: value"` strings, whichever reads
+better; a saved configuration writes the object form. A value may contain
+`{{session}}`, which every request replaces with the session id of the chat
+it belongs to. Every chat has one: MaiCore mints it when the chat is created,
+keeps it in the chat's file, and hands it to the child agents the chat
+starts, so a backend that meters or routes by session sees one id per chat.
+`/chat session` shows it, `/chat info` lists it, and `/chat session new`
+starts a fresh session without touching the chat. OpenCode Zen's Go plan
+requires exactly that in `x-opencode-session`:
+
+```json
+{
+  "id": "opencode",
+  "kind": "openAICompatible",
+  "baseURL": "https://opencode.ai/zen/go/v1",
+  "apiKeyEnvironment": "OPENCODE_API_KEY",
+  "headers": ["x-opencode-session: {{session}}"]
+}
+```
+
+`headerEnvironment` maps a header name to the environment variable holding
+its value. `/edit provider [ID]` opens one configured provider as JSON and
+rebuilds it in the running session when the editor closes, so headers can be
+added without a restart; `/provider` lists the header names it sends.
+
 Chats belong to a project, the directory pmai was started in, mirroring the
 chat folders PocketMai keeps with a name, a tint, and a working folder. The
 project's own file and its chats live in `.pmai/` inside that directory (one
@@ -242,8 +269,11 @@ current chat's agent in the shared configuration.
 Use `/baseurl URL` to change the current provider endpoint. To edit another
 provider, select it first with `/provider ID`. The provider is replaced in the
 live runtime and the new URL is saved immediately. `/provider baseurl URL`
-remains an alias. In `/visual`, open the Providers tab, choose **Edit** beside a
-configured provider, change **Base URL**, and choose **Update**.
+remains an alias, and `/edit provider [ID]` opens the whole provider record
+(base URL, key source, headers, timeout, options) as JSON with the same live
+reload. In `/visual`, open the Providers tab, choose **Edit** beside a
+configured provider, change **Base URL**, and choose **Update**. See
+`doc/edit.md` for everything `/edit` reaches.
 
 On a terminal the prompt never goes away: the bottom two rows are reserved for
 a status line (project, agent, what is running, how much is queued) and the

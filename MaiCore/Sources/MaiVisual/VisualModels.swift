@@ -8,19 +8,23 @@ public struct VisualConversationSeed: Equatable, Sendable {
   public var profile: AgentDefinition
   public var messages: [AgentMessage]
   public var pendingContent: [ContentPart]
+  /// The session the chat presents to providers; see `ChatSession`.
+  public var sessionID: String
 
   public init(
     id: UUID = UUID(),
     title: String,
     profile: AgentDefinition,
     messages: [AgentMessage] = [],
-    pendingContent: [ContentPart] = []
+    pendingContent: [ContentPart] = [],
+    sessionID: String? = nil
   ) {
     self.id = id
     self.title = title
     self.profile = profile
     self.messages = messages
     self.pendingContent = pendingContent
+    self.sessionID = sessionID ?? ChatSession.newID()
   }
 }
 
