@@ -164,6 +164,35 @@ func openAIStructuredContentOnlyWithoutText() async throws {
   #expect(texts[1] == "<structured_content>\n{\"ok\":true}\n</structured_content>")
 }
 
+@Test("Tool proxy names its catalog and caps a broad listing")
+func toolProxyCatalogAndCap() {
+  let catalog = (1...9).map { index in
+    ToolDefinition(
+      name: "files_op\(index)",
+      description: "Work with files, operation \(index).",
+      parameters: [
+        ToolParameterDef(name: "path", type: "string", description: "A file path.", required: true)
+      ])
+  }
+  let definitions = ToolProxy.definitions(for: catalog)
+  #expect(definitions.map(\.name) == [ToolProxy.listName, ToolProxy.callName])
+  #expect(definitions[0].description.contains("files_op1, files_op2"))
+  #expect(ToolProxy.definitions.first?.description.contains("Enabled tools") == false)
+
+  let listing = ToolProxy.listTools(arguments: ["keywords": .string("files")], definitions: catalog)
+  let detailed = listing.components(separatedBy: "\n").filter { $0.hasPrefix("- files_op") }
+  #expect(detailed.count == ToolProxy.detailedMatches)
+  #expect(listing.contains("named only: files_op7, files_op8, files_op9."))
+
+  // A term in the name ranks above the same term in a description.
+  let mixed = [
+    ToolDefinition(name: "web_fetch", description: "Read a page."),
+    ToolDefinition(name: "files_read", description: "Fetch nothing; read a file."),
+  ]
+  let ranked = ToolProxy.listTools(arguments: ["keywords": .string("read")], definitions: mixed)
+  #expect(ranked.hasPrefix("- files_read"))
+}
+
 @Test("Tool result previews bound lines, line length, and terminal control characters")
 func toolResultPreview() {
   let result = ToolResult(

@@ -318,7 +318,7 @@ public actor AgentRuntime {
     let concreteDefinitions = try visibleDefinitions(for: request)
     let definitions =
       request.useToolProxy && !concreteDefinitions.isEmpty
-      ? ToolProxy.definitions : concreteDefinitions
+      ? ToolProxy.definitions(for: concreteDefinitions) : concreteDefinitions
     let supportsNativeTools = provider.descriptor.capabilities.contains(.nativeToolCalling)
     if request.toolCallingStrategy == .native, !definitions.isEmpty, !supportsNativeTools {
       throw AgentRuntimeError.nativeToolCallingUnavailable(request.provider)
