@@ -49,16 +49,15 @@ func fileToolsAcceptAbsolutePathsInsideTheWorkspace() async throws {
   #expect(notFolder.text.contains("not a folder; files_read reads a file"))
 }
 
-@Test("run_sh and run_system take command and script as aliases of each other")
+@Test("run_sh takes command and script as aliases of each other")
 func runToolsAcceptAliases() async throws {
   let tools = MaiRunTool.makeTools(configuration: MaiRunConfiguration())
   let shell = try #require(tools.first { $0.definition.name == "run_sh" })
-  let system = try #require(tools.first { $0.definition.name == "run_system" })
 
   let viaCommand = try await usabilityCall(shell, ["command": .string("printf via-command")])
   #expect(!viaCommand.isError)
   #expect(viaCommand.text == "via-command")
-  let viaScript = try await usabilityCall(system, ["script": .string("printf via-script")])
+  let viaScript = try await usabilityCall(shell, ["script": .string("printf via-script")])
   #expect(!viaScript.isError)
   #expect(viaScript.text == "via-script")
   let empty = try await usabilityCall(shell, [:])
@@ -67,14 +66,11 @@ func runToolsAcceptAliases() async throws {
 
   // The schema itself admits both spellings, so the runtime's validation
   // never rejects the call before the tool can read the alias.
-  for tool in [shell, system] {
-    let schema = try #require(tool.definition.inputSchema.objectValue)
-    #expect(schema["required"] == .array([]))
-    let properties = try #require(schema["properties"]?.objectValue)
-    #expect(properties["command"] != nil)
-    #expect(properties["script"] != nil)
-  }
-  #expect(shell.definition.description.contains("'script'"))
+  let schema = try #require(shell.definition.inputSchema.objectValue)
+  #expect(schema["required"] == .array([]))
+  let properties = try #require(schema["properties"]?.objectValue)
+  #expect(properties["command"] != nil)
+  #expect(properties["script"] != nil)
 }
 
 @Test("Schema errors name the fields the call had and the fields the tool takes")

@@ -7,57 +7,36 @@ import MaiCore
   import Glibc
 #endif
 
-/// Configuration for the Run tool group, which executes code on the host with
-/// the privileges of the pmai process. Interpreters are names looked up in
-/// `PATH` or absolute paths, optionally followed by leading arguments.
+/// Configuration for the Run tool, which executes shell scripts on the host
+/// with the privileges of the pmai process. The shell is a name looked up in
+/// `PATH` or an absolute path, optionally followed by leading arguments.
 public struct MaiRunConfiguration: Equatable, Sendable {
   public static let defaultShell = "/bin/sh"
-  public static let defaultPython = "python3"
-  public static let defaultNode = "node"
   public static let defaultTimeout: TimeInterval = 60
   public static let maximumTimeout: TimeInterval = 600
   public static let defaultOutputLimit = 100_000
 
   public var shell: String
-  public var python: String
-  public var node: String
   public var defaultTimeout: TimeInterval
   public var outputLimit: Int
 
   public init(
     shell: String = Self.defaultShell,
-    python: String = Self.defaultPython,
-    node: String = Self.defaultNode,
     defaultTimeout: TimeInterval = Self.defaultTimeout,
     outputLimit: Int = Self.defaultOutputLimit
   ) {
     self.shell = shell.isEmpty ? Self.defaultShell : shell
-    self.python = python.isEmpty ? Self.defaultPython : python
-    self.node = node.isEmpty ? Self.defaultNode : node
     self.defaultTimeout = min(max(defaultTimeout, 1), Self.maximumTimeout)
     self.outputLimit = max(outputLimit, 1_024)
   }
 }
 
-/// One operation in the Run tool group: a shell one-liner, or a shell, Python,
-/// or Node.js script written to a temporary file and executed on the host.
+/// The Run tool: a shell command line or script written to a temporary file
+/// and executed on the host. Other languages go through the shell too
+/// (`python3 - <<'EOF' … EOF`), so one tool and one schema cover them all.
 public struct MaiRunTool: AgentTool {
-  public enum Operation: String, CaseIterable, Sendable {
-    case system = "run_system"
-    case shell = "run_sh"
-    case python = "run_python"
-    case javascript = "run_js"
-
-    var scriptExtension: String {
-      switch self {
-      case .system, .shell: "sh"
-      case .python: "py"
-      case .javascript: "js"
-      }
-    }
-  }
-
-  public static let toolNames = Operation.allCases.map(\.rawValue)
+  public static let name = "run_sh"
+  public static let toolNames = [name]
 
   /// Spawning processes is unavailable on iOS, where the group is simply absent.
   public static var isSupported: Bool {
@@ -68,27 +47,16 @@ public struct MaiRunTool: AgentTool {
     #endif
   }
 
-  public let operation: Operation
   public let configuration: MaiRunConfiguration
   public let definition: ToolDefinition
 
-  public init(operation: Operation, configuration: MaiRunConfiguration) {
-    self.operation = operation
+  public init(configuration: MaiRunConfiguration) {
     self.configuration = configuration
-    definition = Self.definition(for: operation, configuration: configuration)
+    definition = Self.definition(configuration: configuration)
   }
 
   public static func makeTools(configuration: MaiRunConfiguration) -> [MaiRunTool] {
-    guard isSupported else { return [] }
-    return Operation.allCases.map { MaiRunTool(operation: $0, configuration: configuration) }
-  }
-
-  var interpreter: String {
-    switch operation {
-    case .system, .shell: configuration.shell
-    case .python: configuration.python
-    case .javascript: configuration.node
-    }
+    isSupported ? [MaiRunTool(configuration: configuration)] : []
   }
 
   public func call(arguments: JSONValue, context: ToolExecutionContext) async throws -> ToolOutput {
@@ -110,29 +78,20 @@ public struct MaiRunTool: AgentTool {
   #if os(macOS) || os(Linux)
     private func execute(_ arguments: [String: JSONValue]) async throws -> ToolOutput {
       let environment = ProcessInfo.processInfo.environment
-      let launcher = try MaiHostProcess.resolve(interpreter, environment: environment)
+      let launcher = try MaiHostProcess.resolve(configuration.shell, environment: environment)
       let workingDirectory = try Self.workingDirectory(arguments["cwd"]?.stringValue)
       let timeout = min(
         max(
           arguments["timeout_seconds"]?.numberValue ?? configuration.defaultTimeout, 1),
         MaiRunConfiguration.maximumTimeout)
       let stdin = arguments["stdin"]?.stringValue
-      var extraArguments: [String] = []
-      var scriptURL: URL?
-      switch operation {
-      case .system:
-        let command = try Self.requiredText(arguments, key: "command", alias: "script")
-        extraArguments = ["-c", command]
-      case .shell, .python, .javascript:
-        let script = try Self.requiredText(arguments, key: "script", alias: "command")
-        let url = try Self.writeScript(script, extension: operation.scriptExtension)
-        scriptURL = url
-        extraArguments = [url.path]
-        if let args = arguments["args"]?.arrayValue {
-          extraArguments += args.map { $0.stringValue ?? $0.compactJSONString }
-        }
+      let script = try Self.requiredText(arguments, key: "script", alias: "command")
+      let scriptURL = try Self.writeScript(script, extension: "sh")
+      defer { try? FileManager.default.removeItem(at: scriptURL) }
+      var extraArguments = [scriptURL.path]
+      if let args = arguments["args"]?.arrayValue {
+        extraArguments += args.map { $0.stringValue ?? $0.compactJSONString }
       }
-      defer { if let scriptURL { try? FileManager.default.removeItem(at: scriptURL) } }
 
       let outcome = try await MaiHostProcess.run(
         executable: launcher.executable,
@@ -227,61 +186,29 @@ public struct MaiRunTool: AgentTool {
     }
   #endif
 
-  private static func definition(
-    for operation: Operation,
-    configuration: MaiRunConfiguration
-  ) -> ToolDefinition {
+  private static func definition(configuration: MaiRunConfiguration) -> ToolDefinition {
     var properties: [String: JSONValue] = [:]
-    var required: [String] = []
-    let description: String
-    switch operation {
-    case .system:
-      description =
-        "Run one shell command line on this computer with '\(configuration.shell) -c' and return its stdout, stderr, and exit code. Put the command line in 'command'."
-      properties["command"] = stringProperty(
-        "Shell command line. Pipes, globs, redirections, and && chains are allowed.")
-      properties["script"] = stringProperty("Accepted as an alias of command.")
-      required = []
-    case .shell:
-      description =
-        "Run a shell command line or a multi-line shell script on this computer with '\(configuration.shell)' and return its stdout, stderr, and exit code. Put the text in 'script'; it runs from the current directory unless cwd is set."
-      properties["script"] = stringProperty(
-        "Shell command line or script source, one or more lines. It is saved to a temporary file and run as '\(configuration.shell) FILE ARGS'.")
-      properties["command"] = stringProperty("Accepted as an alias of script.")
-      required = []
-    case .python:
-      description =
-        "Run a Python script on this computer with '\(configuration.python)' and return its stdout, stderr, and exit code."
-      properties["script"] = stringProperty(
-        "Python source. It is saved to a temporary .py file and run as '\(configuration.python) FILE ARGS'.")
-      required = ["script"]
-    case .javascript:
-      description =
-        "Run a JavaScript script on this computer with Node.js ('\(configuration.node)') and return its stdout, stderr, and exit code."
-      properties["script"] = stringProperty(
-        "JavaScript source. It is saved to a temporary .js file and run as '\(configuration.node) FILE ARGS'.")
-      required = ["script"]
-    }
-    if operation != .system {
-      properties["args"] = .object([
-        "type": .string("array"),
-        "items": .object(["type": .string("string")]),
-        "description": .string("Command-line arguments passed to the script."),
-      ])
-    }
-    properties["stdin"] = stringProperty(
-      "Text piped to the process's standard input. Omit to provide no input.")
-    properties["cwd"] = stringProperty(
-      "Working directory, absolute or relative to the current directory. Default: the current directory.")
+    properties["script"] = stringProperty(
+      "Shell command line or multi-line script. Other languages run through the shell, for example python3 - <<'EOF' … EOF."
+    )
+    properties["command"] = stringProperty("Accepted as an alias of script.")
+    properties["args"] = .object([
+      "type": .string("array"),
+      "items": .object(["type": .string("string")]),
+      "description": .string("Arguments passed to the script as $1, $2, …"),
+    ])
+    properties["stdin"] = stringProperty("Text piped to standard input.")
+    properties["cwd"] = stringProperty("Working directory. Default: the current directory.")
     properties["timeout_seconds"] = .object([
       "type": .string("number"),
       "description": .string(
         "Seconds before the process is killed, 1-\(Int(MaiRunConfiguration.maximumTimeout)). Default: \(Int(configuration.defaultTimeout))."),
     ])
     return ToolDefinition(
-      name: operation.rawValue,
-      description: description,
-      inputSchema: objectSchema(properties: properties, required: required),
+      name: name,
+      description:
+        "Run a shell command line or script with '\(configuration.shell)' from the current directory and return its stdout, stderr, and exit code.",
+      inputSchema: objectSchema(properties: properties, required: []),
       annotations: ToolAnnotations(
         readOnly: false,
         destructive: true,

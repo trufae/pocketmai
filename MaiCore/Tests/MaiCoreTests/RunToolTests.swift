@@ -11,14 +11,14 @@ func runSystemCapturesOutput() async throws {
   #expect(tools.allSatisfy { $0.definition.annotations.approval == .dangerous })
   #expect(tools.allSatisfy { $0.definition.annotations.destructive })
 
-  let ok = try await call(tool(tools, .system), ["command": .string("printf 'hello world'")])
+  let ok = try await call(shell(tools), ["command": .string("printf 'hello world'")])
   #expect(!ok.isError)
   #expect(ok.text == "hello world")
   #expect(ok.structuredContent?.objectValue?["exitCode"] == .integer(0))
   #expect(ok.structuredContent?.objectValue?["timedOut"] == .bool(false))
 
   let failed = try await call(
-    tool(tools, .system),
+    shell(tools),
     ["command": .string("printf out; printf oops >&2; exit 3")])
   #expect(failed.isError)
   #expect(failed.text.contains("out"))
@@ -26,12 +26,12 @@ func runSystemCapturesOutput() async throws {
   #expect(failed.text.contains("[exit code 3]"))
   #expect(failed.structuredContent?.objectValue?["exitCode"] == .integer(3))
 
-  let silent = try await call(tool(tools, .system), ["command": .string("true")])
+  let silent = try await call(shell(tools), ["command": .string("true")])
   #expect(silent.text == "(no output; exit code 0)")
 
-  let missing = try await call(tool(tools, .system), [:])
+  let missing = try await call(shell(tools), [:])
   #expect(missing.isError)
-  #expect(missing.text.contains("command is required"))
+  #expect(missing.text.contains("script is required"))
 }
 
 @Test("Run tools pass stdin, arguments, and the working directory to scripts")
@@ -43,7 +43,7 @@ func runShellScriptUsesArgumentsAndStdin() async throws {
   let tools = MaiRunTool.makeTools(configuration: MaiRunConfiguration())
 
   let output = try await call(
-    tool(tools, .shell),
+    shell(tools),
     [
       "script": .string("echo \"first=$1 second=$2\"\ncat\npwd"),
       "args": .array([.string("a b"), .string("c")]),
@@ -58,42 +58,29 @@ func runShellScriptUsesArgumentsAndStdin() async throws {
     == directory.standardizedFileURL.resolvingSymlinksInPath().path)
 
   let badDirectory = try await call(
-    tool(tools, .shell),
+    shell(tools),
     ["script": .string("true"), "cwd": .string(directory.appendingPathComponent("nope").path)])
   #expect(badDirectory.isError)
   #expect(badDirectory.text.contains("is not a directory"))
 }
 
-@Test("Run tools execute Python and Node.js scripts when the interpreters are installed")
-func runPythonAndJavaScript() async throws {
+@Test("Other languages run through the shell, and a missing shell is reported")
+func runOtherLanguagesThroughTheShell() async throws {
   let tools = MaiRunTool.makeTools(configuration: MaiRunConfiguration())
+  #expect(tools.map(\.definition.name) == ["run_sh"])
   let environment = ProcessInfo.processInfo.environment
   if (try? MaiHostProcess.resolve("python3", environment: environment)) != nil {
     let output = try await call(
-      tool(tools, .python),
+      shell(tools),
       [
-        "script": .string("import sys\nprint('py', sys.argv[1], sys.stdin.read().strip())"),
+        "script": .string("python3 - \"$1\" <<'PY'\nimport sys\nprint('py', sys.argv[1])\nPY"),
         "args": .array([.string("arg")]),
-        "stdin": .string("in"),
       ])
     #expect(!output.isError)
-    #expect(output.text == "py arg in")
+    #expect(output.text == "py arg")
   }
-  if (try? MaiHostProcess.resolve("node", environment: environment)) != nil {
-    let output = try await call(
-      tool(tools, .javascript),
-      [
-        "script": .string("console.log('js', process.argv[2]); process.exitCode = 2"),
-        "args": .array([.string("arg")]),
-      ])
-    #expect(output.isError)
-    #expect(output.text.contains("js arg"))
-    #expect(output.structuredContent?.objectValue?["exitCode"] == .integer(2))
-  }
-  let missing = MaiRunTool(
-    operation: .python,
-    configuration: MaiRunConfiguration(python: "pmai-no-such-interpreter"))
-  let unavailable = try await call(missing, ["script": .string("print(1)")])
+  let missing = MaiRunTool(configuration: MaiRunConfiguration(shell: "pmai-no-such-shell"))
+  let unavailable = try await call(missing, ["script": .string("true")])
   #expect(unavailable.isError)
   #expect(unavailable.text.contains("was not found in PATH"))
 }
@@ -103,7 +90,7 @@ func runToolsEnforceTimeout() async throws {
   let tools = MaiRunTool.makeTools(configuration: MaiRunConfiguration())
   let started = Date()
   let output = try await call(
-    tool(tools, .system),
+    shell(tools),
     ["command": .string("echo started; sleep 30; echo finished"), "timeout_seconds": .integer(1)])
   #expect(Date().timeIntervalSince(started) < 10)
   #expect(output.isError)
@@ -115,9 +102,7 @@ func runToolsEnforceTimeout() async throws {
 
 @Test("Run tools cap captured output")
 func runToolsTruncateOutput() async throws {
-  let tool = MaiRunTool(
-    operation: .system,
-    configuration: MaiRunConfiguration(outputLimit: 1_024))
+  let tool = MaiRunTool(configuration: MaiRunConfiguration(outputLimit: 1_024))
   let output = try await call(tool, ["command": .string("head -c 5000 /dev/zero | tr '\\0' x")])
   #expect(!output.isError)
   #expect(output.text.hasPrefix(String(repeating: "x", count: 1_024)))
@@ -133,7 +118,7 @@ func runToolsPropagateCancellation() async throws {
   defer { try? FileManager.default.removeItem(at: marker) }
   let task = Task {
     try await call(
-      tool(tools, .system),
+      shell(tools),
       ["command": .string("sleep 30; touch '\(marker.path)'")])
   }
   try await Task.sleep(for: .milliseconds(300))
@@ -141,7 +126,7 @@ func runToolsPropagateCancellation() async throws {
   task.cancel()
   do {
     _ = try await task.value
-    Issue.record("Expected run_system to propagate cancellation")
+    Issue.record("Expected run_sh to propagate cancellation")
   } catch is CancellationError {
     // Expected: the REPL regains control and the child is gone.
   }
@@ -153,22 +138,21 @@ func runToolsPropagateCancellation() async throws {
 func standardFactoryExposesRunGroup() async throws {
   let context = PluginFactoryContext(
     id: "standard",
-    options: ["runPython": .string("python3 -u"), "runTimeoutSeconds": .integer(5)])
+    options: ["runShell": .string("/bin/sh -e"), "runTimeoutSeconds": .integer(5)])
   let factory = MaiStandardToolFactory()
   let tools = try await factory.makeTools(context: context)
-  let python = try #require(
-    tools.first { $0.definition.name == MaiRunTool.Operation.python.rawValue } as? MaiRunTool)
-  #expect(python.configuration.python == "python3 -u")
-  #expect(python.configuration.defaultTimeout == 5)
-  #expect(python.definition.description.contains("python3 -u"))
+  let run = try #require(tools.first { $0.definition.name == MaiRunTool.name } as? MaiRunTool)
+  #expect(run.configuration.shell == "/bin/sh -e")
+  #expect(run.configuration.defaultTimeout == 5)
+  #expect(run.definition.description.contains("/bin/sh -e"))
 
   let group = try #require(try await factory.toolGroups(context: context).first { $0.id == "run" })
   #expect(group.toolNames == Set(MaiRunTool.toolNames))
-  #expect(group.options.map(\.id) == ["runShell", "runPython", "runNode", "runTimeoutSeconds"])
+  #expect(group.options.map(\.id) == ["runShell", "runTimeoutSeconds"])
 }
 
-private func tool(_ tools: [MaiRunTool], _ operation: MaiRunTool.Operation) -> MaiRunTool {
-  tools.first { $0.operation == operation }!
+private func shell(_ tools: [MaiRunTool]) -> MaiRunTool {
+  tools[0]
 }
 
 private func call(

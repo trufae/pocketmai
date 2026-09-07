@@ -595,19 +595,18 @@ does not expose `files_chdir`. Paths are relative to that directory, and an
 absolute path is accepted as long as it lies inside it, so a model can reuse a
 path a shell command printed; a path error names the directory so the model can
 correct itself.
-The `run` group executes code on this computer with the privileges of the
-`pmai` process: `run_system` passes one command line to `sh -c`, while
-`run_sh`, `run_python`, and `run_js` save a script to a temporary file and run
-it with the configured shell, Python, or Node.js interpreter (`runShell`,
-`runPython`, `runNode`; names are looked up in `PATH`, and leading arguments
-such as `node --no-warnings` are honoured). `run_system` and `run_sh` take the
-text in `command` or `script` interchangeably, since models mix the two up.
-Every call may pass `args`, `stdin`,
-`cwd`, and `timeout_seconds`; stdout and stderr are captured with a 100 KB cap
-per stream, the process is killed after the timeout (`runTimeoutSeconds`,
-default 60), and `Ctrl+C` terminates it. All four tools are marked dangerous,
-so they follow the `dangerous` approval setting, and the group is absent on
-iOS. Use `/tools disable run` to remove them from an agent.
+The `run` group is one tool, `run_sh`, which executes code on this computer
+with the privileges of the `pmai` process: the command line or script is saved
+to a temporary file and run with the configured shell (`runShell`; a name looked
+up in `PATH` or a full path, leading arguments such as `bash -e` honoured).
+Other languages go through the shell (`python3 - <<'EOF' … EOF`), so there is
+one schema to pay for on every call rather than four. The text is taken from
+`command` or `script` interchangeably, since models mix the two up. Every call
+may pass `args`, `stdin`, `cwd`, and `timeout_seconds`; stdout and stderr are
+captured with a 100 KB cap per stream, the process is killed after the timeout
+(`runTimeoutSeconds`, default 60), and `Ctrl+C` terminates it. The tool is
+marked dangerous, so it follows the `dangerous` approval setting, and the group
+is absent on iOS. Use `/tools disable run` to remove it from an agent.
 Streamable HTTP support is supplied by `MaiMCPPlugin`, so the transport is not a
 dependency of the core runtime.
 

@@ -49,8 +49,6 @@ public struct MaiStandardToolFactory: ConfiguredToolFactory {
     }
     let runConfiguration = MaiRunConfiguration(
       shell: context.string("runShell", environment: "PMAI_RUN_SHELL"),
-      python: context.string("runPython", environment: "PMAI_RUN_PYTHON"),
-      node: context.string("runNode", environment: "PMAI_RUN_NODE"),
       defaultTimeout: context.options["runTimeoutSeconds"]?.numberValue
         ?? MaiRunConfiguration.defaultTimeout)
     let tools: [any AgentTool] =
@@ -135,25 +133,14 @@ public struct MaiStandardToolFactory: ConfiguredToolFactory {
       ToolGroupDefinition(
         id: "run",
         displayName: "Run",
-        description:
-          "Run shell one-liners, shell scripts, Python scripts, and Node.js scripts on this computer.",
+        description: "Run shell command lines and scripts on this computer.",
         toolNames: Set(MaiRunTool.toolNames),
         options: [
           .init(
             id: "runShell",
             label: "Shell",
-            help: "Runs run_system command lines and run_sh scripts.",
+            help: "Runs run_sh scripts; a name found in PATH or a full path, optionally with leading arguments.",
             defaultValue: .string(MaiRunConfiguration.defaultShell)),
-          .init(
-            id: "runPython",
-            label: "Python interpreter",
-            help: "Name found in PATH or a full path, optionally with leading arguments.",
-            defaultValue: .string(MaiRunConfiguration.defaultPython)),
-          .init(
-            id: "runNode",
-            label: "Node.js interpreter",
-            help: "Name found in PATH or a full path, optionally with leading arguments.",
-            defaultValue: .string(MaiRunConfiguration.defaultNode)),
           .init(
             id: "runTimeoutSeconds",
             label: "Default timeout (seconds)",
