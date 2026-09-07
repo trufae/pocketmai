@@ -1,0 +1,1 @@
+Run make and fix the compilation errors until the build succeeds and ./app prints the sum of the numbers.

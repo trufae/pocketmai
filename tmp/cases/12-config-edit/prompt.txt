@@ -1,0 +1,1 @@
+In config.json change server.port to 8080 and add a top-level key "debug" set to false. Keep everything else exactly as it is.

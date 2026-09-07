@@ -1,0 +1,1 @@
+Add a --json flag to wordfreq.py that prints the result as a JSON object mapping each word to its count, and document the flag in README.md.

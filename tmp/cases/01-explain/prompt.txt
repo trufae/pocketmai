@@ -1,0 +1,1 @@
+Explain what this project does in at most 5 lines, then list every public function and class with its file and line number.

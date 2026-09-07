@@ -1,0 +1,1 @@
+Rename the function fetch_data to load_records across the whole project, including tests and documentation. Run the tests afterwards to confirm nothing broke.

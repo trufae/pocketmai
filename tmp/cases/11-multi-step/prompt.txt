@@ -1,0 +1,1 @@
+Do these three things in app.py: 1) fix the typo in the greeting, 2) add a __version__ = "1.1.0" constant, 3) make `python3 app.py --version` print that version and exit. Verify everything works at the end.

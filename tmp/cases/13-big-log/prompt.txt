@@ -1,0 +1,1 @@
+How many ERROR lines are in server.log and what is the most common error message? Answer briefly.

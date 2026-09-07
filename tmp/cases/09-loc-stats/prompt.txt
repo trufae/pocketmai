@@ -1,0 +1,1 @@
+Count the lines of code per file extension in this repository, skipping hidden directories, and show the result as a table sorted by line count.
