@@ -14,7 +14,10 @@ public struct MaiRunConfiguration: Equatable, Sendable {
   public static let defaultShell = "/bin/sh"
   public static let defaultTimeout: TimeInterval = 60
   public static let maximumTimeout: TimeInterval = 600
-  public static let defaultOutputLimit = 100_000
+  /// Bytes of stdout and of stderr kept per call. Everything kept enters the
+  /// conversation and is resent on every later turn; a test run fits in far
+  /// less, and a model that needs the rest can rerun with head, tail or grep.
+  public static let defaultOutputLimit = 24_000
 
   public var shell: String
   public var defaultTimeout: TimeInterval

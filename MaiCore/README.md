@@ -606,7 +606,7 @@ Other languages go through the shell (`python3 - <<'EOF' … EOF`), so there is
 one schema to pay for on every call rather than four. The text is taken from
 `command` or `script` interchangeably, since models mix the two up. Every call
 may pass `args`, `stdin`, `cwd`, and `timeout_seconds`; stdout and stderr are
-captured with a 100 KB cap per stream, the process is killed after the timeout
+captured with a 24 KB cap per stream (the rest is dropped with a note; rerun with head, tail or grep for more), the process is killed after the timeout
 (`runTimeoutSeconds`, default 60), and `Ctrl+C` terminates it. The tool is
 marked dangerous, so it follows the `dangerous` approval setting, and the group
 is absent on iOS. Use `/tools disable run` to remove it from an agent.
