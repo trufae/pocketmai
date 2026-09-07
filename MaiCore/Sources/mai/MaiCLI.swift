@@ -26,31 +26,27 @@ import MaiVisionOCR
 @_silgen_name("system")
 private func posixSystem(_ command: UnsafePointer<CChar>) -> CInt
 
-/// Swift discovers argv from the initial process stack on ELF targets. Termux
-/// may execute downloaded binaries as `linker64 PROGRAM ARGS...` to satisfy
-/// Android's app-data execution policy. Bionic hides that extra linker argument
-/// from C programs, but Swift can still recover the original kernel argv and
-/// mistake PROGRAM for a positional prompt. Normalize the procfs command line
-/// to the argv the loaded program is meant to see.
-private func platformCommandLineArguments() -> [String] {
+/// Swift discovers argv from the initial process stack on ELF targets. The
+/// Play Store build of Termux preserves argv[0], inserts the executable at
+/// argv[1], and starts Android's linker. Bionic skips the preserved argv[0]
+/// before calling C main, but Swift still finds it on the initial stack.
+private func platformCommandLineArguments(environment: [String: String]) -> [String] {
+  var arguments = CommandLine.arguments
   #if canImport(Android)
-    let url = URL(fileURLWithPath: "/proc/self/cmdline")
-    if let data = try? Data(contentsOf: url), !data.isEmpty {
-      var fields = data.split(separator: 0, omittingEmptySubsequences: false)
-      if fields.last?.isEmpty == true { fields.removeLast() }
-      if !fields.isEmpty {
-        var arguments = fields.map { String(decoding: $0, as: UTF8.self) }
-        if arguments.count >= 2 {
-          let launcher = URL(fileURLWithPath: arguments[0]).lastPathComponent
-          if launcher == "linker" || launcher == "linker64" {
-            arguments.removeFirst()
-          }
-        }
-        return arguments
+    guard arguments.count >= 2 else { return arguments }
+
+    if environment["TERMUX_EXEC__PROC_SELF_EXE"] != nil {
+      arguments.removeFirst()
+    } else {
+      // Also support invoking the Android linker explicitly, outside the
+      // termux-exec wrapper.
+      let first = URL(fileURLWithPath: arguments[0]).lastPathComponent
+      if first == "linker" || first == "linker64" {
+        arguments.removeFirst()
       }
     }
   #endif
-  return CommandLine.arguments
+  return arguments
 }
 
 private struct CLIOptions {
@@ -878,14 +874,14 @@ private actor TerminalApprovalHandler: ApprovalHandler {
 @main
 struct MaiCLI {
   static func main() async {
-    let commandLineArguments = platformCommandLineArguments()
+    let environment = ProcessInfo.processInfo.environment
+    let commandLineArguments = platformCommandLineArguments(environment: environment)
     if commandLineArguments.dropFirst().contains(where: { $0 == "--help" || $0 == "-h" }) {
       printUsage()
       return
     }
 
     do {
-      let environment = ProcessInfo.processInfo.environment
       let options = try CLIOptions(
         arguments: Array(commandLineArguments.dropFirst()),
         environment: environment)
