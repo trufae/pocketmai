@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#a8b9e6">
+    <meta name="description" content="PocketMai is a native iOS AI app and a powerful macOS, Linux, and Android CLI built on the open-source MaiCore framework.">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="PocketMai — iOS app and agent CLI">
+    <meta property="og:description" content="PocketMai brings MaiCore to iOS, macOS, Linux, and Android.">
+    <meta name="twitter:card" content="summary">
+    <title>PocketMai — iOS app and agent CLI</title>
+    <link rel="icon" href="icon-192.png" sizes="192x192">
+    <link rel="apple-touch-icon" href="icon-192.png">
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header" data-header>
+      <a class="brand" href="#top" aria-label="PocketMai home">
+        <span class="brand-mark"><img src="mai-logo.png" alt=""></span>
+        <span>PocketMai</span>
+      </a>
+      <button class="menu-button" type="button" aria-expanded="false" aria-controls="site-nav" data-menu-button>
+        <span>Menu</span><i aria-hidden="true"></i>
+      </button>
+      <nav class="site-nav" id="site-nav" aria-label="Main navigation" data-nav>
+        <a href="#why">Why PocketMai</a>
+        <a href="#platforms">Platforms</a>
+        <a href="#local">Local-first</a>
+        <a href="https://www.swift.org/" target="_blank" rel="noreferrer">Swift ↗</a>
+        <a href="https://github.com/trufae/pocketmai" target="_blank" rel="noreferrer">GitHub ↗</a>
+        <a class="nav-download" href="#get">Download ↓</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero section-shell" id="top">
+        <div class="hero-copy reveal">
+          <div class="hero-badges">
+            <p class="eyebrow">PocketMai · open source · powered by MaiCore</p>
+            <a class="swift-top" href="https://www.swift.org/" target="_blank" rel="noreferrer">
+              <img src="swift.svg" alt="Swift programming language"><span>↗</span>
+            </a>
+          </div>
+          <h1>PocketMai, from phone to shell.</h1>
+          <p class="hero-lede">
+            A native iOS app and an agent CLI for macOS, Linux, and Android.
+            Choose the model, decide which tools it can use, steer every subagent,
+            and keep your conversations on your terms.
+          </p>
+          <a class="source-link" href="https://github.com/trufae/pocketmai" target="_blank" rel="noreferrer">
+            Open source on GitHub <span>↗</span>
+          </a>
+        </div>
+
+        <div class="hero-interfaces reveal" id="platforms">
+          <div class="interface-heading">
+            <p class="kicker">Two interfaces</p>
+            <strong>The same MaiCore engine in the app and the terminal.</strong>
+          </div>
+
+          <article class="interface-card ios-interface">
+            <div class="platform-title">
+              <img src="icon-192.png" alt="PocketMai app icon">
+              <div><span>iOS app</span><h2>PocketMai</h2></div>
+            </div>
+            <p>Native conversations, voice, documents, OCR, browser handoff, and background replies.</p>
+            <a href="https://apps.apple.com/es/app/pocketmai/id6764296742">Download on the App Store ↗</a>
+          </article>
+
+          <article class="interface-card cli-interface" id="get">
+            <div class="platform-title">
+              <span class="terminal-mark" aria-hidden="true">›_</span>
+              <div><span>macOS · Linux · Android</span><h2>pmai CLI</h2></div>
+            </div>
+            <p>Terminal-native chat, tools, memory, skills, protocols, and full agent supervision.</p>
+            <div class="command-box">
+              <span class="shell-prompt" aria-hidden="true">$</span>
+              <code id="install-command">curl -fsSL https://raw.githubusercontent.com/trufae/pocketmai/main/www/install.sh | sh</code>
+              <button class="copy-button" type="button" data-copy aria-label="Copy install command"><span data-copy-label>Copy</span></button>
+            </div>
+            <small>One command for all three platforms · no root · verified download</small>
+          </article>
+        </div>
+
+        <div class="platform-line reveal" aria-label="PocketMai platforms">
+          <span>One shared core</span><b>iOS app</b><i></i><b>macOS CLI</b><i></i><b>Linux CLI</b><i></i><b>Android CLI</b>
+        </div>
+      </section>
+
+      <section class="why" id="why">
+        <div class="section-shell">
+          <div class="section-heading reveal">
+            <p class="kicker">Why PocketMai</p>
+            <h2>Agents you can inspect, steer, and stop.</h2>
+            <p>See the work, change direction, and set clear boundaries.</p>
+          </div>
+
+          <div class="feature-grid">
+            <article class="feature feature-main reveal">
+              <p class="feature-label">Full subagent control</p>
+              <h3>See and steer every subagent.</h3>
+              <p>Follow the whole agent tree and each child’s output, transcript, status, and usage. Send a message, focus one agent, pause and continue it, or stop a branch.</p>
+              <ul>
+                <li>Per-agent model, prompt, and tools</li>
+                <li>Fair queues for busy slots</li>
+                <li>Depth, count, turn, tool, token, and time limits</li>
+              </ul>
+              <div class="command-tags" aria-label="Subagent commands">
+                <code>/agents tree</code><code>@3 steer this work</code><code>/agents stop 3</code>
+              </div>
+            </article>
+
+            <article class="feature reveal">
+              <p class="feature-label">Editable context</p>
+              <h3>Change the conversation when you need to.</h3>
+              <p>Edit, undo, trim, archive, search, or compact with a focus. Linked tool calls stay valid.</p>
+            </article>
+
+            <article class="feature reveal">
+              <p class="feature-label">Live steering</p>
+              <h3>Add instructions while it is working.</h3>
+              <p>New guidance joins at the next safe boundary without throwing away progress.</p>
+            </article>
+
+            <article class="feature reveal">
+              <p class="feature-label">Clear permissions</p>
+              <h3>Decide what each tool may do.</h3>
+              <p>Allow once, always allow, edit arguments, deny, or cancel. Each agent sees only what you enabled.</p>
+            </article>
+
+            <article class="feature reveal">
+              <p class="feature-label">Your stack</p>
+              <h3>Use the models you already trust.</h3>
+              <p>Apple Intelligence, OpenAI-compatible providers, local models, skills, plugins, MCP, and ACP.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="local section-shell" id="local">
+        <div class="section-heading reveal">
+          <p class="kicker">Local-first</p>
+          <h2>Local models and offline conversations.</h2>
+          <p>Keep the model, documents, memory, and useful tools close to you.</p>
+        </div>
+
+        <div class="local-grid">
+          <article class="local-card local-lead reveal">
+            <span>Private by architecture</span>
+            <h3>Local conversations are first-class.</h3>
+            <p>With an on-device or local provider selected, normal conversations, project memory, attachments, OCR, and local tools can stay off the internet.</p>
+            <div><b>No cloud account</b><b>No remote transcript</b><b>No connection</b></div>
+          </article>
+
+          <article class="local-card reveal">
+            <span>Local inference</span>
+            <h3>Run the model on your hardware.</h3>
+            <p>Use Apple Intelligence on device, local MLX models on supported iPhones, or connect to Ollama, llama.cpp, and other local endpoints.</p>
+          </article>
+
+          <article class="local-card reveal">
+            <span>Tools for smaller models</span>
+            <h3>Spend context on the task, not tool schemas.</h3>
+            <p>Native calls when available; JSON, XML, and text fallbacks when they are not. The hybrid tool proxy keeps the common tools direct and the long tail compact.</p>
+          </article>
+
+          <article class="local-card reveal">
+            <span>On-device OCR</span>
+            <h3>Read documents without uploading them.</h3>
+            <p>Read images and scanned documents with Apple Vision, or use a local Tesseract installation from the CLI—without uploading the page.</p>
+          </article>
+
+          <article class="local-card reveal">
+            <span>Durable conversations</span>
+            <h3>Your local workspace remembers.</h3>
+            <p>Chats, system prompts, project memory, todos, and context controls remain available locally between sessions.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="final-cta">
+        <div class="section-shell reveal">
+          <img src="mai-logo.png" alt="">
+          <div><p class="kicker">Pocket-sized. Mai-ghty capable.</p><h2>App or terminal. Your call.</h2></div>
+          <div class="final-actions">
+            <a href="https://apps.apple.com/es/app/pocketmai/id6764296742">Get the iOS app ↗</a>
+            <a href="#get">Install the CLI ↑</a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-brand"><img src="mai-logo.png" alt=""><strong>PocketMai</strong></div>
+      <div class="footer-links">
+        <a href="https://github.com/trufae/pocketmai">GitHub</a>
+        <a href="https://github.com/trufae/pocketmai/releases">Releases</a>
+        <a href="https://github.com/trufae/pocketmai/blob/main/LICENSE.txt">License</a>
+      </div>
+      <p>Open source, built with Swift, powered by MaiCore. <span>© <b data-year>2026</b></span></p>
+    </footer>
+  </body>
+</html>

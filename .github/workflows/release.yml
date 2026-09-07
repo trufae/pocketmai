@@ -22,6 +22,14 @@ jobs:
             name: Linux arm64
             target: linux-arm64
             runner_arch: aarch64
+          - os: macos-26-intel
+            name: macOS x64
+            target: macos-x64
+            runner_arch: x86_64
+          - os: macos-26
+            name: macOS arm64
+            target: macos-arm64
+            runner_arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -32,22 +40,85 @@ jobs:
           swift --version
           test "$(uname -m)" = "${{ matrix.runner_arch }}"
 
+      - name: Install Linux static-link dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libxml2-dev
+
       - name: Build release CLI
         run: |
-          swift build --package-path MaiCore -c release --product pmai -Xswiftc -Osize
-          strip -x MaiCore/.build/release/pmai
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            swift build --package-path MaiCore -c release --product pmai \
+              --static-swift-stdlib -Xswiftc -Osize
+            strip -s MaiCore/.build/release/pmai
+          else
+            swift build --package-path MaiCore -c release --product pmai -Xswiftc -Osize
+            strip -x MaiCore/.build/release/pmai
+          fi
 
       - name: Package CLI
         run: |
-          asset="pmai-${{ matrix.target }}.tar.gz"
-          tar -czf "$asset" -C MaiCore/.build/release pmai
-          tar -tzf "$asset"
+          asset="pmai-${{ matrix.target }}.zip"
+          zip -j "$asset" MaiCore/.build/release/pmai
+          unzip -l "$asset"
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v7
         with:
           name: pmai-${{ matrix.target }}
-          path: pmai-${{ matrix.target }}.tar.gz
+          path: pmai-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  android-cli:
+    name: CLI (Android arm64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Swift 6.3.3
+        uses: swift-actions/setup-swift@v3
+        with:
+          swift-version: "6.3.3"
+
+      - name: Install Android NDK and Swift SDK
+        run: |
+          set -eu
+          ndk="$RUNNER_TEMP/android-ndk-r27d"
+          curl -fL -o "$RUNNER_TEMP/android-ndk.zip" \
+            https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q "$RUNNER_TEMP/android-ndk.zip" -d "$RUNNER_TEMP"
+
+          swift sdk install \
+            https://download.swift.org/swift-6.3.3-release/android-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_android.artifactbundle.tar.gz \
+            --checksum d160cc3206dd1886dae3fef2337af5e25ec034692cd0ec225721c56cc69da7f5
+          swift_sdk_root="${XDG_CONFIG_HOME:-$HOME/.config}/swiftpm/swift-sdks"
+          android_sdk="$swift_sdk_root/swift-6.3.3-RELEASE_android.artifactbundle/swift-android"
+          ANDROID_NDK_HOME="$ndk" bash "$android_sdk/scripts/setup-android-sdk.sh"
+
+      - name: Build Android arm64 release CLI
+        run: |
+          swift build --package-path MaiCore -c release --product pmai \
+            --swift-sdk aarch64-unknown-linux-android28 --static-swift-stdlib \
+            -Xswiftc -Osize
+
+      - name: Package Android CLI
+        run: |
+          set -eu
+          package="$RUNNER_TEMP/pmai-android-arm64"
+          mkdir -p "$package"
+          cp MaiCore/.build/aarch64-unknown-linux-android28/release/pmai "$package/pmai"
+          cp "$RUNNER_TEMP/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$package/"
+          "$RUNNER_TEMP/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" -x "$package/pmai"
+          (cd "$package" && zip -9 "$GITHUB_WORKSPACE/pmai-android-arm64.zip" pmai libc++_shared.so)
+          unzip -l pmai-android-arm64.zip
+
+      - name: Upload Android CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pmai-android-arm64
+          path: pmai-android-arm64.zip
           if-no-files-found: error
 
   ipa:
@@ -109,7 +180,7 @@ jobs:
 
   release:
     name: Publish GitHub release
-    needs: [cli, ipa]
+    needs: [cli, android-cli, ipa]
     runs-on: ubuntu-latest
     steps:
       - name: Download release artifacts
@@ -118,6 +189,11 @@ jobs:
           path: release-assets
           pattern: "*"
           merge-multiple: true
+
+      - name: Generate CLI checksums
+        run: |
+          cd release-assets
+          sha256sum pmai-*.zip > SHA256SUMS
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
