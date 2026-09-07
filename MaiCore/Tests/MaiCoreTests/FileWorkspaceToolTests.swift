@@ -131,6 +131,13 @@ func fileWorkspaceSearchUsesCodingFriendlyDefaults() async throws {
 
   let normalGrep = try await call(grep, ["query": .string("needle")])
   #expect(normalGrep.structuredContent?.objectValue?["scannedFiles"] == .integer(2))
+
+  // A search that stops at the match limit says so in the text the model reads.
+  try Data(String(repeating: "needle here\n", count: 150).utf8)
+    .write(to: root.appendingPathComponent("Sources/Many.swift"))
+  let capped = try await call(grep, ["query": .string("needle")])
+  #expect(capped.text.contains("Stopped after 100 matching lines; more exist."))
+  #expect(capped.structuredContent?.objectValue?["truncated"] == .bool(true))
 }
 
 #if os(macOS) || os(Linux)
