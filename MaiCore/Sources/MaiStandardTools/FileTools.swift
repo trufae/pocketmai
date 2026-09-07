@@ -141,24 +141,18 @@ public struct MaiFileWorkspaceTool: AgentTool {
     for operation: Operation,
     workspaceName: String
   ) -> ToolDefinition {
-    let path = ToolParameterDef(
-      name: "path",
-      type: "string",
-      description:
-        "File path relative to the current directory, or an absolute path inside the workspace.",
-      required: true)
+    let path = ToolParameterDef(name: "path", type: "string", description: "File path.", required: true)
     switch operation {
     case .list:
       return ToolDefinition(
         name: operation.rawValue,
         description:
-          "List a folder in the configured workspace '\(workspaceName)'. The last path component may be a pattern such as src/*.c to list only matching entries.",
+          "List a folder of the workspace '\(workspaceName)'. Paths are relative to the current directory or absolute inside it. The last component may be a pattern such as src/*.c.",
         parameters: [
           ToolParameterDef(
             name: "path",
             type: "string",
-            description:
-              "Folder to list, relative to the current directory or absolute inside the workspace, optionally ending in a name pattern (*.swift, src/*.c). Omit for the current directory.",
+            description: "Folder to list. Omit for the current directory.",
             required: false)
         ],
         annotations: ToolAnnotations(
@@ -167,36 +161,18 @@ public struct MaiFileWorkspaceTool: AgentTool {
       return ToolDefinition(
         name: operation.rawValue,
         description:
-          "Find files and folders by an approximate name or a glob pattern in '\(workspaceName)'. By default this searches project source using Git or Mercurial ignore rules when available, and otherwise skips hidden, dependency, build, and cache directories.",
+          "Find files and folders by approximate name or glob, skipping ignored, hidden, build, and dependency paths.",
         parameters: [
           ToolParameterDef(
             name: "query",
             type: "string",
             description:
-              "Exact, partial, or fuzzy file name or relative path, or a glob: *.swift matches names at any depth, src/*.c only files directly in src, src/**/*.c files anywhere below it; ? is one character, [ab] a set, {a,b} alternatives.",
+              "File name, partial path, or glob: *.swift at any depth, src/*.c directly in src, src/**/*.c below it.",
             required: true),
           ToolParameterDef(
             name: "path",
             type: "string",
-            description:
-              "Folder to search, relative to the current directory or absolute inside the workspace. Omit for the current directory.",
-            required: false),
-          ToolParameterDef(
-            name: "depth",
-            type: "integer",
-            description:
-              "Maximum result depth below path, 1-100. Depth 1 searches only direct children. Omit for any depth.",
-            required: false),
-          ToolParameterDef(
-            name: "include_ignored",
-            type: "boolean",
-            description:
-              "Also search hidden, VCS-ignored, dependency, build, and cache paths. Default: false.",
-            required: false),
-          ToolParameterDef(
-            name: "limit",
-            type: "integer",
-            description: "Maximum results, 1-500. Default: 100.",
+            description: "Folder to search. Omit for the current directory.",
             required: false),
         ],
         annotations: ToolAnnotations(
@@ -205,7 +181,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
       return ToolDefinition(
         name: operation.rawValue,
         description:
-          "Search UTF-8 files for text or a regular expression in '\(workspaceName)'. By default this searches project source using Git or Mercurial ignore rules when available, and otherwise skips hidden, dependency, build, and cache directories.",
+          "Search text files for a string or regular expression (smart case, first 100 matching lines), skipping ignored, hidden, build, and dependency paths.",
         parameters: [
           ToolParameterDef(
             name: "query",
@@ -215,41 +191,17 @@ public struct MaiFileWorkspaceTool: AgentTool {
           ToolParameterDef(
             name: "path",
             type: "string",
-            description:
-              "File or folder to search, relative to the current directory or absolute inside the workspace; a pattern such as src/*.c searches the matching files. Omit for the current directory.",
+            description: "File or folder to search; a pattern such as src/*.c searches matching files. Omit for the current directory.",
             required: false),
           ToolParameterDef(
             name: "glob",
             type: "string",
-            description:
-              "Only search files whose name or relative path matches this pattern, for example *.swift or src/**/*.c.",
+            description: "Only files matching this pattern, for example *.swift or src/**/*.c.",
             required: false),
           ToolParameterDef(
             name: "regex",
             type: "boolean",
             description: "Interpret query as a regular expression. Default: false.",
-            required: false),
-          ToolParameterDef(
-            name: "case_sensitive",
-            type: "boolean",
-            description: "Use case-sensitive matching. Default: smart case.",
-            required: false),
-          ToolParameterDef(
-            name: "depth",
-            type: "integer",
-            description:
-              "Maximum file depth below path, 1-100. Depth 1 searches only direct files. Omit for any depth.",
-            required: false),
-          ToolParameterDef(
-            name: "include_ignored",
-            type: "boolean",
-            description:
-              "Also search hidden, VCS-ignored, dependency, build, and cache paths. Default: false.",
-            required: false),
-          ToolParameterDef(
-            name: "limit",
-            type: "integer",
-            description: "Maximum matching lines, 1-500. Default: 100.",
             required: false),
         ],
         annotations: ToolAnnotations(
@@ -257,8 +209,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
     case .read:
       return ToolDefinition(
         name: operation.rawValue,
-        description:
-          "Read a text file in the configured workspace '\(workspaceName)'. PDF and DOCX files are converted to Markdown.",
+        description: "Read a text file. PDF and DOCX are converted to Markdown.",
         parameters: [
           path,
           ToolParameterDef(
@@ -269,7 +220,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
           ToolParameterDef(
             name: "offset",
             type: "integer",
-            description: "Byte offset for continuing a large file. Default: 0.",
+            description: "Byte offset to continue a long file. Default: 0.",
             required: false),
         ],
         annotations: ToolAnnotations(
@@ -278,7 +229,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
       return ToolDefinition(
         name: operation.rawValue,
         description:
-          "List functions and types in source files, or headings in documents, with 1-based line numbers in '\(workspaceName)'.",
+          "List the functions and types of a source file, or the headings of a document, with line numbers.",
         parameters: [path],
         annotations: ToolAnnotations(
           readOnly: true, idempotent: true, openWorld: false, approval: .confirm))
@@ -286,7 +237,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
       return ToolDefinition(
         name: operation.rawValue,
         description:
-          "Read one function from a source file in '\(workspaceName)' and report its line and UTF-8 byte bounds. Supports common brace, indentation, and end-delimited languages, including HolyC. Returns a revision required by files_set_function.",
+          "Read one function of a source file with its line bounds and the revision files_set_function needs.",
         parameters: [
           path,
           ToolParameterDef(
@@ -304,7 +255,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
       return ToolDefinition(
         name: operation.rawValue,
         description:
-          "Atomically replace only a named function body in a source file in '\(workspaceName)'. Uses the latest file contents so edits to other functions are preserved, rejects stale revisions, validates the new structural bounds, and returns a unified diff.",
+          "Replace the body of one function read with files_get_function, rejecting a stale revision, and return a unified diff.",
         parameters: [
           path,
           ToolParameterDef(
@@ -314,12 +265,11 @@ public struct MaiFileWorkspaceTool: AgentTool {
           ToolParameterDef(
             name: "body", type: "string",
             description:
-              "Complete replacement body between the existing braces or declaration/end lines, including desired whitespace and indentation but excluding the delimiters.",
+              "Complete new body between the existing delimiters, with its indentation.",
             required: true),
           ToolParameterDef(
             name: "revision", type: "string",
-            description:
-              "Current body revision returned by files_get_function. The write fails if that function changed.",
+            description: "Revision returned by files_get_function.",
             required: true),
           ToolParameterDef(
             name: "line", type: "integer",
@@ -331,7 +281,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
     case .readRange:
       return ToolDefinition(
         name: operation.rawValue,
-        description: "Read a 1-based inclusive line range from a file in '\(workspaceName)'.",
+        description: "Read a 1-based inclusive line range of a file.",
         parameters: [
           path,
           ToolParameterDef(
@@ -347,7 +297,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
       return ToolDefinition(
         name: operation.rawValue,
         description:
-          "Replace a 1-based inclusive line range in a UTF-8 text file in '\(workspaceName)'. Set end_line to start_line - 1 to insert; omit content to delete.",
+          "Replace a 1-based inclusive line range. Set end_line to start_line - 1 to insert; omit content to delete. Prefer files_patch when the text to change is known.",
         parameters: [
           path,
           ToolParameterDef(
@@ -367,13 +317,13 @@ public struct MaiFileWorkspaceTool: AgentTool {
       return ToolDefinition(
         name: operation.rawValue,
         description:
-          "Patch a UTF-8 text file in '\(workspaceName)' by replacing a unique literal string or regular-expression match. This avoids fragile byte and line offsets.",
+          "Edit a text file by replacing a literal string or regular-expression match; returns a unified diff.",
         parameters: [
           path,
           ToolParameterDef(
             name: "find", type: "string",
             description:
-              "Exact text to find, or a regular expression when regex is true. Must match exactly expected_matches times.",
+              "Exact text to find, or a regular expression when regex is true. Must match exactly expected_matches times (default once).",
             required: true),
           ToolParameterDef(
             name: "replace", type: "string",
@@ -392,14 +342,13 @@ public struct MaiFileWorkspaceTool: AgentTool {
       return ToolDefinition(
         name: operation.rawValue,
         description:
-          "Create a new UTF-8 file, append to a file, or create a folder in '\(workspaceName)'. Replacing an existing file's ENTIRE contents requires overwrite: true. Never use this to modify only part of an existing file: use files_patch (preferred) or files_replace_range instead.",
+          "Create a file, append to one, or create a folder. Replacing an existing file needs overwrite: true; to change part of a file use files_patch instead.",
         parameters: [
           path,
           ToolParameterDef(
             name: "content",
             type: "string",
-            description:
-              "The complete contents of the file, unless append is true. Omit only when create_directory is true.",
+            description: "The complete contents, or the text to append. Omit for a folder.",
             required: false),
           ToolParameterDef(
             name: "append",
@@ -409,8 +358,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
           ToolParameterDef(
             name: "overwrite",
             type: "boolean",
-            description:
-              "Required to replace an existing non-empty file. Prefer files_patch for partial edits. Default: false.",
+            description: "Replace an existing non-empty file. Default: false.",
             required: false),
           ToolParameterDef(
             name: "create_directory",
@@ -423,21 +371,17 @@ public struct MaiFileWorkspaceTool: AgentTool {
     case .rename:
       return ToolDefinition(
         name: operation.rawValue,
-        description: "Rename or move a file or folder within '\(workspaceName)'.",
+        description: "Rename or move a file or folder.",
         parameters: [
           path,
-          ToolParameterDef(
-            name: "new_path",
-            type: "string",
-            description: "New path relative to the same workspace.",
-            required: true),
+          ToolParameterDef(name: "new_path", type: "string", description: "New path.", required: true),
         ],
         annotations: ToolAnnotations(
           readOnly: false, idempotent: false, openWorld: false, approval: .confirm))
     case .delete:
       return ToolDefinition(
         name: operation.rawValue,
-        description: "Delete a file or folder within '\(workspaceName)'.",
+        description: "Delete a file or folder.",
         parameters: [
           path,
           ToolParameterDef(
@@ -481,6 +425,8 @@ private struct MaiFileWorkspace: Sendable {
   private static let maximumEditableFileBytes = 10_000_000
   private static let maximumSourceFileBytes = 50_000_000
   private static let maximumListEntries = 500
+  /// Matches returned by find and grep; a model that needs more narrows the query.
+  static let searchLimit = 100
   private static let maximumSearchEntries = 10_000
   private static let searchResourceKeys: Set<URLResourceKey> = [
     .fileSizeKey, .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
@@ -587,9 +533,7 @@ private struct MaiFileWorkspace: Sendable {
     try requireDirectory(directory, displayPath: displayPath(rawPath))
     let glob = try globPattern(query)
     let base = relativePath(directory)
-    let limit = boundedLimit(arguments["limit"]?.intValue, default: 100)
-    let depth = try searchDepth(arguments)
-    let includeIgnored = arguments["include_ignored"]?.coercedBoolValue == true
+    let limit = Self.searchLimit
     var matches: [(url: URL, score: Int, kind: String)] = []
     var scanned = 0
     var hitScanLimit = false
@@ -617,10 +561,9 @@ private struct MaiFileWorkspace: Sendable {
       return true
     }
     let searchMethod: String
-    if !includeIgnored,
-      let controlled = try await versionControlledEntries(
-        at: directory, maximumDepth: depth, includeDirectories: true,
-        limit: Self.maximumSearchEntries + 1)
+    if let controlled = try await versionControlledEntries(
+      at: directory, includeDirectories: true,
+      limit: Self.maximumSearchEntries + 1)
     {
       searchMethod = controlled.name
       hitScanLimit = controlled.truncated
@@ -629,10 +572,8 @@ private struct MaiFileWorkspace: Sendable {
         guard try visit(url, values, nil) else { break }
       }
     } else {
-      searchMethod = includeIgnored ? "filesystem" : "filtered-filesystem"
-      try enumerateFiles(
-        at: directory, maximumDepth: depth, includeIgnored: includeIgnored
-      ) { url, values, enumerator in
+      searchMethod = "filtered-filesystem"
+      try enumerateFiles(at: directory) { url, values, enumerator in
         try visit(url, values, enumerator)
       }
     }
@@ -703,11 +644,8 @@ private struct MaiFileWorkspace: Sendable {
     }
     let target = try resolve(rawPath, allowRoot: true, mustExist: true)
     let base = relativePath(target)
-    let limit = boundedLimit(arguments["limit"]?.intValue, default: 100)
-    let depth = try searchDepth(arguments)
-    let includeIgnored = arguments["include_ignored"]?.coercedBoolValue == true
-    let caseSensitive =
-      arguments["case_sensitive"]?.coercedBoolValue ?? query.contains(where: \.isUppercase)
+    let limit = Self.searchLimit
+    let caseSensitive = query.contains(where: \.isUppercase)
     let useRegex = arguments["regex"]?.coercedBoolValue == true
     let expression: NSRegularExpression?
     if useRegex {
@@ -777,10 +715,9 @@ private struct MaiFileWorkspace: Sendable {
     ])
     var searchMethod = "file"
     if targetValues.isDirectory == true {
-      if !includeIgnored,
-        let controlled = try await versionControlledEntries(
-          at: target, maximumDepth: depth, includeDirectories: false,
-          limit: Self.maximumSearchEntries + 1)
+      if let controlled = try await versionControlledEntries(
+        at: target, includeDirectories: false,
+        limit: Self.maximumSearchEntries + 1)
       {
         searchMethod = controlled.name
         if controlled.truncated { hitLimit = true }
@@ -789,10 +726,8 @@ private struct MaiFileWorkspace: Sendable {
           guard try scanFile(url, values) else { break }
         }
       } else {
-        searchMethod = includeIgnored ? "filesystem" : "filtered-filesystem"
-        try enumerateFiles(
-          at: target, maximumDepth: depth, includeIgnored: includeIgnored
-        ) { url, values, enumerator in
+        searchMethod = "filtered-filesystem"
+        try enumerateFiles(at: target) { url, values, enumerator in
           let shouldContinue = try scanFile(url, values)
           if !shouldContinue { enumerator.skipDescendants() }
           return shouldContinue
@@ -1364,28 +1299,20 @@ private struct MaiFileWorkspace: Sendable {
 
   private func enumerateFiles(
     at directory: URL,
-    maximumDepth: Int? = nil,
-    includeIgnored: Bool = false,
     _ visit: (URL, URLResourceValues, FileManager.DirectoryEnumerator) throws -> Bool
   ) throws {
-    let options: FileManager.DirectoryEnumerationOptions =
-      includeIgnored ? [] : [.skipsHiddenFiles, .skipsPackageDescendants]
     guard
       let enumerator = FileManager.default.enumerator(
         at: directory,
         includingPropertiesForKeys: Array(Self.searchResourceKeys),
-        options: options)
+        options: [.skipsHiddenFiles, .skipsPackageDescendants])
     else {
       throw MaiFileWorkspaceError.notDirectory(relativePath(directory))
     }
     while let url = enumerator.nextObject() as? URL {
       try Task.checkCancellation()
       let values = try url.resourceValues(forKeys: Self.searchResourceKeys)
-      if let maximumDepth, pathDepth(of: url, below: directory) > maximumDepth {
-        if values.isDirectory == true { enumerator.skipDescendants() }
-        continue
-      }
-      if !includeIgnored, shouldExcludeFromSourceSearch(url, values: values, below: directory) {
+      if shouldExcludeFromSourceSearch(url, values: values, below: directory) {
         if values.isDirectory == true { enumerator.skipDescendants() }
         continue
       }
@@ -1411,7 +1338,6 @@ private struct MaiFileWorkspace: Sendable {
   /// use the portable filtered filesystem walk instead.
   private func versionControlledEntries(
     at directory: URL,
-    maximumDepth: Int?,
     includeDirectories: Bool,
     limit: Int
   ) async throws -> VersionControlledEntries? {
@@ -1479,10 +1405,7 @@ private struct MaiFileWorkspace: Sendable {
         }
       }
 
-      let eligible = candidates.filter { candidate in
-        maximumDepth.map { pathDepth(of: candidate, below: directory) <= $0 } ?? true
-      }
-      .sorted {
+      let eligible = candidates.sorted {
         $0.path.localizedStandardCompare($1.path) == .orderedAscending
       }
       let selected = eligible.prefix(limit)
@@ -1517,12 +1440,6 @@ private struct MaiFileWorkspace: Sendable {
     return nil
   }
 
-  private func searchDepth(_ arguments: [String: JSONValue]) throws -> Int? {
-    guard let depth = arguments["depth"]?.intValue else { return nil }
-    guard (1...100).contains(depth) else { throw MaiFileWorkspaceError.invalidSearchDepth }
-    return depth
-  }
-
   private func shouldExcludeFromSourceSearch(
     _ url: URL,
     values: URLResourceValues,
@@ -1537,9 +1454,6 @@ private struct MaiFileWorkspace: Sendable {
     }
   }
 
-  private func pathDepth(of url: URL, below directory: URL) -> Int {
-    path(relativeTo: directory, child: url)?.split(separator: "/").count ?? .max
-  }
 
   private func path(relativeTo directory: URL, child: URL) -> String? {
     let parentPath = directory.standardizedFileURL.path
@@ -1568,10 +1482,6 @@ private struct MaiFileWorkspace: Sendable {
     else {
       throw MaiFileWorkspaceError.notDirectory(displayPath)
     }
-  }
-
-  private func boundedLimit(_ requested: Int?, default defaultValue: Int) -> Int {
-    min(max(requested ?? defaultValue, 1), 500)
   }
 
   private func textWindow(
@@ -1719,7 +1629,6 @@ private enum MaiFileWorkspaceError: LocalizedError {
   case writeDisabled
   case invalidPattern(String)
   case invalidGlob(String)
-  case invalidSearchDepth
   case invalidMatchCount
   case emptyPatchMatch
   case patchMatchCount(Int, Int)
@@ -1753,7 +1662,6 @@ private enum MaiFileWorkspaceError: LocalizedError {
     case .writeDisabled: "File changes are disabled for this tool source."
     case .invalidPattern(let detail): "Invalid regular expression: \(detail)"
     case .invalidGlob(let message): "Invalid pattern: \(message)"
-    case .invalidSearchDepth: "depth must be between 1 and 100."
     case .invalidMatchCount: "expected_matches must be between 1 and 100."
     case .emptyPatchMatch: "The regular expression must not match an empty range."
     case .patchMatchCount(let expected, let actual):

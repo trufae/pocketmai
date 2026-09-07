@@ -87,7 +87,7 @@ func fileWorkspaceToolsManageFiles() async throws {
     !FileManager.default.fileExists(atPath: root.appendingPathComponent("notes/done.md").path))
 }
 
-@Test("Files search defaults to source paths and supports bounded exhaustive search")
+@Test("Files search covers source paths and offers only the arguments a model needs")
 func fileWorkspaceSearchUsesCodingFriendlyDefaults() async throws {
   let root = FileManager.default.temporaryDirectory
     .appendingPathComponent("mai-files-search-\(UUID().uuidString)", isDirectory: true)
@@ -112,10 +112,9 @@ func fileWorkspaceSearchUsesCodingFriendlyDefaults() async throws {
     configuration: MaiFileWorkspaceConfiguration(rootURL: root))
   let find = tool(tools, .find)
   let grep = tool(tools, .grep)
-  #expect(find.definition.parameters.contains { $0.name == "depth" })
-  #expect(find.definition.parameters.contains { $0.name == "include_ignored" })
-  #expect(grep.definition.parameters.contains { $0.name == "depth" })
-  #expect(grep.definition.parameters.contains { $0.name == "include_ignored" })
+  // Only the arguments a model needs are offered; the rest are fixed defaults.
+  #expect(Set(find.definition.parameters.map(\.name)) == ["query", "path"])
+  #expect(Set(grep.definition.parameters.map(\.name)) == ["query", "path", "glob", "regex"])
 
   let normal = try await call(find, ["query": .string("Needle.swift")])
   let normalPaths = Set(
@@ -130,35 +129,8 @@ func fileWorkspaceSearchUsesCodingFriendlyDefaults() async throws {
   #expect(
     normal.structuredContent?.objectValue?["searchMethod"] == .string("filtered-filesystem"))
 
-  let shallow = try await call(
-    find, ["query": .string("Needle.swift"), "depth": .integer(2)])
-  let shallowPaths = Set(
-    shallow.structuredContent?.objectValue?["matches"]?.arrayValue?.compactMap {
-      $0.objectValue?["path"]?.stringValue
-    } ?? [])
-  #expect(shallowPaths.contains("Sources/Needle.swift"))
-  #expect(!shallowPaths.contains("Sources/Nested/Needle.swift"))
-
-  let exhaustive = try await call(
-    find, ["query": .string("Needle.swift"), "include_ignored": .bool(true)])
-  let exhaustivePaths = Set(
-    exhaustive.structuredContent?.objectValue?["matches"]?.arrayValue?.compactMap {
-      $0.objectValue?["path"]?.stringValue
-    } ?? [])
-  #expect(exhaustivePaths.contains("node_modules/package/Needle.swift"))
-  #expect(exhaustivePaths.contains("build/Needle.swift"))
-  #expect(exhaustivePaths.contains(".cache/Needle.swift"))
-
   let normalGrep = try await call(grep, ["query": .string("needle")])
   #expect(normalGrep.structuredContent?.objectValue?["scannedFiles"] == .integer(2))
-  let exhaustiveGrep = try await call(
-    grep, ["query": .string("needle"), "include_ignored": .bool(true)])
-  #expect(exhaustiveGrep.structuredContent?.objectValue?["scannedFiles"] == .integer(5))
-
-  let invalidDepth = try await call(
-    find, ["query": .string("Needle.swift"), "depth": .integer(0)])
-  #expect(invalidDepth.isError)
-  #expect(invalidDepth.text.contains("depth must be between 1 and 100"))
 }
 
 #if os(macOS) || os(Linux)
