@@ -991,8 +991,15 @@ private struct MaiFileWorkspace: Sendable {
     try Data(edit.text.utf8).write(to: file, options: .atomic)
     let action =
       edit.removedLineCount == 0 ? "Inserted" : edit.insertedLineCount == 0 ? "Deleted" : "Replaced"
+    // The new numbering is what the next edit needs; without it models
+    // re-read the whole file to find out where their lines ended up.
+    let placed =
+      edit.insertedLineCount == 0
+      ? "lines \(start)-\(max(start, end)) removed"
+      : edit.insertedLineCount == 1
+        ? "now line \(start)" : "now lines \(start)-\(start + edit.insertedLineCount - 1)"
     return mutationOutput(
-      "\(action) lines in \(displayPath(rawPath)); now \(edit.totalLineCount) lines.",
+      "\(action) in \(displayPath(rawPath)): \(placed) of \(edit.totalLineCount).",
       path: rawPath,
       diff: MaiUnifiedDiff.render(old: text, new: edit.text, path: displayPath(rawPath)))
   }
