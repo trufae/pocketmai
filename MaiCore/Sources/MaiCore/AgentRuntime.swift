@@ -4,13 +4,11 @@ import Foundation
 /// and bounded child-agent runs. Hosts own presentation and persistence and
 /// observe work through `AgentEvent` values and the shared `AgentSupervisor`.
 public actor AgentRuntime {
-  public static let agentStartToolName = "agent_start"
-  public static let agentStatusToolName = "agent_status"
-  public static let agentResultToolName = "agent_result"
-  public static let agentStopToolName = "agent_stop"
-  public static let agentToolNames: Set<String> = [
-    agentStartToolName, agentStatusToolName, agentResultToolName, agentStopToolName,
-  ]
+  public static let agentStartToolName = AgentProcessTools.startToolName
+  public static let agentStatusToolName = AgentProcessTools.statusToolName
+  public static let agentResultToolName = AgentProcessTools.resultToolName
+  public static let agentStopToolName = AgentProcessTools.stopToolName
+  public static let agentToolNames: Set<String> = AgentProcessTools.toolNames
   public static let agentToolGroup = ToolGroupDefinition(
     id: "agents",
     sourceID: "runtime",
@@ -20,8 +18,8 @@ public actor AgentRuntime {
   /// Earlier spellings of `agent_start`. They are still executed so existing
   /// configurations and fine-tuned providers keep working, but they are no
   /// longer offered: six near-identical tools only confuse a model.
-  public static let subagentToolName = "spawn_agent"
-  public static let agentLaunchToolName = "agent_launch"
+  public static let subagentToolName = AgentProcessTools.legacySpawnToolName
+  public static let agentLaunchToolName = AgentProcessTools.legacyLaunchToolName
 
   private struct RegisteredMCP: Sendable {
     var source: any MCPToolSource
@@ -995,6 +993,11 @@ public actor AgentRuntime {
 
   // MARK: - The agent_* tool family
 
+  // The family itself lives in `AgentProcessTools`, shared with hosts that run
+  // children through a loop of their own. What stays here is what only the
+  // runtime knows: which definition a name resolves to, the derived worker,
+  // the run budget, and the events a host follows.
+
   private func startAgent(
     _ call: ToolCall,
     legacyName: String,
@@ -1005,20 +1008,13 @@ public actor AgentRuntime {
     emit: @escaping AgentEventHandler
   ) async -> ToolResult {
     let arguments = call.arguments.objectValue ?? [:]
-    // `spawn_agent` took `task`; `agent_launch` took `prompt`. Both become the
-    // task half of a brief with no context and no output contract.
-    let brief =
-      AgentTaskBrief(arguments: arguments)
-      ?? (arguments["prompt"]?.stringValue).map { AgentTaskBrief(task: $0) }
-    guard let brief else {
+    guard let start = AgentProcessTools.StartArguments(arguments: arguments, toolName: legacyName)
+    else {
       return await fail(call, "the brief needs a non-empty 'task'.", parent: parent, emit: emit)
     }
 
-    let requestedAgent = arguments["agent"]?.stringValue?.trimmingCharacters(
-      in: .whitespacesAndNewlines)
-    let narrowedTools = arguments["tools"]?.arrayValue.map { Set($0.compactMap(\.stringValue)) }
     let definition: AgentDefinition
-    if let requestedAgent, !requestedAgent.isEmpty {
+    if let requestedAgent = start.agent {
       guard request.subagentNames.contains(requestedAgent), var named = agents[requestedAgent],
         named.isEnabled
       else {
@@ -1026,13 +1022,10 @@ public actor AgentRuntime {
           call, "agent '\(requestedAgent)' is not available to this agent.",
           parent: parent, emit: emit)
       }
-      if let narrowedTools {
-        let allowed = named.toolNames.intersection(narrowedTools)
-        if !allowed.isEmpty { named.toolNames = allowed }
-      }
+      named.toolNames = start.narrowed(named.toolNames)
       definition = named
     } else if request.toolDelegation.delegatesTools {
-      definition = derivedWorker(for: request, narrowedTo: narrowedTools)
+      definition = derivedWorker(for: request, toolNames: start.narrowed(request.toolNames))
     } else {
       return await fail(
         call,
@@ -1041,7 +1034,6 @@ public actor AgentRuntime {
         parent: parent, emit: emit)
     }
 
-    let wait = arguments["wait"]?.coercedBoolValue ?? (legacyName != Self.agentLaunchToolName)
     guard request.limits.maxSubagents > 0 else {
       return await fail(
         call, "this agent may not start children (limits.maxSubagents is 0).",
@@ -1053,57 +1045,88 @@ public actor AgentRuntime {
         parent: parent, emit: emit)
     }
 
+    let prompt = AgentDelegationPrompt.render(
+      start.brief,
+      agent: definition.id,
+      workingDirectory: FileManager.default.currentDirectoryPath,
+      template: delegationTemplate)
+    let childRequest = self.request(for: definition, messages: [.user(prompt)])
+    let childRunID = UUID()
+    let childDepth = depth + 1
     // A child past the concurrency limit is not refused: it is registered as
     // queued and starts on its own when a sibling ends, so the model can hand
     // out all the work it has and collect the answers as they come.
-    let launched = await launch(
-      definition: definition,
-      brief: brief,
-      parent: parent,
-      depth: depth,
-      limit: request.limits.maxSubagents,
-      budget: budget,
-      background: !wait,
-      emit: emit)
-
-    guard wait else {
-      let slots = request.limits.maxSubagents
-      let text =
-        launched.queued
-        ? "Queued \(definition.id) as \(launched.pid): all \(slots) subagent slot\(slots == 1 ? " is" : "s are") busy, so it starts when one frees up. Poll \(Self.agentStatusToolName), then \(Self.agentResultToolName) with pid \"\(launched.pid.rawValue)\"."
-        : "Started \(definition.id) as \(launched.pid). Poll \(Self.agentStatusToolName), then \(Self.agentResultToolName) with pid \"\(launched.pid.rawValue)\"."
-      let result = ToolResult(
-        callID: call.id,
-        content: [.text(text)],
-        structuredContent: .object([
-          "pid": .string(String(launched.pid.rawValue)),
-          "agent": .string(definition.id),
-          "status": .string(launched.queued ? "queued" : "running"),
-        ]))
-      await emit(.toolFinished(parent, result))
-      return result
-    }
-
-    do {
-      let child = try await withTaskCancellationHandler {
-        try await launched.task.value
-      } onCancel: {
-        launched.task.cancel()
+    let (childPID, admitted) = await AgentProcessTools.register(
+      supervisor: supervisor,
+      runID: childRunID,
+      parent: parent.pid,
+      agentID: definition.id,
+      displayName: definition.displayName,
+      task: start.brief.headline,
+      depth: childDepth,
+      limit: request.limits.maxSubagents)
+    let childContext = AgentEventContext(
+      runID: childRunID,
+      parentRunID: parent.runID,
+      agentID: definition.id,
+      depth: childDepth,
+      pid: childPID)
+    await emit(
+      admitted ? .childStarted(parent, child: childContext) : .childQueued(parent, child: childContext))
+    // Every child's events reach the host, background or not, tagged with the
+    // child's own context and pid. How they are shown — prefixed, folded into
+    // one line, or dropped — is the host's call, not the runtime's. The child
+    // runs in a task of its own, so `agent_stop` kills a blocking child the
+    // same way it kills a background one.
+    let task = Task {
+      try await AgentProcessTools.run(
+        childPID,
+        supervisor: supervisor,
+        limit: request.limits.maxSubagents,
+        admitted: admitted,
+        background: !start.wait,
+        queueDeadline: budget.deadline.map {
+          AgentProcessTools.QueueDeadline(instant: $0, interruption: budget.timeInterruption)
+        },
+        onAdmitted: { await emit(.childStarted(parent, child: childContext)) }
+      ) {
+        try await self.runInternal(
+          childRequest,
+          runID: childRunID,
+          pid: childPID,
+          parentRunID: parent.runID,
+          depth: childDepth,
+          budget: budget,
+          emit: emit)
       }
-      await supervisor.collect(launched.pid)
-      await emit(.childFinished(parent, child: child))
-      let result = childResult(call.id, pid: launched.pid, agentID: definition.id, result: child)
+    }
+    await supervisor.attach(task, to: childPID)
+    let launched = AgentProcessTools.Launch(pid: childPID, task: task, queued: !admitted)
+
+    guard start.wait else {
+      let result = AgentProcessTools.startedResult(
+        callID: call.id,
+        pid: launched.pid,
+        agentID: definition.id,
+        queued: launched.queued,
+        slots: request.limits.maxSubagents)
       await emit(.toolFinished(parent, result))
       return result
-    } catch is CancellationError {
-      return await fail(
-        call, "agent '\(definition.id)' \(launched.pid) was cancelled.",
-        parent: parent, emit: emit)
-    } catch {
-      return await fail(
-        call, "agent '\(definition.id)' \(launched.pid) failed: \(error.localizedDescription)",
-        parent: parent, emit: emit)
     }
+
+    let result: ToolResult
+    do {
+      let child = try await AgentProcessTools.awaitChild(
+        launched.task, pid: launched.pid, supervisor: supervisor)
+      await emit(.childFinished(parent, child: child))
+      result = AgentProcessTools.childResult(
+        callID: call.id, pid: launched.pid, agentID: definition.id, result: child)
+    } catch {
+      result = AgentProcessTools.childFailure(
+        callID: call.id, pid: launched.pid, agentID: definition.id, error: error)
+    }
+    await emit(.toolFinished(parent, result))
+    return result
   }
 
   private func reportAgentStatus(
@@ -1111,117 +1134,13 @@ public actor AgentRuntime {
     parent: AgentEventContext,
     emit: @escaping AgentEventHandler
   ) async -> ToolResult {
-    let arguments = call.arguments.objectValue ?? [:]
-    let tree = await supervisor.tree()
-    guard let callerPID = parent.pid else {
-      return await fail(call, "this run has no process table.", parent: parent, emit: emit)
-    }
-    let rawPID = arguments["pid"]?.coercedStringValue ?? arguments["id"]?.coercedStringValue ?? ""
-    let listed: [AgentProcessInfo]
-    var structured: [String: JSONValue] = [:]
-    var text: String
-    if rawPID.isEmpty {
-      let wholeTree = arguments["tree"]?.coercedBoolValue ?? false
-      let descendants = Array(tree.subtree(of: callerPID).dropFirst())
-      listed = wholeTree ? descendants : descendants.filter { $0.parent == callerPID }
-      text = listed.isEmpty ? "No child agents." : listed.map(\.summaryLine).joined(separator: "\n")
-      if !listed.isEmpty {
-        text += "\nThe number after # is the pid the agent_* tools take."
-      }
-    } else {
-      let pid: AgentPID
-      switch childPID(rawPID, of: callerPID, in: tree) {
-      case .success(let found): pid = found
-      case .failure(let error): return await fail(call, error.message, parent: parent, emit: emit)
-      }
-      guard let info = tree.info(pid) else {
-        return await fail(call, "agent \(pid) is not one of yours.", parent: parent, emit: emit)
-      }
-      listed = [info]
-      text = info.summaryLine
-      if let count = logCount(arguments["log"]) {
-        let excerpt = await transcriptExcerpt(pid, last: count)
-        text += "\n" + excerpt.text
-        structured["transcript"] = excerpt.json
-      }
-    }
-    structured["agents"] = .array(listed.map { processJSON($0) })
-    structured["count"] = .integer(listed.count)
-    let result = ToolResult(
+    let result = await AgentProcessTools.status(
+      arguments: call.arguments.objectValue ?? [:],
       callID: call.id,
-      content: [.text(text)],
-      structuredContent: .object(structured))
+      caller: parent.pid,
+      supervisor: supervisor)
     await emit(.toolFinished(parent, result))
     return result
-  }
-
-  static let defaultLogMessages = 20
-  private static let maximumLogMessages = 200
-  private static let logMessageLength = 2000
-
-  /// How many transcript messages a `log` argument asks for; nil for none.
-  private func logCount(_ value: JSONValue?) -> Int? {
-    guard let value else { return nil }
-    if let number = value.coercedNumberValue, number >= 1 {
-      return min(Int(number), Self.maximumLogMessages)
-    }
-    return value.coercedBoolValue == true ? Self.defaultLogMessages : nil
-  }
-
-  /// The end of an agent's transcript, numbered as the whole of it is, in the
-  /// pasteable form hosts print; long messages are clipped.
-  private func transcriptExcerpt(_ pid: AgentPID, last count: Int) async -> (
-    text: String, json: JSONValue
-  ) {
-    let messages = await supervisor.transcript(pid)
-    guard !messages.isEmpty else {
-      return ("Transcript of \(pid): nothing yet.", .array([]))
-    }
-    let start = max(0, messages.count - count)
-    var lines = [
-      messages.count > count
-        ? "Transcript of \(pid), last \(count) of \(messages.count) messages:"
-        : "Transcript of \(pid), \(messages.count) message\(messages.count == 1 ? "" : "s"):"
-    ]
-    var rows: [JSONValue] = []
-    for (offset, message) in messages[start...].enumerated() {
-      let index = start + offset + 1
-      var rendered = TranscriptCopy.render(message)
-      if rendered.count > Self.logMessageLength {
-        rendered = String(rendered.prefix(Self.logMessageLength)) + "…"
-      }
-      lines.append("[\(index)] \(message.role.rawValue): \(rendered)")
-      rows.append(
-        .object([
-          "index": .integer(index), "role": .string(message.role.rawValue),
-          "text": .string(rendered),
-        ]))
-    }
-    return (lines.joined(separator: "\n"), .array(rows))
-  }
-
-  private struct ChildLookupError: Error {
-    let message: String
-  }
-
-  /// The child a tool call names. A name such as `main.worker` is explained
-  /// rather than rejected, since that is what a model tends to pass.
-  private func childPID(
-    _ rawPID: String,
-    of callerPID: AgentPID?,
-    in tree: AgentProcessTree
-  ) -> Result<AgentPID, ChildLookupError> {
-    guard let pid = AgentPID(text: rawPID) else {
-      return .failure(
-        ChildLookupError(
-          message:
-            "'\(rawPID)' is not a pid. Pass the number \(Self.agentStatusToolName) shows after # (2 for '#2 main.worker'); agent names are not identifiers."
-        ))
-    }
-    guard let callerPID, tree.isDescendant(pid, of: callerPID) else {
-      return .failure(ChildLookupError(message: "agent \(pid) is not one of yours."))
-    }
-    return .success(pid)
   }
 
   private func collectAgentResult(
@@ -1229,57 +1148,13 @@ public actor AgentRuntime {
     parent: AgentEventContext,
     emit: @escaping AgentEventHandler
   ) async -> ToolResult {
-    let arguments = call.arguments.objectValue ?? [:]
-    let rawPID = arguments["pid"]?.coercedStringValue ?? arguments["id"]?.coercedStringValue ?? ""
-    let pid: AgentPID
-    switch childPID(rawPID, of: parent.pid, in: await supervisor.tree()) {
-    case .success(let found): pid = found
-    case .failure(let error): return await fail(call, error.message, parent: parent, emit: emit)
-    }
-    let wait = arguments["wait"]?.coercedBoolValue ?? true
-
-    if let finished = await supervisor.result(pid) {
-      await supervisor.collect(pid)
-      let result = childResult(call.id, pid: pid, agentID: finished.agentID, result: finished)
-      await emit(.toolFinished(parent, result))
-      return result
-    }
-    guard let handle = await supervisor.handle(pid) else {
-      let info = await supervisor.info(pid)
-      let reason = info?.failure ?? "it produced no result"
-      var message = "agent \(pid) is not available: \(reason)."
-      if !(await supervisor.transcript(pid)).isEmpty {
-        let excerpt = await transcriptExcerpt(pid, last: 6)
-        message += "\n" + excerpt.text
-        message += "\n\(Self.agentStatusToolName) with pid \(pid.rawValue) and log reads more."
-      }
-      return await fail(call, message, parent: parent, emit: emit)
-    }
-    guard wait else {
-      let info = await supervisor.info(pid)
-      let result = ToolResult(
-        callID: call.id,
-        content: [.text(info?.summaryLine ?? "\(pid) is still running.")],
-        structuredContent: info.map { processJSON($0) })
-      await emit(.toolFinished(parent, result))
-      return result
-    }
-    do {
-      let child = try await withTaskCancellationHandler {
-        try await handle.value
-      } onCancel: {
-        handle.cancel()
-      }
-      await supervisor.collect(pid)
-      let result = childResult(call.id, pid: pid, agentID: child.agentID, result: child)
-      await emit(.toolFinished(parent, result))
-      return result
-    } catch is CancellationError {
-      return await fail(call, "agent \(pid) was cancelled.", parent: parent, emit: emit)
-    } catch {
-      return await fail(
-        call, "agent \(pid) failed: \(error.localizedDescription)", parent: parent, emit: emit)
-    }
+    let result = await AgentProcessTools.result(
+      arguments: call.arguments.objectValue ?? [:],
+      callID: call.id,
+      caller: parent.pid,
+      supervisor: supervisor)
+    await emit(.toolFinished(parent, result))
+    return result
   }
 
   private func stopAgent(
@@ -1287,115 +1162,14 @@ public actor AgentRuntime {
     parent: AgentEventContext,
     emit: @escaping AgentEventHandler
   ) async -> ToolResult {
-    let arguments = call.arguments.objectValue ?? [:]
-    let rawPID = arguments["pid"]?.coercedStringValue ?? arguments["id"]?.coercedStringValue ?? ""
-    let reason = arguments["reason"]?.stringValue ?? "Stopped by \(parent.agentID)"
-    let pid: AgentPID
-    switch childPID(rawPID, of: parent.pid, in: await supervisor.tree()) {
-    case .success(let found): pid = found
-    case .failure(let error): return await fail(call, error.message, parent: parent, emit: emit)
-    }
-    let stopped = await supervisor.stop(pid, reason: reason)
-    let result = ToolResult(
+    let result = await AgentProcessTools.stop(
+      arguments: call.arguments.objectValue ?? [:],
       callID: call.id,
-      content: [
-        .text(
-          "Stopped \(stopped.map(\.description).joined(separator: ", ")).")
-      ],
-      structuredContent: .object([
-        "stopped": .array(stopped.map { .string(String($0.rawValue)) })
-      ]))
+      caller: parent.pid,
+      supervisor: supervisor,
+      stoppedBy: parent.agentID)
     await emit(.toolFinished(parent, result))
     return result
-  }
-
-  /// Registers a child, starts it, and hands back the handle so the caller
-  /// decides whether to wait. Children always run in their own task, so
-  /// `agent_stop` kills a blocking child the same way it kills a background one.
-  private func launch(
-    definition: AgentDefinition,
-    brief: AgentTaskBrief,
-    parent: AgentEventContext,
-    depth: Int,
-    limit: Int,
-    budget: RunBudget,
-    background: Bool,
-    emit: @escaping AgentEventHandler
-  ) async -> (pid: AgentPID, task: Task<AgentResult, Error>, queued: Bool) {
-    let prompt = AgentDelegationPrompt.render(
-      brief,
-      agent: definition.id,
-      workingDirectory: FileManager.default.currentDirectoryPath,
-      template: delegationTemplate)
-    let childRequest = request(for: definition, messages: [.user(prompt)])
-    let childRunID = UUID()
-    let childPID = await supervisor.register(
-      runID: childRunID,
-      parent: parent.pid,
-      agentID: definition.id,
-      displayName: definition.displayName,
-      task: brief.headline,
-      depth: depth + 1)
-    let childContext = AgentEventContext(
-      runID: childRunID,
-      parentRunID: parent.runID,
-      agentID: definition.id,
-      depth: depth + 1,
-      pid: childPID)
-    // Whether the child runs now or waits is settled here, so the tool result
-    // the parent gets says which; a queued child announces `childStarted`
-    // itself once a slot frees up.
-    let admitted = await supervisor.admit(childPID, limit: limit)
-    await emit(
-      admitted
-        ? .childStarted(parent, child: childContext) : .childQueued(parent, child: childContext))
-    // Every child's events reach the host, background or not, tagged with the
-    // child's own context and pid. How they are shown — prefixed, folded into
-    // one line, or dropped — is the host's call, not the runtime's.
-    let task = Task {
-      do {
-        if !admitted {
-          try await awaitSlot(childPID, limit: limit, budget: budget)
-          await emit(.childStarted(parent, child: childContext))
-        }
-        let child = try await runInternal(
-          childRequest,
-          runID: childRunID,
-          pid: childPID,
-          parentRunID: parent.runID,
-          depth: depth + 1,
-          budget: budget,
-          emit: emit)
-        await supervisor.finish(childPID, result: child, announce: background)
-        return child
-      } catch is CancellationError {
-        await supervisor.fail(
-          childPID, state: .cancelled, message: "Cancelled", announce: background)
-        throw CancellationError()
-      } catch is RunDeadlineExceeded {
-        let message = "\(budget.timeInterruption.summary) while queued"
-        await supervisor.fail(
-          childPID, state: .interrupted, message: message, announce: background)
-        throw AgentRuntimeError.limitExceeded("time")
-      } catch {
-        await supervisor.fail(
-          childPID, state: .failed, message: error.localizedDescription, announce: background)
-        throw error
-      }
-    }
-    await supervisor.attach(task, to: childPID)
-    return (childPID, task, !admitted)
-  }
-
-  /// Where a queued child waits for a subagent slot, in its own task: it asks
-  /// the supervisor again every 100ms until it is admitted, so stopping it
-  /// with `agent_stop` ends the wait like any other cancellation, and the
-  /// run's deadline applies to time spent waiting as well.
-  private func awaitSlot(_ pid: AgentPID, limit: Int, budget: RunBudget) async throws {
-    while !(await supervisor.admit(pid, limit: limit)) {
-      if budget.deadlinePassed { throw RunDeadlineExceeded() }
-      try await Task.sleep(for: .milliseconds(100))
-    }
   }
 
   /// The agent MaiCore invents when a delegating agent does not name a child:
@@ -1404,14 +1178,9 @@ public actor AgentRuntime {
   /// agent with no way to do anything.
   private func derivedWorker(
     for request: AgentRequest,
-    narrowedTo tools: Set<String>?
+    toolNames: Set<String>
   ) -> AgentDefinition {
-    var toolNames = request.toolNames
-    if let tools {
-      let allowed = toolNames.intersection(tools)
-      if !allowed.isEmpty { toolNames = allowed }
-    }
-    return AgentDefinition(
+    AgentDefinition(
       id: "\(request.agentID).worker",
       displayName: "\(request.agentID) worker",
       instructions: workerInstructions ?? AgentDelegationPrompt.workerInstructions,
@@ -1436,73 +1205,9 @@ public actor AgentRuntime {
     parent: AgentEventContext,
     emit: @escaping AgentEventHandler
   ) async -> ToolResult {
-    let result = ToolResult(callID: call.id, text: "Error: \(message)", isError: true)
+    let result = AgentProcessTools.failure(callID: call.id, message)
     await emit(.toolFinished(parent, result))
     return result
-  }
-
-  private func processJSON(_ info: AgentProcessInfo) -> JSONValue {
-    var value: [String: JSONValue] = [
-      "pid": .string(String(info.pid.rawValue)),
-      "agent": .string(info.agentID),
-      "status": .string(info.state.rawValue),
-      "turns": .integer(info.modelTurns),
-      "tools": .integer(info.toolCalls),
-    ]
-    if let tokens = info.usage?.totalTokens { value["tokens"] = .integer(tokens) }
-    if let failure = info.failure { value["error"] = .string(failure) }
-    if let attention = info.attention { value["attention"] = .string(attention.summary) }
-    return .object(value)
-  }
-
-  private func childSummary(
-    _ pid: AgentPID,
-    agentID: String,
-    result: AgentResult
-  ) -> JSONValue {
-    var value: [String: JSONValue] = [
-      "pid": .string(String(pid.rawValue)),
-      "agent": .string(agentID),
-      "status": .string(result.interruption == nil ? "completed" : "interrupted"),
-      "turns": .integer(result.modelTurns),
-      "tools": .integer(result.toolCalls),
-    ]
-    if let tokens = result.usage?.totalTokens { value["tokens"] = .integer(tokens) }
-    if let interruption = result.interruption { value["error"] = .string(interruption.summary) }
-    return .object(value)
-  }
-
-  /// The tool result a parent gets for a child that ended. A child a limit
-  /// paused before it answered comes back as an error carrying whatever it
-  /// said last, so the parent can decide whether to start it again with a
-  /// narrower brief.
-  private func childResult(
-    _ callID: String,
-    pid: AgentPID,
-    agentID: String,
-    result child: AgentResult
-  ) -> ToolResult {
-    let summary = childSummary(pid, agentID: agentID, result: child)
-    guard let interruption = child.interruption else {
-      return ToolResult(callID: callID, content: childAnswer(child), structuredContent: summary)
-    }
-    var text = "Error: agent '\(agentID)' \(pid) stopped before answering: \(interruption.summary)."
-    let last = child.response.text.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !last.isEmpty { text += "\nIts last message:\n\(last)" }
-    return ToolResult(
-      callID: callID, content: [.text(text)], structuredContent: summary, isError: true)
-  }
-
-  /// Only the child's answer travels back: its tool traffic and reasoning stay
-  /// in the transcript that is about to be discarded.
-  private func childAnswer(_ child: AgentResult) -> [ContentPart] {
-    let content = child.response.content.filter { part in
-      switch part {
-      case .toolCall, .toolResult, .reasoning: false
-      default: true
-      }
-    }
-    return content.isEmpty ? [.text(child.response.text)] : content
   }
 
   private func visibleDefinitions(for request: AgentRequest) throws -> [ToolDefinition] {
@@ -1546,154 +1251,14 @@ public actor AgentRuntime {
     allowedAgentNames: Set<String>,
     delegating: Bool
   ) -> [ToolDefinition] {
-    let names = allowedAgentNames.sorted()
-    var startProperties: [String: JSONValue] = [
-      "context": .object([
-        "type": .string("string"),
-        "description": .string(
-          "What it cannot discover on its own: facts, decisions, and paths already found. It cannot see this conversation."
-        ),
-      ]),
-      "task": .object([
-        "type": .string("string"),
-        "description": .string("The single thing to do."),
-      ]),
-      "output": .object([
-        "type": .string("string"),
-        "description": .string(
-          "What to return and in what shape, for example \"file paths, one per line, no prose\"."
-        ),
-      ]),
-      "wait": .object([
-        "type": .string("boolean"),
-        "description": .string(
-          "Wait for the answer (default); false returns a pid to collect with \(Self.agentResultToolName)."
-        ),
-      ]),
-      "tools": .object([
-        "type": .string("array"),
-        "items": .object(["type": .string("string")]),
-        "description": .string("Subset of the agent's tools to allow."),
-      ]),
-    ]
-    if !names.isEmpty {
-      let described = names.map { name -> String in
-        guard let agent = agents[name] else { return name }
-        let purpose =
-          agent.description.isEmpty
-          ? (agent.displayName == name ? "" : agent.displayName) : agent.description
-        return purpose.isEmpty ? name : "\(name) — \(purpose)"
-      }
-      startProperties["agent"] = .object([
-        "type": .string("string"),
-        "enum": .array(names.map(JSONValue.string)),
-        "description": .string(
-          "Which agent to run. \(described.joined(separator: "; "))."
-            + (delegating ? " Omit to use a general worker with your own tools." : "")),
-      ])
+    let offered = allowedAgentNames.map { name -> AgentProcessTools.OfferedAgent in
+      guard let agent = agents[name] else { return AgentProcessTools.OfferedAgent(id: name) }
+      let purpose =
+        agent.description.isEmpty
+        ? (agent.displayName == name ? "" : agent.displayName) : agent.description
+      return AgentProcessTools.OfferedAgent(id: name, purpose: purpose)
     }
-
-    let startDescription =
-      delegating
-      ? "Run a task in a child agent with your tools; only its answer enters this conversation. Use it for work with bulky tool output, not for small calls."
-      : "Run one task in a child agent with a transcript of its own; only its answer comes back. Agents: \(names.joined(separator: ", "))."
-
-    return [
-      ToolDefinition(
-        name: Self.agentStartToolName,
-        description: startDescription,
-        inputSchema: .object([
-          "type": .string("object"),
-          "properties": .object(startProperties),
-          "required": .array([.string("task"), .string("output")]),
-          "additionalProperties": .bool(false),
-        ]),
-        annotations: ToolAnnotations(
-          readOnly: false,
-          destructive: false,
-          idempotent: false,
-          openWorld: true,
-          approval: .confirm)),
-      ToolDefinition(
-        name: Self.agentStatusToolName,
-        description:
-          "List your child agents and their state, one line each, pid first (#2). With pid and log, read that agent's transcript.",
-        inputSchema: .object([
-          "type": .string("object"),
-          "properties": .object([
-            "pid": .object([
-              "type": .string("string"),
-              "description": .string("An agent's pid, the number after # (2 for '#2 main.worker')."),
-            ]),
-            "tree": .object([
-              "type": .string("boolean"),
-              "description": .string("Include grandchildren."),
-            ]),
-            "log": .object([
-              "type": .string("integer"),
-              "description": .string(
-                "With pid: also return the last N messages of its transcript (1-200)."),
-            ]),
-          ]),
-          "additionalProperties": .bool(false),
-        ]),
-        annotations: ToolAnnotations(
-          readOnly: true,
-          destructive: false,
-          idempotent: true,
-          openWorld: false,
-          approval: .automatic)),
-      ToolDefinition(
-        name: Self.agentResultToolName,
-        description:
-          "Take the answer of a child started with wait false, by pid; waits for it unless wait is false. A failed child returns its error and the end of its transcript.",
-        inputSchema: .object([
-          "type": .string("object"),
-          "properties": .object([
-            "pid": .object([
-              "type": .string("string"),
-              "description": .string("The pid returned by \(Self.agentStartToolName)."),
-            ]),
-            "wait": .object([
-              "type": .string("boolean"),
-              "description": .string("Block until it finishes (default true)."),
-            ]),
-          ]),
-          "required": .array([.string("pid")]),
-          "additionalProperties": .bool(false),
-        ]),
-        annotations: ToolAnnotations(
-          readOnly: true,
-          destructive: false,
-          idempotent: false,
-          openWorld: false,
-          approval: .automatic)),
-      ToolDefinition(
-        name: Self.agentStopToolName,
-        description:
-          "Stop a child agent and everything it started.",
-        inputSchema: .object([
-          "type": .string("object"),
-          "properties": .object([
-            "pid": .object([
-              "type": .string("string"),
-              "description": .string("The pid to stop."),
-            ]),
-            "reason": .object([
-              "type": .string("string"),
-              "description": .string("Why, for the log."),
-            ]),
-          ]),
-          "required": .array([.string("pid")]),
-          "additionalProperties": .bool(false),
-        ]),
-        annotations: ToolAnnotations(
-          readOnly: false,
-          destructive: false,
-          idempotent: true,
-          openWorld: false,
-          approval: .automatic)),
-    ]
+    return AgentProcessTools.definitions(offering: offered, delegating: delegating)
   }
 
   private func request(
@@ -1787,17 +1352,11 @@ extension AgentRuntime {
   /// before it is refused as a loop.
   static let maximumIdenticalCalls = 3
 
-  fileprivate static let reservedToolNames: Set<String> = [
-    agentStartToolName, agentStatusToolName, agentResultToolName, agentStopToolName,
-    subagentToolName, agentLaunchToolName,
-  ]
+  fileprivate static let reservedToolNames: Set<String> = AgentProcessTools.reservedToolNames
 
   /// Maps a retired tool name onto the one that replaced it.
   fileprivate static func canonicalToolName(_ name: String) -> String {
-    switch name {
-    case subagentToolName, agentLaunchToolName: agentStartToolName
-    default: name
-    }
+    AgentProcessTools.canonicalName(name)
   }
 }
 

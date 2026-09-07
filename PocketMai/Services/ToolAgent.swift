@@ -274,6 +274,10 @@ enum ToolAgentRegistry {
     if !enabledResourceServers.isEmpty {
       defs.append(MCPResourceTool.definition(for: enabledResourceServers))
     }
+    for definition in SubagentTool.definitions(for: conversation, settings: settings)
+    where takenNames.insert(definition.name).inserted {
+      defs.append(definition)
+    }
     return defs
   }
 
@@ -293,20 +297,26 @@ enum ToolAgentRegistry {
     return await execute(call: call, conversation: conversation, store: store)
   }
 
+  /// Runs a call for a conversation the store owns, with the live settings.
+  /// An isolated run — a child agent, the OpenAPI server — passes the
+  /// settings it was started with instead, so a child sees the tools of the
+  /// agent it runs as.
   static func execute(
     call: ParsedToolCall,
     conversation: Conversation,
+    settings: AppSettings? = nil,
     store: AppStore
   ) async -> String {
+    let settings = settings ?? store.settings
     let fullDefinitions = ToolAgentRegistry.definitions(
       for: conversation,
-      settings: store.settings,
+      settings: settings,
       mcpTools: store.mcpTools,
       mcpResources: store.mcpResources,
       mcpStatuses: store.mcpStatuses)
     let visibleDefinitions = ToolAgentRegistry.visibleDefinitions(
       for: conversation,
-      settings: store.settings,
+      settings: settings,
       mcpTools: store.mcpTools,
       mcpResources: store.mcpResources,
       mcpStatuses: store.mcpStatuses)
@@ -315,7 +325,7 @@ enum ToolAgentRegistry {
       return AgentTooling.unavailableToolError(name: visibleCall.name)
     }
 
-    if store.settings.useToolProxy && !fullDefinitions.isEmpty {
+    if settings.useToolProxy && !fullDefinitions.isEmpty {
       switch visibleCall.name {
       case ToolProxy.listName:
         return ToolProxy.listTools(
@@ -330,6 +340,7 @@ enum ToolAgentRegistry {
         return await executeConcrete(
           call: call,
           conversation: conversation,
+          settings: settings,
           store: store,
           definitions: fullDefinitions)
       default:
@@ -341,6 +352,7 @@ enum ToolAgentRegistry {
     return await executeConcrete(
       call: visibleCall,
       conversation: conversation,
+      settings: settings,
       store: store,
       definitions: fullDefinitions)
   }
@@ -348,12 +360,20 @@ enum ToolAgentRegistry {
   fileprivate static func executeConcrete(
     call: ParsedToolCall,
     conversation: Conversation,
+    settings: AppSettings,
     store: AppStore,
     definitions: [ToolDefinition]
   ) async -> String {
     let normalizedCall = AgentTooling.normalized(call: call, tools: definitions)
     guard AgentTooling.containsDefinition(named: normalizedCall.name, in: definitions) else {
       return AgentTooling.unavailableToolError(name: normalizedCall.name)
+    }
+    if SubagentTool.isAgentTool(normalizedCall.name) {
+      return await SubagentTool.execute(
+        call: normalizedCall,
+        conversation: conversation,
+        settings: settings,
+        store: store)
     }
     if let result = await BuiltInToolCatalog.execute(
       call: normalizedCall,

@@ -13,6 +13,10 @@ enum AssistantToolLoop {
   struct IsolatedResult: Sendable {
     let text: String
     let toolRuns: [ToolRunDetail]
+    /// How many times the model was asked, for a child agent's process row.
+    let modelTurns: Int
+    /// The conversation as it ended, so a child agent's transcript can be kept.
+    let conversation: Conversation
   }
 
   private struct RequestState {
@@ -45,7 +49,8 @@ enum AssistantToolLoop {
       settings: AppSettings,
       mcpTools: [UUID: [MCPToolDescriptor]],
       mcpResources: [UUID: [MCPResourceDescriptor]],
-      mcpStatuses: [UUID: EndpointConnectionState])
+      mcpStatuses: [UUID: EndpointConnectionState],
+      process: AgentPID?)
   }
 
   private struct SkippedModelResponse: Error {
@@ -369,18 +374,24 @@ enum AssistantToolLoop {
     }
   }
 
+  /// Runs a conversation the store does not own to its final answer. With a
+  /// `process`, the run is a child agent: it reports each turn and tool to
+  /// the supervisor, waits while paused, and reads the messages a person
+  /// queued for it before its next model turn.
   static func runIsolated(
     conversation initialConversation: Conversation,
     settings: AppSettings,
     baseContext: String,
-    store: AppStore
+    store: AppStore,
+    process: AgentPID? = nil
   ) async throws -> IsolatedResult {
     var conversation = initialConversation
-    let assistantID = UUID()
+    var assistantID = UUID()
     conversation.messages.append(ChatMessage(id: assistantID, role: .assistant, text: ""))
 
     var state = State()
     var toolRuns: [ToolRunDetail] = []
+    var modelTurns = 0
     let maxToolCalls = maxToolCallsPerTurn(settings: settings)
     let maxRepairTurns = maxRepairTurnsPerTurn(settings: settings)
 
@@ -388,12 +399,37 @@ enum AssistantToolLoop {
 
     while state.toolCallCount < maxToolCalls && state.repairTurnCount < maxRepairTurns {
       try Task.checkCancellation()
+      if let process {
+        try await holdWhilePaused(process, store: store)
+        // Messages queued for this child join its conversation before the
+        // next model turn, the way pmai's inbox works: the answer so far is
+        // kept and a fresh assistant turn follows them.
+        let injected = await store.agentSupervisor.drainInbox(process).filter { $0.role == .user }
+        if !injected.isEmpty {
+          conversation.messages.append(
+            contentsOf: injected.map { ChatMessage(role: .user, text: $0.text) })
+          assistantID = UUID()
+          conversation.messages.append(ChatMessage(id: assistantID, role: .assistant, text: ""))
+          state = State()
+        }
+      }
+      modelTurns += 1
+      if let process {
+        await store.agentSupervisor.note(
+          process,
+          state: .running,
+          modelTurns: modelTurns,
+          toolCalls: toolRuns.count,
+          activity: "thinking",
+          transcript: SubagentRunner.transcript(of: conversation))
+      }
       let host = RunHost.isolated(
         conversation: conversation,
         settings: settings,
         mcpTools: store.mcpTools,
         mcpResources: store.mcpResources,
-        mcpStatuses: store.mcpStatuses)
+        mcpStatuses: store.mcpStatuses,
+        process: process)
       let requestState = makeRequestState(
         conversation: conversation,
         baseContext: baseContext,
@@ -431,7 +467,9 @@ enum AssistantToolLoop {
         updateLocalAssistantMessage(id: assistantID, text: text, conversation: &conversation)
         return IsolatedResult(
           text: userVisibleResponseText(from: text),
-          toolRuns: toolRuns)
+          toolRuns: toolRuns,
+          modelTurns: modelTurns,
+          conversation: conversation)
       case .retry(let feedback, _):
         state.debugRoundIndex += 1
         state.repairTurnCount += 1
@@ -467,7 +505,20 @@ enum AssistantToolLoop {
     updateLocalAssistantMessage(id: assistantID, text: text, conversation: &conversation)
     return IsolatedResult(
       text: userVisibleResponseText(from: text),
-      toolRuns: toolRuns)
+      toolRuns: toolRuns,
+      modelTurns: modelTurns,
+      conversation: conversation)
+  }
+
+  /// Where a paused child waits: a person pauses it through the supervisor
+  /// while it is inside a model call or a tool, and it holds here at the
+  /// next turn boundary until it is resumed or stopped.
+  private static func holdWhilePaused(_ process: AgentPID, store: AppStore) async throws {
+    guard await store.agentSupervisor.isPaused(process) else { return }
+    await store.agentSupervisor.note(process, activity: "")
+    while await store.agentSupervisor.isPaused(process) {
+      try await Task.sleep(for: .milliseconds(200))
+    }
   }
 
   private static func requestModelResponse(
@@ -690,7 +741,7 @@ enum AssistantToolLoop {
       echoReasoningContent = shouldEchoReasoningContent(
         conversationID: conversationID,
         store: store)
-    case .isolated(let conversation, let settings, _, _, _):
+    case .isolated(let conversation, let settings, _, _, _, _):
       echoReasoningContent = shouldEchoReasoningContent(
         conversation: conversation,
         settings: settings)
@@ -813,7 +864,7 @@ enum AssistantToolLoop {
         definitions: currentDefinitions,
         mode: mode,
         conversationID: conversationID)
-    case .isolated(let conversation, _, _, _, _):
+    case .isolated(let conversation, _, _, _, _, _):
       approval = await store.requestToolCallApproval(
         call: normalizedCall,
         definitions: currentDefinitions,
@@ -874,7 +925,10 @@ enum AssistantToolLoop {
         operationName: executableCall.name,
         conversationTitle: store.conversation(withID: conversationID)?.displayTitle,
         timeoutInterval: store.settings.mcpRequestTimeoutInterval)
-    case .isolated(let conversation, let settings, _, _, _):
+    case .isolated(let conversation, let settings, _, _, _, let process):
+      if let process {
+        await store.agentSupervisor.note(process, activity: executableCall.name)
+      }
       context = LongRunningOperationContext(
         kind: .toolCall,
         conversationID: conversation.id,
@@ -883,25 +937,33 @@ enum AssistantToolLoop {
         conversationTitle: conversation.displayTitle,
         timeoutInterval: settings.mcpRequestTimeoutInterval)
     }
+    let execute: @Sendable () async -> String = {
+      switch host {
+      case .live(_, _, let conversationID):
+        await ToolAgentRegistry.execute(
+          call: executableCall,
+          conversationID: conversationID,
+          store: store)
+      case .isolated(let conversation, let settings, _, _, _, _):
+        await ToolAgentRegistry.execute(
+          call: executableCall,
+          conversation: conversation,
+          settings: settings,
+          store: store)
+      }
+    }
+    // A child agent runs for as long as its own model calls take, each under
+    // the same timeout prompt as this one; asking again about the parent's
+    // wait for it would only double the questions.
+    if SubagentTool.isAgentTool(executableCall.name) {
+      return CallResult(call: executableCall, result: await execute())
+    }
     do {
       let result = try await InteractiveOperationTimeout.run(
         seconds: context.timeoutInterval,
         context: context,
-        onTimeout: timeoutHandler(store: store)
-      ) {
-        switch host {
-        case .live(_, _, let conversationID):
-          await ToolAgentRegistry.execute(
-            call: executableCall,
-            conversationID: conversationID,
-            store: store)
-        case .isolated(let conversation, _, _, _, _):
-          await ToolAgentRegistry.execute(
-            call: executableCall,
-            conversation: conversation,
-            store: store)
-        }
-      }
+        onTimeout: timeoutHandler(store: store),
+        operation: execute)
       return CallResult(call: executableCall, result: result)
     } catch is LongRunningOperationSkipped {
       return CallResult(
@@ -918,7 +980,7 @@ enum AssistantToolLoop {
     case .live(_, _, let conversationID):
       return currentVisibleDefinitions(conversationID: conversationID, store: store)
     case .isolated(
-      let conversation, let settings, let mcpTools, let mcpResources, let mcpStatuses):
+      let conversation, let settings, let mcpTools, let mcpResources, let mcpStatuses, _):
       return currentVisibleDefinitions(
         conversation: conversation,
         settings: settings,
@@ -932,7 +994,7 @@ enum AssistantToolLoop {
     switch host {
     case .live:
       return store.settings
-    case .isolated(_, let settings, _, _, _):
+    case .isolated(_, let settings, _, _, _, _):
       return settings
     }
   }

@@ -55,6 +55,29 @@ is kill, `/agents tree` is pstree, and a pid is short enough to type. One
 definition can back many concurrent processes; a process always names the
 definition it was started from.
 
+## Hosts without the runtime
+
+The family is not tied to `AgentRuntime`. `AgentProcessTools` holds the four
+schemas, the parsing of an `agent_start` call, the registration and
+bookkeeping of a child in the `AgentSupervisor`, and the answers to
+`agent_status`, `agent_result`, and `agent_stop`; the runtime is one caller of
+it. A host with a tool loop of its own brings the one thing MaiCore cannot
+know — how a child actually runs — as a closure that returns an `AgentResult`,
+and gets the same pids, the same queueing, and the same result wording.
+
+PocketMai is such a host. An agent profile whose "Can spawn subagents" switch
+is on sees the tools; `agent_start` without a name runs a worker with the
+caller's own model and tools, and with a name runs any other profile, whose
+description is what the model reads to choose it. A child is an isolated run
+of the app's tool loop in a Swift task — no process, no pipe, no ACP — that
+reports each turn and tool to the supervisor, holds at its next turn while
+paused, and reads the messages queued for it before its next model turn. The
+chat shows its children in a bar above the composer, where they can be paused,
+messaged, and stopped, and their transcripts read. A chat is one process for
+its whole life, registered the first time an agent tool asks for it, reopened
+for every turn, and completed between them, so a background child started
+three turns ago is still the chat's to collect.
+
 ## The tree
 
 Any agent that is allowed subagents can start them, including a subagent. That

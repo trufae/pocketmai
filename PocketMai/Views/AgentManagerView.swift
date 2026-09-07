@@ -191,9 +191,10 @@ struct AgentEditorView: View {
         Text("Agent")
       } footer: {
         Text(
-          isCreating
-            ? "The new agent starts with the selected agent's model, prompt, tools, and MCP servers, and becomes the selected agent so you can change them in Settings."
-            : "Select this agent in the list to choose its model, prompt, tools, and MCP servers in Settings."
+          (isCreating
+            ? "The new agent starts with the selected agent's model, prompt, tools, and MCP servers, and becomes the selected agent so you can change them in Settings. "
+            : "Select this agent in the list to choose its model, prompt, tools, and MCP servers in Settings. ")
+            + "An agent that can spawn subagents gets the agent_start, agent_status, agent_result, and agent_stop tools: it can hand a task to a worker with its own model and tools, or to any other agent by name, and only the answer comes back into the chat. Running subagents show in a bar above the composer, where they can be paused, messaged, or stopped."
         )
       }
     }

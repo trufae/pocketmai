@@ -264,9 +264,13 @@ public actor AgentSupervisor {
     publish(.changed(entry.info))
   }
 
-  // MARK: - Runtime API
+  // MARK: - Run API
 
-  func register(
+  // What a run reports as it goes. `AgentRuntime` calls these for the runs it
+  // drives; a host with a tool loop of its own calls them the same way, so
+  // its processes are listed, stopped, and steered like any other.
+
+  public func register(
     runID: UUID,
     parent: AgentPID?,
     agentID: String,
@@ -295,7 +299,7 @@ public actor AgentSupervisor {
   /// and its children. A chat is one process across its whole life, so a
   /// background child started three turns ago is still addressable by the run
   /// that started it. Answers false when the pid is gone.
-  func reopen(_ pid: AgentPID, runID: UUID, task: String) -> Bool {
+  public func reopen(_ pid: AgentPID, runID: UUID, task: String) -> Bool {
     guard var entry = entries[pid] else { return false }
     entry.info.runID = runID
     entry.info.task = task
@@ -315,7 +319,7 @@ public actor AgentSupervisor {
     return true
   }
 
-  func attach(_ handle: Task<AgentResult, Error>, to pid: AgentPID) {
+  public func attach(_ handle: Task<AgentResult, Error>, to pid: AgentPID) {
     entries[pid]?.handle = handle
   }
 
@@ -325,7 +329,7 @@ public actor AgentSupervisor {
   /// again from the child's own task until the answer is yes, the way a
   /// paused run polls `isPaused`, so a slot that frees up is taken in pid
   /// order and a stopped child simply stops asking.
-  func admit(_ pid: AgentPID, limit: Int) -> Bool {
+  public func admit(_ pid: AgentPID, limit: Int) -> Bool {
     guard var entry = entries[pid], !entry.info.state.isTerminal else { return false }
     guard let parent = entry.info.parent, let agentID = entries[parent]?.info.agentID else {
       return true
@@ -353,13 +357,13 @@ public actor AgentSupervisor {
 
   /// The task running one process, so a caller can await it without holding
   /// the supervisor for the whole run.
-  func handle(_ pid: AgentPID) -> Task<AgentResult, Error>? {
+  public func handle(_ pid: AgentPID) -> Task<AgentResult, Error>? {
     entries[pid]?.handle
   }
 
   /// Records progress. Every argument is optional so callers update only what
   /// they know, and an unchanged table publishes nothing.
-  func note(
+  public func note(
     _ pid: AgentPID,
     state: AgentProcessState? = nil,
     modelTurns: Int? = nil,
@@ -386,7 +390,7 @@ public actor AgentSupervisor {
   /// Marks a process as needing a human. The matching state follows from the
   /// kind of attention, so a run blocked on a synchronous approval prompt still
   /// shows as `approve?` in a listing.
-  func raise(_ attention: AgentAttention, for pid: AgentPID) {
+  public func raise(_ attention: AgentAttention, for pid: AgentPID) {
     guard var entry = entries[pid] else { return }
     entry.info.attention = attention
     if let state = attention.implicitState, !entry.info.state.isTerminal {
@@ -397,7 +401,7 @@ public actor AgentSupervisor {
     publish(.attention(entry.info))
   }
 
-  func clearAttention(for pid: AgentPID, resuming state: AgentProcessState? = .running) {
+  public func clearAttention(for pid: AgentPID, resuming state: AgentProcessState? = .running) {
     guard var entry = entries[pid], entry.info.attention != nil else { return }
     entry.info.attention = nil
     if let state, !entry.info.state.isTerminal {
@@ -408,7 +412,7 @@ public actor AgentSupervisor {
     publish(.attention(entry.info))
   }
 
-  func finish(_ pid: AgentPID, result: AgentResult, announce: Bool) {
+  public func finish(_ pid: AgentPID, result: AgentResult, announce: Bool) {
     guard var entry = entries[pid] else { return }
     entry.transcript = result.transcript
     entry.result = result
@@ -417,6 +421,9 @@ public actor AgentSupervisor {
     entry.info.usage = result.usage ?? entry.info.usage
     entry.handle = nil
     entries[pid] = entry
+    // A process somebody stopped keeps saying so, whatever its run reports
+    // on the way out; the transcript it ended with is kept for inspection.
+    guard !entry.info.state.isTerminal else { return }
     // A run a limit paused is listed as stopped, with the limit as its reason,
     // so a person can tell it from one that answered.
     if let interruption = result.interruption {
@@ -435,8 +442,10 @@ public actor AgentSupervisor {
     transition(pid, to: .completed, failure: nil, attention: attention, finished: true)
   }
 
-  func fail(_ pid: AgentPID, state: AgentProcessState, message: String, announce: Bool) {
+  public func fail(_ pid: AgentPID, state: AgentProcessState, message: String, announce: Bool) {
     entries[pid]?.handle = nil
+    // A stop's reason outlives the run's own cancellation report.
+    guard let entry = entries[pid], !entry.info.state.isTerminal else { return }
     transition(
       pid,
       to: state,
@@ -445,8 +454,18 @@ public actor AgentSupervisor {
       finished: true)
   }
 
+  /// Ends a turn of a process a host runs itself, when there is no
+  /// `AgentResult` to finish it with: the process shows as completed, keeps
+  /// its children and its inbox, and `reopen` puts it back to work for the
+  /// next turn.
+  public func complete(_ pid: AgentPID) {
+    guard let entry = entries[pid], !entry.info.state.isTerminal else { return }
+    entries[pid]?.handle = nil
+    transition(pid, to: .completed, failure: nil, attention: nil, finished: true)
+  }
+
   /// Marks the answer as taken, so it stops asking for attention.
-  func collect(_ pid: AgentPID) {
+  public func collect(_ pid: AgentPID) {
     guard var entry = entries[pid] else { return }
     entry.info.isCollected = true
     entry.info.attention = nil
@@ -455,7 +474,7 @@ public actor AgentSupervisor {
     pruneFinished()
   }
 
-  func forget(_ pid: AgentPID) {
+  public func forget(_ pid: AgentPID) {
     entries[pid] = nil
     inboxes[pid] = nil
     paused.remove(pid)

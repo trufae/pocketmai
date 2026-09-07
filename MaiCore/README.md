@@ -558,6 +558,17 @@ and `prompts.worker` holds the derived worker's instructions. Both fall back to
 MaiCore's built-in text and are editable with `/edit delegation` and
 `/edit worker`. See `doc/agents.md` for the design behind all of this.
 
+The tool family itself lives in `AgentProcessTools`, apart from the runtime,
+so a host with a tool loop of its own offers the same four tools over the
+same `AgentSupervisor`: `definitions(offering:delegating:)` builds the
+schemas, `StartArguments` parses a call, `register` and `run` (or `launch`,
+which does both in a task of its own) put a child in the table and record how
+it ended, and `status`, `result`, and `stop` answer the other three calls.
+`AgentSupervisor.complete` marks a host-driven process idle between turns.
+PocketMai runs its children this way — each one an isolated run of its own
+tool loop in a Swift task — and `AgentRuntime` uses the same code for the
+children it starts, so an agent behaves the same wherever it is started.
+
 In the `pmai` REPL, `/mcp list` shows configured servers and their live state.
 Add and connect a stdio server without editing JSON using
 `/mcp add COMMAND [ARG ...]`; the command basename becomes its ID. Use

@@ -214,6 +214,14 @@ final class AppStore: ObservableObject {
 
   private var responseTasks: [UUID: Task<Void, Never>] = [:]
   private var responseTaskTokens: [UUID: UUID] = [:]
+  /// The process table for child agents, one for the whole app the way pmai
+  /// keeps one per session. Nothing in it is persisted.
+  let agentSupervisor = AgentSupervisor()
+  /// Written only by the supervisor feed; views read it.
+  @Published var agentProcesses: [AgentProcessInfo] = []
+  /// The process a conversation runs as — the root its children hang off —
+  /// and, while a child runs, the process its own conversation is.
+  var agentProcessIDs: [UUID: AgentPID] = [:]
   private var followUpTasks: [UUID: Task<Void, Never>] = [:]
   private var followUpTaskTokens: [UUID: UUID] = [:]
   private var responseBackgroundTasks: [UUID: UIBackgroundTaskIdentifier] = [:]
@@ -328,6 +336,7 @@ final class AppStore: ObservableObject {
     endResponseBackgroundTask(for: conversationID)
     clearFollowUpSuggestions(in: conversationID)
     activityTurnAbandoned(conversationID: conversationID)
+    stopAgentProcesses(for: conversationID, reason: "Reply abandoned")
   }
 
   func followUpSuggestions(
@@ -414,7 +423,7 @@ final class AppStore: ObservableObject {
   private var conversationDrafts: [UUID: String] = [:]
   private var conversationIndexByID: [UUID: Int] = [:]
   private var activeConversationPublicationKey: ActiveConversationPublicationKey?
-  private var hasLoadedPersistedSettings = false
+  private(set) var hasLoadedPersistedSettings = false
   private var pendingSettingsSave = false
   private var pendingRememberedConversationIDBeforeSettingsLoad: UUID?
   private var hasLoadedPersistedDrafts = false
@@ -448,6 +457,7 @@ final class AppStore: ObservableObject {
     appleAvailabilityReport = .checking
     appleAvailabilityMessage = nil
     startFreshConversationForLaunch()
+    startAgentSupervisorFeed()
     ResponseNotificationService.shared.openConversationHandler = { [weak self] conversationID in
       self?.handleLaunchCommand(.openConversation(id: conversationID))
     }
@@ -1599,6 +1609,7 @@ final class AppStore: ObservableObject {
       respondingConversationIDs.remove(id)
       activityTurnAbandoned(conversationID: id)
     }
+    stopAllAgentProcesses()
     clearAllFollowUpSuggestions()
     conversationDrafts.removeAll()
     queuedUserMessagesByConversationID.removeAll()
@@ -1634,6 +1645,7 @@ final class AppStore: ObservableObject {
     for id in respondingConversationIDs {
       activityTurnAbandoned(conversationID: id)
     }
+    stopAllAgentProcesses(reason: "Factory reset")
     respondingConversationIDs.removeAll()
     queuedUserMessagesByConversationID.removeAll()
     conversationDrafts.removeAll()
@@ -2738,6 +2750,7 @@ final class AppStore: ObservableObject {
     activityTurnStarted(conversationID: conversationID)
     prepareNotificationsForResponse()
     refreshBackgroundKeepAlive()
+    reopenAgentProcess(for: conversationID)
     let task = Task { @MainActor [weak self] in
       guard let self else { return }
       guard responseTaskTokens[conversationID] == responseTaskToken else { return }
@@ -2751,6 +2764,7 @@ final class AppStore: ObservableObject {
           endResponseBackgroundTask(for: conversationID)
           saveConversations()
           activityTurnFinished(conversationID: conversationID)
+          completeAgentProcess(for: conversationID)
         }
       }
       if let conversation = conversation(withID: conversationID), conversation.provider == .mlx {
@@ -4419,6 +4433,7 @@ final class AppStore: ObservableObject {
     endResponseBackgroundTask(for: removedID)
     respondingConversationIDs.remove(removedID)
     activityTurnAbandoned(conversationID: removedID)
+    stopAgentProcesses(for: removedID, reason: "Chat deleted")
     clearFollowUpSuggestions(in: removedID)
     queuedUserMessagesByConversationID[removedID] = nil
     if conversationDrafts.removeValue(forKey: removedID) != nil {
@@ -5705,6 +5720,7 @@ final class AppStoreViewObservation: ObservableObject {
       observe(store.$selectedConversationID)
       observe(store.$settings)
       observe(store.$respondingConversationIDs)
+      observe(store.$agentProcesses)
       observe(store.$queuedUserMessagesByConversationID)
       observe(store.$followUpSuggestionsByConversationID)
       observe(store.$generatingFollowUpSourceMessageIDsByConversationID)

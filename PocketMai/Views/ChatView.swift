@@ -75,6 +75,7 @@ struct ChatView: View {
   @State private var pendingScrollToMessageID: UUID?
   @State private var showingWebXDCRunnerFromBar = false
   @State private var showingWebXDCStopConfirmation = false
+  @State private var showingSubagents = false
   @State private var chatSearch = ChatSearchState()
   @State private var messageFontPinchSession = MessageFontPinchSession()
   @State private var keyboardOverlap: CGFloat = 0
@@ -223,6 +224,12 @@ struct ChatView: View {
         CompactChatSheet()
           .environmentObject(store)
       }
+      .sheet(isPresented: $showingSubagents) {
+        SubagentProcessesSheet(
+          store: store,
+          storeObservation: storeObservation,
+          conversationID: store.currentConversation?.id)
+      }
       .modifier(ConversationExportPresentations(coordinator: exportCoordinator))
   }
 
@@ -292,12 +299,23 @@ struct ChatView: View {
       if let session = currentWebXDCSession {
         webxdcSessionBar(session)
       }
+      if !currentSubagents.isEmpty {
+        SubagentsBar(processes: currentSubagents) {
+          showingSubagents = true
+        }
+      }
       messages
         .overlay(alignment: .bottomTrailing) {
           browserCardOverlay
         }
       bottomControls
     }
+  }
+
+  /// The child agents of the chat on screen, live or finished, so a turn
+  /// that delegated work shows what it started.
+  private var currentSubagents: [AgentProcessInfo] {
+    store.agentChildren(of: store.currentConversation?.id)
   }
 
   private var currentWebXDCSession: WebXDCRunningSession? {

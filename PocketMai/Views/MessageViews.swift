@@ -3011,6 +3011,9 @@ enum ToolCallParser {
     if name.lowercased().hasPrefix("github") {
       return "arrow.triangle.branch"
     }
+    if name.lowercased().hasPrefix("agent_") {
+      return "person.2"
+    }
     switch name.lowercased() {
     case "date & time": return "clock"
     case "location": return "location"
