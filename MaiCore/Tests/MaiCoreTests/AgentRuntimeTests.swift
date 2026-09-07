@@ -1251,21 +1251,35 @@ func nativeRespondCallIsFinal() async throws {
   #expect(result.toolCalls == 0)
 }
 
-@Test("Size mode replaces the bodies of files read two results ago with a reference; cache mode keeps them")
-func sizeModePrunesConsumedFileBodies() async throws {
+@Test("Size mode prunes file bodies read for earlier prompts and keeps the current prompt's; cache mode keeps all")
+func sizeModePrunesEarlierPromptsFileBodies() async throws {
   let body = String(repeating: "line of source code\n", count: 40)
-  func readCall(_ id: String, _ name: String) -> ProviderResponse {
-    ProviderResponse(
-      message: AgentMessage(
-        role: .assistant,
-        content: [
-          .toolCall(ToolCall(id: id, name: "readfile", arguments: .object(["path": .string(name)])))
-        ]),
-      stopReason: .toolCall)
+  func fileResult(_ id: String, _ name: String) -> AgentMessage {
+    AgentMessage(
+      role: .tool,
+      content: [
+        .toolResult(
+          ToolResult(
+            callID: id,
+            content: [.file(FileContent(name: name, mimeType: "text/plain", text: body))],
+            structuredContent: .object(["path": .string(name)])))
+      ])
   }
+  func readCall(_ id: String, _ name: String) -> AgentMessage {
+    AgentMessage(
+      role: .assistant,
+      content: [
+        .toolCall(ToolCall(id: id, name: "readfile", arguments: .object(["path": .string(name)])))
+      ])
+  }
+  // An earlier prompt read a.py and was answered; the new prompt reads b.py.
+  let history: [AgentMessage] = [
+    .user("describe a.py"), readCall("r1", "a.py"), fileResult("r1", "a.py"),
+    .assistant("a.py defines main."), .user("now look at b.py"),
+  ]
   func run(_ mode: AgentContextMode) async throws -> (AgentResult, [ProviderRequest]) {
     let provider = ScriptedProvider(responses: [
-      readCall("r1", "a.py"), readCall("r2", "b.py"), readCall("r3", "c.py"),
+      ProviderResponse(message: readCall("r2", "b.py"), stopReason: .toolCall),
       ProviderResponse(message: .assistant("Done."), stopReason: .stop),
     ])
     let runtime = AgentRuntime()
@@ -1284,28 +1298,25 @@ func sizeModePrunesConsumedFileBodies() async throws {
       })
     let result = try await runtime.run(
       AgentRequest(
-        provider: "scripted", model: "fixture", messages: [.user("read them")],
+        provider: "scripted", model: "fixture", messages: history,
         toolNames: ["readfile"], context: mode))
     return (result, await provider.requests)
   }
 
   let (sized, sizedRequests) = try await run(.size)
   #expect(sized.response.text == "Done.")
-  // The fourth request follows three reads: a.py is two results old and pruned, b.py and c.py stay.
-  let lastTools = sizedRequests[3].messages.filter { $0.role == .tool }.flatMap(\.toolResults)
-  #expect(lastTools.count == 3)
-  #expect(lastTools[0].text.contains("[a.py: 41 lines, \(body.count) characters, read earlier and removed"))
-  #expect(lastTools[1].text == body)
-  #expect(lastTools[2].text == body)
-  #expect(sized.transcript.flatMap(\.toolResults).first?.text.contains("removed from the context") == true)
+  let results = sizedRequests[1].messages.filter { $0.role == .tool }.flatMap(\.toolResults)
+  #expect(results.count == 2)
+  #expect(results[0].text.contains("[a.py: 41 lines, \(body.count) characters, read earlier and removed"))
+  #expect(results[1].text == body)
 
   let (cached, cachedRequests) = try await run(.cache)
   #expect(cached.response.text == "Done.")
-  #expect(cachedRequests[3].messages.filter { $0.role == .tool }.flatMap(\.toolResults).allSatisfy { $0.text == body })
+  #expect(cachedRequests[1].messages.filter { $0.role == .tool }.flatMap(\.toolResults).allSatisfy { $0.text == body })
 }
 
-@Test("Pruning leaves short bodies and the newest results alone")
-func pruningKeepsSmallAndRecent() {
+@Test("Pruning leaves short bodies and the prompt in progress alone")
+func pruningKeepsSmallAndCurrent() {
   func toolMessage(_ id: String, _ text: String) -> AgentMessage {
     AgentMessage(
       role: .tool,
@@ -1316,14 +1327,14 @@ func pruningKeepsSmallAndRecent() {
   }
   let long = String(repeating: "x", count: 500)
   var messages = [
-    AgentMessage.user("go"), toolMessage("1", "short"), toolMessage("2", long),
-    toolMessage("3", long), toolMessage("4", long),
+    AgentMessage.user("first"), toolMessage("1", "short"), toolMessage("2", long),
+    .assistant("done"), .user("second"), toolMessage("3", long),
   ]
   let report = AgentContextPruning.prune(&messages)
   #expect(report?.rewritten == 1)
   #expect(messages[1].toolResults[0].text == "short")
   #expect(messages[2].toolResults[0].text.hasPrefix("[2.txt: 1 lines, 500 characters"))
-  #expect(messages[3].toolResults[0].text == long)
+  #expect(messages[5].toolResults[0].text == long)
   #expect(AgentContextPruning.prune(&messages) == nil)
 }
 

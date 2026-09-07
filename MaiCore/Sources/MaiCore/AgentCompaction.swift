@@ -164,29 +164,30 @@ public enum AgentAutocompaction {
   }
 }
 
-/// The cheap half of keeping a conversation small: a file the model read
-/// two or more tool results ago has been acted on, so its body is replaced
-/// with a line that says what was there and how to get it back. Runs in
+/// The cheap half of keeping a conversation small: files read while answering
+/// an earlier prompt have been acted on, so their bodies are replaced with a
+/// line that says what was there and how to get it back. Runs in
 /// `AgentContextMode.size` before each model call.
+///
+/// Everything read for the prompt in progress stays. Pruning inside a run was
+/// measured to cost more than it saved: a model asked to describe four files
+/// re-read the ones already collapsed when it came to write the answer
+/// (10 calls and 27k tokens instead of 7 and 18k).
 public enum AgentContextPruning {
-  /// File bodies in the newest results stay: the model may still be working
-  /// on them.
-  public static let keepLatest = 2
   /// Bodies shorter than this are left alone; the reference would not be smaller.
   public static let minimumCharacters = 400
 
-  public static func prune(
-    _ messages: inout [AgentMessage],
-    keepLatest: Int = keepLatest
-  ) -> AgentTranscriptEditReport? {
+  public static func prune(_ messages: inout [AgentMessage]) -> AgentTranscriptEditReport? {
+    guard let currentPrompt = messages.lastIndex(where: { $0.role == .user }) else { return nil }
     var candidates: [Int] = []
-    for (index, message) in messages.enumerated() where message.role == .tool {
+    for (index, message) in messages.enumerated()
+    where index < currentPrompt && message.role == .tool {
       if message.toolResults.contains(where: { hasPrunableFile($0) }) { candidates.append(index) }
     }
-    guard candidates.count > keepLatest else { return nil }
+    guard !candidates.isEmpty else { return nil }
     var report = AgentTranscriptEditReport(
       charactersBefore: AgentTranscriptEditor.characterCount(of: messages))
-    for index in candidates.dropLast(keepLatest) {
+    for index in candidates {
       var message = messages[index]
       message.content = message.content.map { part in
         guard case .toolResult(var result) = part, hasPrunableFile(result) else { return part }
