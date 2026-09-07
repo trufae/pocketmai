@@ -373,4 +373,36 @@ func homeResolution() {
   #expect(
     AgentHome.resolve(environment: ["PMAI_HOME": "  "], homeDirectory: fallback).rootURL.path
       == "/Users/example/.pmai")
+  #expect(
+    AgentHome.resolve(
+      environment: ["HOME": "/data/data/com.termux/files/home"], homeDirectory: fallback
+    )
+    .rootURL.path == "/data/data/com.termux/files/home/.pmai")
+  #expect(
+    AgentHome.resolve(
+      environment: [
+        "HOME": "/data/data/com.termux/files/home",
+        "PMAI_HOME": "~/.local/state/pmai",
+      ],
+      homeDirectory: fallback
+    ).rootURL.path == "/data/data/com.termux/files/home/.local/state/pmai")
+}
+
+@Test("User paths expand against the shell HOME")
+func userPathResolution() {
+  let fallback = URL(fileURLWithPath: "/Users/example", isDirectory: true)
+  let environment = ["HOME": "/data/data/com.termux/files/home"]
+  #expect(
+    AgentHome.userHomeDirectory(environment: environment, fallback: fallback).path
+      == "/data/data/com.termux/files/home")
+  #expect(
+    AgentHome.expandUserPath("~", environment: environment, fallback: fallback)
+      == "/data/data/com.termux/files/home")
+  #expect(
+    AgentHome.expandUserPath(
+      "~/.config/pmai/config.json", environment: environment, fallback: fallback)
+      == "/data/data/com.termux/files/home/.config/pmai/config.json")
+  #expect(
+    AgentHome.expandUserPath("relative/file", environment: environment, fallback: fallback)
+      == "relative/file")
 }

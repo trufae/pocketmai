@@ -904,7 +904,8 @@ struct MaiCLI {
         let project = try home.openProject(
           atWorkingDirectory: URL(
             fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true))
-        let store = resolvedChatStore(options: options, home: home, project: project)
+        let store = resolvedChatStore(
+          options: options, home: home, project: project, environment: environment)
         let workspace = try store.loadWorkspace { error in
           FileHandle.standardError.write(
             Data("warning: skipped a chat file. \(error.localizedDescription)\n".utf8))
@@ -913,8 +914,8 @@ struct MaiCLI {
         return
       }
 
-      let loaded = try loadConfiguration(options: options)
-      let configurationPath = loaded?.path ?? defaultConfigurationPath
+      let loaded = try loadConfiguration(options: options, environment: environment)
+      let configurationPath = loaded?.path ?? defaultConfigurationPath(environment: environment)
       var configuration = loaded?.configuration
       if var existing = configuration {
         var changed = existing.associateSystemPrompts()
@@ -953,6 +954,7 @@ struct MaiCLI {
         options: options,
         loadedConfigurationPath: loaded?.path,
         configuration: configuration,
+        environment: environment,
         host: nativePluginHost,
         registry: plugins)
       let memoryState = MemoryState(
@@ -1022,7 +1024,8 @@ struct MaiCLI {
       await runtime.configureMemory(memoryState.promptSection)
       await runtime.configureProjectInstructions(projectInstructionsSection(configuration))
       await runtime.configurePlanning(configuration?.use.plan ?? true)
-      let store = resolvedChatStore(options: options, home: home, project: project)
+      let store = resolvedChatStore(
+        options: options, home: home, project: project, environment: environment)
       importLegacyChats(into: store, project: project, options: options, environment: environment)
       let providerOverride =
         options.providerOverride
@@ -1122,6 +1125,7 @@ struct MaiCLI {
     options: CLIOptions,
     loadedConfigurationPath: String?,
     configuration: MaiConfiguration?,
+    environment: [String: String],
     host: NativePluginHost,
     registry: PluginRegistry
   ) async throws {
@@ -1141,7 +1145,7 @@ struct MaiCLI {
     }
 
     for item in configured + commandLine {
-      let expanded = NSString(string: item.entry.path).expandingTildeInPath
+      let expanded = AgentHome.expandUserPath(item.entry.path, environment: environment)
       let url = URL(fileURLWithPath: expanded, relativeTo: item.baseURL).standardizedFileURL
       do {
         _ = try await host.loadPlugin(at: url, into: registry)
@@ -7839,7 +7843,7 @@ struct MaiCLI {
   /// elided when it is still too long, keeping the tail people recognize.
   private static func abbreviatedPath(_ path: String, width: Int = 44) -> String {
     var shown = path
-    let home = NSHomeDirectory()
+    let home = AgentHome.userHomeDirectory().path
     if shown == home {
       shown = "~"
     } else if shown.hasPrefix(home + "/") {
@@ -8242,8 +8246,8 @@ struct MaiCLI {
     }
   }
 
-  private static var defaultConfigurationPath: String {
-    NSString(string: "~/.config/pmai/config.json").expandingTildeInPath
+  private static func defaultConfigurationPath(environment: [String: String]) -> String {
+    AgentHome.expandUserPath("~/.config/pmai/config.json", environment: environment)
   }
 
   /// Where pmai kept chats and history before projects existed.
@@ -8255,7 +8259,8 @@ struct MaiCLI {
     if let path = options.homePath {
       return AgentHome(
         rootURL: URL(
-          fileURLWithPath: NSString(string: path).expandingTildeInPath, isDirectory: true))
+          fileURLWithPath: AgentHome.expandUserPath(path, environment: environment),
+          isDirectory: true))
     }
     return AgentHome.resolve(environment: environment)
   }
@@ -8275,12 +8280,14 @@ struct MaiCLI {
   private static func resolvedChatStore(
     options: CLIOptions,
     home: AgentHome,
-    project: AgentProject
+    project: AgentProject,
+    environment: [String: String]
   ) -> AgentChatStore {
     if let path = options.statePath {
       return AgentChatStore(
         directoryURL: URL(
-          fileURLWithPath: NSString(string: path).expandingTildeInPath, isDirectory: true))
+          fileURLWithPath: AgentHome.expandUserPath(path, environment: environment),
+          isDirectory: true))
     }
     return home.chatStore(for: project)
   }
@@ -8292,12 +8299,12 @@ struct MaiCLI {
     environment: [String: String]
   ) -> URL {
     if let path = options.historyPath {
-      return URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
+      return URL(fileURLWithPath: AgentHome.expandUserPath(path, environment: environment))
     }
     let url = home.historyURL
     let legacy = URL(
-      fileURLWithPath: NSString(string: "\(legacyStateDirectory)/history.json")
-        .expandingTildeInPath)
+      fileURLWithPath: AgentHome.expandUserPath(
+        "\(legacyStateDirectory)/history.json", environment: environment))
     if usesDefaultHome(options: options, environment: environment),
       !FileManager.default.fileExists(atPath: url.path),
       FileManager.default.fileExists(atPath: legacy.path)
@@ -8320,7 +8327,8 @@ struct MaiCLI {
     guard options.statePath == nil, usesDefaultHome(options: options, environment: environment)
     else { return }
     let legacy = URL(
-      fileURLWithPath: NSString(string: "\(legacyStateDirectory)/chats.json").expandingTildeInPath)
+      fileURLWithPath: AgentHome.expandUserPath(
+        "\(legacyStateDirectory)/chats.json", environment: environment))
     guard FileManager.default.fileExists(atPath: legacy.path) else { return }
     do {
       var workspace = try AgentChatWorkspace.load(from: legacy)
@@ -8644,10 +8652,11 @@ struct MaiCLI {
   }
 
   private static func loadConfiguration(
-    options: CLIOptions
+    options: CLIOptions,
+    environment: [String: String]
   ) throws -> (configuration: MaiConfiguration, path: String)? {
     if let explicit = options.configPath {
-      let expanded = NSString(string: explicit).expandingTildeInPath
+      let expanded = AgentHome.expandUserPath(explicit, environment: environment)
       guard FileManager.default.fileExists(atPath: expanded) else {
         throw CLIError.configNotFound(expanded)
       }
@@ -8655,7 +8664,7 @@ struct MaiCLI {
     }
     let candidates = [
       FileManager.default.currentDirectoryPath + "/pmai.json",
-      NSString(string: "~/.config/pmai/config.json").expandingTildeInPath,
+      defaultConfigurationPath(environment: environment),
     ]
     for path in candidates where FileManager.default.fileExists(atPath: path) {
       return (try MaiConfiguration.load(from: URL(fileURLWithPath: path)), path)

@@ -147,7 +147,7 @@ extension ChatFileStore where Chat == AgentChat {
 ///     ~/.pmai/skills/<name>/SKILL.md     skills every project may use
 ///     ~/.pmai/projects/<id>/             the same files, for read-only directories
 ///
-/// The root is `$PMAI_HOME` when set, else `~/.pmai`.
+/// The root is `$PMAI_HOME` when set, else `$HOME/.pmai`.
 public struct AgentHome: Sendable {
   public static let directoryName = ".pmai"
   public static let environmentVariable = "PMAI_HOME"
@@ -168,14 +168,47 @@ public struct AgentHome: Sendable {
     environment: [String: String] = ProcessInfo.processInfo.environment,
     homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
   ) -> AgentHome {
+    let userHome = userHomeDirectory(environment: environment, fallback: homeDirectory)
     if let override = environment[environmentVariable]?.trimmingCharacters(
       in: .whitespacesAndNewlines), !override.isEmpty
     {
-      let expanded = NSString(string: override).expandingTildeInPath
-      return AgentHome(rootURL: URL(fileURLWithPath: expanded, isDirectory: true))
+      return AgentHome(
+        rootURL: URL(
+          fileURLWithPath: expandUserPath(
+            override, environment: environment, fallback: homeDirectory),
+          isDirectory: true))
     }
     return AgentHome(
-      rootURL: homeDirectory.appendingPathComponent(directoryName, isDirectory: true))
+      rootURL: userHome.appendingPathComponent(directoryName, isDirectory: true))
+  }
+
+  /// The shell's home is authoritative for command-line hosts such as Termux.
+  /// Foundation's home remains the fallback for app hosts and sparse process
+  /// environments.
+  public static func userHomeDirectory(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    fallback: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+  ) -> URL {
+    guard
+      let raw = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !raw.isEmpty, raw.hasPrefix("/")
+    else { return fallback }
+    return URL(fileURLWithPath: raw, isDirectory: true).standardizedFileURL
+  }
+
+  /// Expands `~` against the same home used by `resolve`, avoiding Foundation
+  /// and the shell disagreeing about the current user's directory on Android.
+  public static func expandUserPath(
+    _ path: String,
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    fallback: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+  ) -> String {
+    let home = userHomeDirectory(environment: environment, fallback: fallback)
+    if path == "~" { return home.path }
+    if path.hasPrefix("~/") {
+      return home.appendingPathComponent(String(path.dropFirst(2))).path
+    }
+    return NSString(string: path).expandingTildeInPath
   }
 
   public var projectIndexURL: URL {
