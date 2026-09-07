@@ -84,9 +84,18 @@ Three facts decide everything below:
   and a note to answer with what it has.
 - [x] **Empty replies in a row were also endless** (`dd85f41`). Same treatment
   after three consecutive empty replies; the error also carries its message again.
-- [x] **Native `respond` in a text protocol** (this pass). The text prompt
+- [x] **Native `respond` in a text protocol** (`c36ca7b`). The text prompt
   offers a `respond` pseudo-tool; when a server returns it as a native call it
   was "not available to this agent". It is the final answer now.
+- [x] **Tool output noise** (this pass). The call line showed raw JSON (a
+  `files_write` printed the whole escaped file) and the result hid under a
+  heading. Calls are one readable line (`→ files_read cli.py`,
+  `→ files_patch path=… find=… (+1 lines) replace=…`), results start right
+  after `←`, errors read `← Error: …`; the same renderers serve child-agent
+  blocks and the visual mode. Still open: `ui.toolResultLines` defaults to all
+  lines, so a 500-line read floods the terminal; a default of ~40 with the
+  `… N more lines` tail is probably right, and `ui.subagents` could gain a
+  `results` level (results only, no calls) to match what people read.
 
 ## 3. Tool catalog: the 3.7k tokens paid on every call
 
