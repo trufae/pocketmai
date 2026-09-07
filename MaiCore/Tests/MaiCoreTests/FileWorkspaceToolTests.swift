@@ -168,6 +168,16 @@ func fileWorkspaceSearchUsesCodingFriendlyDefaults() async throws {
     #expect(paths.contains("Drafts/UntrackedNeedle.swift"))
     #expect(!paths.contains("scratch/IgnoredNeedle.swift"))
     #expect(result.structuredContent?.objectValue?["searchMethod"] == .string("git"))
+
+    // A workspace rooted in a folder the repository ignores is not empty to
+    // the model: git lists nothing there, so the filtered walk takes over.
+    let ignoredRoot = root.appendingPathComponent("scratch")
+    let grep = MaiFileWorkspaceTool(
+      operation: .grep, configuration: MaiFileWorkspaceConfiguration(rootURL: ignoredRoot))
+    let inside = try await call(grep, ["query": .string("ignored")])
+    #expect(inside.text.contains("IgnoredNeedle.swift:1: ignored"))
+    #expect(
+      inside.structuredContent?.objectValue?["searchMethod"] == .string("filtered-filesystem"))
   }
 
   @Test("Files search includes tracked and new non-ignored Mercurial files")

@@ -1405,6 +1405,9 @@ private struct MaiFileWorkspace: Sendable {
         }
       }
 
+      // A folder the VCS lists nothing for (ignored by a parent repository, say)
+      // is searched like any other folder rather than reported empty.
+      guard !candidates.isEmpty else { return nil }
       let eligible = candidates.sorted {
         $0.path.localizedStandardCompare($1.path) == .orderedAscending
       }
