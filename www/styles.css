@@ -88,7 +88,7 @@ code { font-family: var(--mono); }
   overflow: hidden;
   border: 2px solid var(--ink);
   border-radius: 10px;
-  background: var(--accent);
+  background: var(--white);
 }
 
 .brand-mark img { width: 34px; }
@@ -248,6 +248,7 @@ h2 em {
 
 .platform-title > img,
 .terminal-mark {
+  flex: 0 0 52px;
   width: 52px;
   height: 52px;
   border: 2px solid currentColor;
@@ -260,9 +261,10 @@ h2 em {
   display: grid;
   place-items: center;
   color: var(--ink);
-  background: var(--accent);
-  font: 900 18px var(--mono);
+  background: var(--white);
 }
+
+.terminal-mark img { width: 40px; height: 40px; object-fit: contain; }
 
 .platform-title span:not(.terminal-mark) { font: 650 16px var(--sans); }
 .platform-title h2 { margin: 2px 0 0; font: 700 30px/1.1 var(--display); letter-spacing: -0.025em; }

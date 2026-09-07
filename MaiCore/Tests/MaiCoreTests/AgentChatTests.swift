@@ -144,6 +144,7 @@ func agentChatWorkspaceOrdering() {
   #expect(workspace.archivedChats.map(\.title) == ["Archived"])
   #expect(workspace.orderedChats.map(\.title) == ["Newer", "Tie", "Older", "Archived"])
   #expect(workspace.mostRecentActiveChat?.title == "Newer")
+  #expect(workspace.mostRecentChat?.title == "Archived")
 }
 
 @Test("Starting a new chat keeps a single placeholder and drops the rest")

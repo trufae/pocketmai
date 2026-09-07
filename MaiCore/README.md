@@ -217,7 +217,9 @@ whichever way the process ends. Saving never deletes an existing file, so
 upgrading a store cannot lose a chat. `AgentProject`, `AgentProjectIndex`, and
 `AgentHome` carry the project side, with `AgentProjectTint` stored the way
 PocketMai folder colors always were.
-`--resume` reopens the most recently updated chat instead. `/chat list`
+`-l` lists saved chats for the current project, and `-r INDEX|ID|TITLE` (or
+`--resume`) reopens one; `-r` without a selector reopens the most recently
+updated chat. `/chat list`
 shows the earlier chats grouped by day (Today, Yesterday, This week, Last week,
 then dates), newest first, with their agent, size, and last-update time, and
 lists archived chats last; `/chat list active` and `/chat list archived` narrow

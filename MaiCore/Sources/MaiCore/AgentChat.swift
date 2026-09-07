@@ -231,6 +231,11 @@ public struct AgentChatWorkspace: Codable, Equatable, Sendable {
     activeChats.first { $0.hasConversation }
   }
 
+  /// The newest saved conversation, including archived chats.
+  public var mostRecentChat: AgentChat? {
+    chats.filter(\.hasConversation).sorted(by: Self.precedes).first
+  }
+
   public var hasUncommittedChanges: Bool {
     !modifiedChatIDs.isEmpty || !removedChatIDs.isEmpty
   }

@@ -47,6 +47,8 @@ private struct CLIOptions {
   var yolo = false
   /// Reopen the most recently updated chat instead of starting a fresh one.
   var resume = false
+  /// A chat list index, UUID prefix, or title to reopen.
+  var resumeSelector: String?
   /// Render replies as markdown; nil follows the configuration and the tty.
   var markdown: Bool?
   var imagePaths: [String] = []
@@ -58,6 +60,8 @@ private struct CLIOptions {
   var printConfig = false
   /// List every known project and exit.
   var listProjects = false
+  /// List this project's saved chats and exit.
+  var listChats = false
   /// Serve one protocol on stdio instead of the REPL.
   var serve: ServeMode?
 
@@ -80,6 +84,8 @@ private struct CLIOptions {
         homePath = try Self.value(after: argument, in: arguments, index: &index)
       case "--projects":
         listProjects = true
+      case "-l", "--list":
+        listChats = true
       case "--agent":
         agentOverride = try Self.value(after: argument, in: arguments, index: &index)
       case "--provider":
@@ -110,8 +116,12 @@ private struct CLIOptions {
         stream = false
       case "-y", "--yolo":
         yolo = true
-      case "--resume", "--continue":
+      case "-r", "--resume", "--continue":
         resume = true
+        if index + 1 < arguments.count, !arguments[index + 1].hasPrefix("-") {
+          index += 1
+          resumeSelector = arguments[index]
+        }
       case "--markdown":
         markdown = true
       case "--no-markdown":
@@ -170,6 +180,7 @@ private enum CLIError: LocalizedError {
   case invalidURL(String)
   case missingValue(String)
   case unknownOption(String)
+  case unknownChat(String)
   case invalidCount(String, String)
   case configNotFound(String)
   case noProvider
@@ -190,6 +201,7 @@ private enum CLIError: LocalizedError {
     case .invalidURL(let value): "Invalid URL: \(value)"
     case .missingValue(let option): "Missing value after \(option)."
     case .unknownOption(let option): "Unknown option: \(option)"
+    case .unknownChat(let selector): "No chat matches '\(selector)'. Run pmai -l to list chats."
     case .invalidCount(let option, let value):
       "\(option) expects a non-negative integer, got '\(value)'."
     case .configNotFound(let path): "Configuration file not found: \(path)"
@@ -834,6 +846,19 @@ struct MaiCLI {
       if options.listProjects {
         let home = resolvedHome(options: options, environment: environment)
         print(projectListing(try home.loadProjectIndex(), currentID: nil, now: Date()))
+        return
+      }
+      if options.listChats {
+        let home = resolvedHome(options: options, environment: environment)
+        let project = try home.openProject(
+          atWorkingDirectory: URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true))
+        let store = resolvedChatStore(options: options, home: home, project: project)
+        let workspace = try store.loadWorkspace { error in
+          FileHandle.standardError.write(
+            Data("warning: skipped a chat file. \(error.localizedDescription)\n".utf8))
+        }
+        print(chatListing(workspace, scope: .all, selectedID: nil))
         return
       }
 
@@ -7842,10 +7867,19 @@ struct MaiCLI {
       }
     }
     // Like the PocketMai app, every launch opens a fresh chat and keeps the
-    // earlier ones one `/chat use` away; `--resume` reopens the latest instead.
-    if options.resume, let recent = workspace.mostRecentActiveChat {
-      workspace.selectChat(id: recent.id)
-      return workspace
+    // earlier ones one `/chat use` away; `--resume` reopens a saved chat instead.
+    if options.resume {
+      if let selector = options.resumeSelector {
+        guard let chat = resolveChat(selector, in: workspace) else {
+          throw CLIError.unknownChat(selector)
+        }
+        workspace.selectChat(id: chat.id)
+        return workspace
+      }
+      if let recent = workspace.mostRecentChat {
+        workspace.selectChat(id: recent.id)
+        return workspace
+      }
     }
     workspace.startNewChat(primaryAgent: initialProfile.agentDefinition)
     return workspace
@@ -8402,7 +8436,8 @@ struct MaiCLI {
     Removing a tool call or result also removes its linked tool transaction.
     pmai opens a fresh chat on every launch and names it after the first
     message; chats that never received a message are never written. Start
-    with --resume to reopen the most recently updated chat instead. Chats
+    Start with -l to list saved chats, then -r INDEX|ID|TITLE to reopen one;
+    -r without a selector reopens the most recently updated chat. Chats
     belong to the project rooted at the start directory; /project shows it.
     """
 
@@ -8638,7 +8673,8 @@ struct MaiCLI {
         --no-stream         disable response streaming
         -y, --yolo          permit all tool calls without prompting for this run
                             (/set yolo on saves the choice for every run)
-        --resume            reopen the most recently updated chat instead of a fresh one
+        -l, --list          list saved chats in this project and exit
+        -r, --resume [CHAT] reopen CHAT (list index, ID, or title), or the latest chat
         --markdown          render replies as markdown even when piped
         --no-markdown       print replies verbatim
         -h, --help          show this help
