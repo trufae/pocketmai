@@ -222,6 +222,40 @@ func toolProxyNestedEnvelope() {
   #expect(resolved.call?.argumentValues["path"] == .string("cli.py"))
 }
 
+@Test("A call repeated past the identical-call guard withdraws the tools and forces an answer")
+func repeatedCallWithdrawsTools() async throws {
+  let same = ProviderResponse(
+    message: AgentMessage(
+      role: .assistant,
+      content: [.toolCall(ToolCall(id: "c", name: "probe", arguments: .object([:])))]),
+    stopReason: .toolCall)
+  let provider = ScriptedProvider(
+    responses: Array(repeating: same, count: 5)
+      + [ProviderResponse(message: .assistant("Stuck; here is what I have."), stopReason: .stop)])
+  let runtime = AgentRuntime()
+  try await runtime.register(provider)
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "probe", description: "Probe")) { _, _ in
+      ToolOutput(text: "Error: nope", isError: true)
+    })
+
+  let result = try await runtime.run(
+    AgentRequest(
+      provider: "scripted",
+      model: "fixture",
+      messages: [.user("probe until it works")],
+      toolNames: ["probe"]))
+
+  #expect(result.response.text == "Stuck; here is what I have.")
+  let requests = await provider.requests
+  #expect(requests.count == 6)
+  // The fourth identical call trips the guard; the fifth turn is offered no tools.
+  #expect(!requests[3].tools.isEmpty)
+  #expect(requests[4].tools.isEmpty)
+  #expect(requests[4].messages.contains { $0.text.contains("repeated with identical arguments") })
+  #expect(result.transcript.contains { $0.toolResults.contains { $0.text.contains("already run 3 times") } })
+}
+
 @Test("Tool result previews bound lines, line length, and terminal control characters")
 func toolResultPreview() {
   let result = ToolResult(

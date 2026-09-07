@@ -345,6 +345,10 @@ public actor AgentRuntime {
     var localModelTurns = 0
     var localToolCalls = 0
     var repeatedCalls: [ToolCallKey: Int] = [:]
+    /// Set once a call came back a fourth time with the same arguments. The
+    /// next turn is offered no tools and asked to answer: a model that keeps
+    /// repeating a refused call otherwise repeats it until the turn limit.
+    var repeatGuardTripped = false
     var completedToolRuns: [ToolCallKey: String] = [:]
 
     /// A limit met at a turn boundary pauses the run instead of failing it.
@@ -453,7 +457,8 @@ public actor AgentRuntime {
       // Once the run's tool budget is spent the model gets no tools and is
       // told to answer, instead of the run failing with a limit error.
       let toolBudgetExhausted =
-        !definitions.isEmpty && localToolCalls >= request.limits.maxToolCalls
+        !definitions.isEmpty
+        && (localToolCalls >= request.limits.maxToolCalls || repeatGuardTripped)
       var providerMessages = transcript
       if let instructionsSection {
         insertSystem(instructionsSection, into: &providerMessages)
@@ -464,7 +469,7 @@ public actor AgentRuntime {
       if textToolMode != nil || toolBudgetExhausted {
         let prompt =
           toolBudgetExhausted
-          ? Self.toolBudgetExhaustedPrompt
+          ? (repeatGuardTripped ? Self.repeatedCallPrompt : Self.toolBudgetExhaustedPrompt)
           : textToolPrompt(definitions, mode: textToolMode ?? .text)
         insertSystem(prompt, into: &providerMessages)
       }
@@ -646,6 +651,7 @@ public actor AgentRuntime {
               budget: budget,
               emit: emit)
           } else {
+            repeatGuardTripped = true
             await emit(.toolStarted(context, call))
             result = ToolResult(
               callID: call.id,
@@ -1708,6 +1714,8 @@ public actor AgentRuntime {
 
   static let toolBudgetExhaustedPrompt =
     "The tool call budget for this run is exhausted and no tools are available anymore. Do not call tools; give the final answer using the information already gathered."
+  static let repeatedCallPrompt =
+    "The same tool call was repeated with identical arguments too many times, so no tools are available anymore. Do not call tools; give the final answer using the information already gathered, and say what could not be done."
 
   /// Adds a system message after the configured instructions and before the
   /// conversation, so run-scoped context never enters the stored transcript.
