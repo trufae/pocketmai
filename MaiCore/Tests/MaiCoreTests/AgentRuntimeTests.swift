@@ -103,6 +103,14 @@ func toolProxyResolution() throws {
   #expect(resolved.call?.argumentValues["city"] == .string("Rome"))
 }
 
+@Test("JSON values render with sorted keys so a repeated message is byte-identical")
+func compactJSONSortsKeys() {
+  let value = JSONValue.object([
+    "workspace": .string("w"), "entries": .array([.integer(1)]), "path": .string("."),
+  ])
+  #expect(value.compactJSONString == #"{"entries":[1],"path":".","workspace":"w"}"#)
+}
+
 @Test("Tool result previews bound lines, line length, and terminal control characters")
 func toolResultPreview() {
   let result = ToolResult(

@@ -221,8 +221,13 @@ public enum JSONValue: Codable, Equatable, Sendable {
     }
   }
 
+  /// Keys are sorted so the same value renders the same way every time: a
+  /// tool result that reaches the model through this text must not change
+  /// between requests, or the server's prompt cache misses from that message on.
   public var compactJSONString: String {
-    guard let data = try? JSONEncoder().encode(self),
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    guard let data = try? encoder.encode(self),
       let string = String(data: data, encoding: .utf8)
     else { return "null" }
     return string
