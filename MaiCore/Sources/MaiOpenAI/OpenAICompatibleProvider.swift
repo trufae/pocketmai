@@ -465,10 +465,16 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
         // sent only when there is no text to carry the result, so a listing or
         // a file is not paid for twice on every later request.
         let hasText = content.contains { part in
-          if case .text(let text) = part {
+          switch part {
+          case .text(let text):
             return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          case .file(let file):
+            return file.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+          case .resource(let resource):
+            return resource.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+          default:
+            return false
           }
-          return false
         }
         if !hasText, let structured = result.structuredContent {
           content.append(

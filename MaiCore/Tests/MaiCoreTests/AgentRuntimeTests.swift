@@ -135,18 +135,24 @@ func openAIStructuredContentOnlyWithoutText() async throws {
     callID: "c2",
     content: [],
     structuredContent: .object(["ok": .bool(true)]))
+  let read = ToolResult(
+    callID: "c3",
+    content: [.file(FileContent(name: "a.txt", mimeType: "text/plain", text: "hello"))],
+    structuredContent: .object(["totalBytes": .integer(5)]))
   let call = AgentMessage(
     role: .assistant,
     content: [
       .toolCall(ToolCall(id: "c1", name: "files_list", arguments: .object([:]))),
       .toolCall(ToolCall(id: "c2", name: "probe", arguments: .object([:]))),
+      .toolCall(ToolCall(id: "c3", name: "files_read", arguments: .object([:]))),
     ])
   _ = try await provider.complete(
     ProviderRequest(
       model: "test-model",
       messages: [
         .user("list"), call,
-        AgentMessage(role: .tool, content: [.toolResult(listing), .toolResult(bare)]),
+        AgentMessage(
+          role: .tool, content: [.toolResult(listing), .toolResult(bare), .toolResult(read)]),
       ],
       stream: false)
   ) { _ in }
@@ -154,7 +160,7 @@ func openAIStructuredContentOnlyWithoutText() async throws {
   let body = try jsonObject(try #require(recorder.body))
   let messages = try #require(body["messages"] as? [[String: Any]])
   let toolMessages = messages.filter { $0["role"] as? String == "tool" }
-  #expect(toolMessages.count == 2)
+  #expect(toolMessages.count == 3)
   let texts = toolMessages.map { message -> String in
     if let text = message["content"] as? String { return text }
     let parts = message["content"] as? [[String: Any]] ?? []
@@ -162,6 +168,8 @@ func openAIStructuredContentOnlyWithoutText() async throws {
   }
   #expect(texts[0] == "a.txt (3 bytes)")
   #expect(texts[1] == "<structured_content>\n{\"ok\":true}\n</structured_content>")
+  #expect(texts[2].contains("hello"))
+  #expect(!texts[2].contains("structured_content"))
 }
 
 @Test("Tool proxy names its catalog and caps a broad listing")
@@ -766,7 +774,9 @@ func proxiedToolLoop() async throws {
       useToolProxy: true))
 
   #expect(result.transcript.flatMap(\.toolResults).first?.text == "HELLO")
-  #expect(await provider.requests.first?.tools == ToolProxy.definitions)
+  let offered = await provider.requests.first?.tools ?? []
+  #expect(offered.map(\.name) == [ToolProxy.listName, ToolProxy.callName])
+  #expect(offered.first?.description.contains("Enabled tools:") == true)
 }
 
 @Test("Providers without native tools use the JSON fallback without leaking protocol text")
