@@ -860,9 +860,15 @@ public actor AgentRuntime {
       resolvedCall = call
     }
 
-    // Legacy names resolve to the definition of the tool that replaced them.
+    // Legacy names resolve to the definition of the tool that replaced them,
+    // and a name the provider could not map (text protocols offer no tools, so
+    // its resolver is empty) gets the same alias and glued-suffix treatment.
     let definitionName = Self.canonicalToolName(resolvedCall.name)
-    guard let definition = definitions.first(where: { $0.name == definitionName }) else {
+    let definition =
+      definitions.first(where: { $0.name == definitionName })
+      ?? AgentToolNameResolver(tools: definitions).canonicalName(for: definitionName)
+      .flatMap { canonical in definitions.first(where: { $0.name == canonical }) }
+    guard let definition else {
       // A call that never runs is still shown, so the person sees what the
       // model tried rather than an error out of nowhere.
       await emit(.toolStarted(context, resolvedCall))

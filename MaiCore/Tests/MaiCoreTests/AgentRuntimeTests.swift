@@ -1128,6 +1128,38 @@ func repeatedEmptyRepliesWithdrawTools() async throws {
 
 private struct EmptyReplyFailure: ProviderEmptyResponseError {}
 
+@Test("The run loop resolves a glued tool name the provider could not map")
+func runLoopResolvesGluedNames() async throws {
+  let provider = ScriptedProvider(
+    responses: [
+      ProviderResponse(
+        message: AgentMessage(
+          role: .assistant,
+          content: [
+            .toolCall(
+              ToolCall(id: "g1", name: "probe Optimize:", arguments: .object([:])))
+          ]),
+        stopReason: .toolCall),
+      ProviderResponse(message: .assistant("Probed."), stopReason: .stop),
+    ],
+    capabilities: [.streaming])
+  let runtime = AgentRuntime()
+  try await runtime.register(provider)
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "probe", description: "Probe")) { _, _ in
+      ToolOutput(text: "42")
+    })
+
+  let result = try await runtime.run(
+    AgentRequest(
+      provider: "scripted", model: "fixture", messages: [.user("probe")],
+      toolNames: ["probe"], toolCallingStrategy: .json))
+
+  #expect(result.response.text == "Probed.")
+  #expect(result.toolCalls == 1)
+  #expect(result.transcript.contains { $0.toolResults.contains { $0.text == "42" } })
+}
+
 @Test("A call without reported usage is estimated, marked as such, and still counts against the budget")
 func estimatedUsage() async throws {
   let provider = ScriptedProvider(responses: [
