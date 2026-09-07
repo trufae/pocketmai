@@ -165,7 +165,16 @@ public struct AgentToolNameResolver: Sendable {
   }
 
   public func canonicalName(for name: String) -> String? {
-    canonicalByAlias[Self.key(name)] ?? canonicalByShortAlias[Self.shortKey(name)]
+    if let known = canonicalByAlias[Self.key(name)] ?? canonicalByShortAlias[Self.shortKey(name)] {
+      return known
+    }
+    // A model writing a call in its own syntax can hand the server a name with
+    // the arguments glued on ("run_sh Optimize:", "files_read.arguments"). The
+    // leading identifier is the tool it meant; failing it costs a whole turn.
+    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    let head = trimmed.prefix { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+    guard !head.isEmpty, head.count < trimmed.count else { return nil }
+    return canonicalByAlias[Self.key(String(head))]
   }
 
   public func apiName(for canonical: String) -> String {
