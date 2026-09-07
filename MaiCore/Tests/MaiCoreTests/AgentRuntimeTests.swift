@@ -201,6 +201,27 @@ func toolProxyCatalogAndCap() {
   #expect(ranked.hasPrefix("- files_read"))
 }
 
+@Test("Tool proxy unwraps a call envelope nested inside the arguments")
+func toolProxyNestedEnvelope() {
+  let definitions = [
+    ToolDefinition(
+      name: "files_read", description: "Read.",
+      parameters: [
+        ToolParameterDef(name: "path", type: "string", description: "Path.", required: true)
+      ])
+  ]
+  let resolved = ToolProxy.resolveCall(
+    arguments: [
+      "name": .string("files_read"),
+      "arguments": .object([
+        "name": .string("files_read"), "arguments": .object(["path": .string("cli.py")]),
+      ]),
+    ],
+    definitions: definitions)
+  #expect(resolved.error == nil)
+  #expect(resolved.call?.argumentValues["path"] == .string("cli.py"))
+}
+
 @Test("Tool result previews bound lines, line length, and terminal control characters")
 func toolResultPreview() {
   let result = ToolResult(

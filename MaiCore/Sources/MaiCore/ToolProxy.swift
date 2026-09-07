@@ -106,9 +106,18 @@ public enum ToolProxy {
     guard let definition = definitions.first(where: { $0.name == canonicalName }) else {
       return (nil, "Error: unknown tool '\(requestedName)'.")
     }
-    let normalized = AgentTooling.normalizeArguments(
-      argumentObject(from: arguments["arguments"]),
-      for: definition)
+    var argumentValues = argumentObject(from: arguments["arguments"])
+    // Some models wrap the call twice: {"name": T, "arguments": {"name": T,
+    // "arguments": {...}}}. The inner object is what they meant, unless the
+    // tool really takes an argument called "arguments".
+    let envelopeKeys: Set<String> = ["name", "tool", "tool_name", "arguments"]
+    if let inner = argumentValues["arguments"],
+      Set(argumentValues.keys).isSubset(of: envelopeKeys),
+      !definition.parameters.contains(where: { $0.name == "arguments" })
+    {
+      argumentValues = argumentObject(from: inner)
+    }
+    let normalized = AgentTooling.normalizeArguments(argumentValues, for: definition)
     return (
       ParsedToolCall(
         name: canonicalName,
