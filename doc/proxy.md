@@ -10,12 +10,13 @@ the other way MaiCore keeps a transcript small.
 ## Mechanism
 
 Without the proxy, every request carries the JSON schema of every enabled tool.
-The standard coding set (`files`, `run`, `todo`: 23 tools) is about 16k
-characters, roughly 3.7k tokens, and it is resent on every model turn of every
-run because the schemas live outside the conversation.
+The standard coding set (`files`, `run`, `todo`) is 17 tools and about 8.9k
+characters, roughly 2.2k tokens, after the catalog cut recorded in `LALA.md`
+(it was 23 tools and 16k characters before), and it is resent on every model
+turn of every run because the schemas live outside the conversation.
 
-With the proxy, the request carries only the two proxy schemas (about 290
-tokens). The model calls `list-tools keywords=…` to learn what exists and how
+With the proxy, the request carries only the two proxy schemas, which now end
+with the names of the enabled tools (about 340 tokens for the standard set). The model calls `list-tools keywords=…` to learn what exists and how
 to call it, then `call-tool name=… arguments={…}`. The runtime resolves the
 concrete tool (`ToolProxy.resolveCall`) and runs it exactly as if it had been
 called directly; approval rules, the identical-call guard and the tool budget
@@ -34,79 +35,101 @@ asks for, `N` the number of model turns in a run. Native mode pays `S × N`. The
 proxy pays roughly `L × (N − k)` where `k` is the turn on which the listing was
 requested, plus the extra turns spent on `list-tools` itself.
 
-With `S ≈ 3.7k`, a run of 7 turns pays about 26k tokens for schemas. The proxy
-wins as long as the listings it pulls into the transcript stay well below the
-schema size and cost few extra turns. It loses when `list-tools` returns most of
-the catalog: before the fix below, a search for `read file list files` returned
-10.9k characters (about 2.7k tokens), nearly the whole native schema set,
-which then stayed in the transcript for the rest of the run.
+With `S ≈ 2.2k` (it was 3.7k before the catalog cut), a run of 7 turns pays
+about 15k tokens for schemas. The proxy wins as long as the listings it pulls
+into the transcript stay well below the schema size and cost few extra turns.
+It loses when `list-tools` returns most of the catalog: before the fix below, a
+search for `read file list files` returned 10.9k characters (about 2.7k
+tokens), nearly the whole native schema set, which then stayed in the
+transcript for the rest of the run. And the smaller the native catalog gets,
+the less there is for the proxy to save.
 
 ## What the benchmark measured
 
-Thirteen coding tasks, `gemma4:31b` on Ollama cloud, one run per
-configuration. Totals over the 13 tasks (a single run each; expect noise of a
-few tasks' worth between repeats):
+Thirteen coding tasks, `gemma4:31b` on Ollama cloud. The first table is the
+initial study, before any fix, on the old 23-tool catalog; the second is the
+same benchmark on the current build (17-tool catalog, every fix in `LALA.md`
+applied), two runs per mode so the run-to-run noise is visible.
 
-| configuration | solved | model calls | prompt tokens | first-call prompt |
+| initial study (23 tools) | solved | model calls | prompt tokens | first-call prompt |
 |---|---|---|---|---|
 | native schemas, before fixes | 11/13 | 84 | 402k | 3,756 |
-| native schemas, after fixes | 13/13 | 76 | 334k | 3,756 |
 | proxy, before fixes | 4/13 | 49 | 107k | 219 |
-| proxy, after fixes | 8/13 | 128 | 167k | 344 |
 
-The proxy's low total before the fixes is not a saving: in 5 of the 13 tasks
-the model never called a tool. Seeing only `list-tools` and `call-tool` it
-answered "I do not have access to your local file system" and stopped. Where
-it did work, the saving was real: the rename task cost 24.6k prompt tokens
-through the proxy against 108.9k natively, the C build fix 15.7k against 48.7k,
-the grep question 3.7k against 7.9k.
+| current build (17 tools), two runs each | solved | model calls | prompt tokens | completion tokens | median call latency | tool errors |
+|---|---|---|---|---|---|---|
+| native schemas | 12/13, 13/13 | 79, 76 | 215k, 206k | 5.2k, 5.6k | 0.66s, 0.91s | 1, 6 |
+| pure proxy (every tool hidden) | 8/13, 5/13 | 95, 91 | 107k, 73k | 13.3k, 8.4k | 0.85s, 0.80s | 11, 40 |
+| hybrid proxy (6 common tools native) | 12/13, 12/13 | 72, 74 | 140k, 143k | 5.6k, 6.3k | 0.84s, 0.74s | 5, 5 |
 
-### Bugs found and fixed
+Wall time: a clean native sweep takes 71–90s for the 13 tasks, a hybrid sweep
+90–103s, a pure-proxy sweep about 107s; two of the six runs crossed a laptop
+sleep and one killed request, so their wall totals (282s, 630s) say nothing
+and the per-call latency column is the fair time comparison. A model call
+costs 0.7–0.9s whichever mode is on; what differs is how many calls a task
+takes and how many of them are wasted on errors.
 
-1. **The proxy tools did not say what they reach.** Their descriptions named no
-   capability, so the model declined tasks it could do. The definitions now end
-   with the enabled tool names (`Enabled tools: files_find, files_grep, …`),
-   about 120 tokens for the standard set. With the names in hand the model often
-   skips `list-tools` and calls the tool directly (`749db0d`).
-2. **`list-tools` returned everything with all arguments.** Terms found in a
-   tool's name now rank above terms found in its text, the first six matches are
-   described with their arguments, the rest are named in one line, and the
-   result tells the model to search by name for details (`749db0d`).
-3. **Nested envelopes.** `gemma4` sends
-   `{"name":"files_read","arguments":{"name":"files_read","arguments":{"path":"cli.py"}}}`.
-   The inner envelope reached the tool as its arguments, `path` was reported
-   missing, and the model repeated the identical call until the turn limit
-   (40 calls, 44 seconds, for a task that takes 7 natively). The resolver now
-   unwraps an arguments object that holds only envelope keys (`381901c`).
-4. **The identical-call guard did not end anything.** It refused the fourth
-   identical call with an error but the model kept repeating it, and the run
-   burned the remaining 36 turns. Once the guard trips, the next turn is offered
-   no tools and asked to answer with what it has (`564e280`). This is a runtime
-   fix, not a proxy one, but proxy mode is where it bit first: a model that
-   misunderstands the envelope repeats itself exactly.
+### What the pure proxy does to a model
 
-### After the fixes
+The pure proxy's low token count is not a saving. Where the model succeeded,
+it spent fewer tokens than natively (the rename: 6k against 38k; explaining
+the package: 5k against 18k). Where it failed, it failed cheaply, without
+doing the work:
 
-After the four fixes the proxy solved 8 of 13 tasks (128 model calls, 167k
-prompt tokens, 21k completion tokens, 168s) against 12–13 of 13 for native
-schemas at 334–386k prompt tokens. Half the tokens, but a third of the tasks
-lost, and the remaining failures are structural rather than bugs:
+- **It calls hidden tools by their real names.** Knowing from the `list-tools`
+  description that `files_patch` exists, gemma4 emits a `files_patch` call in
+  its own syntax. Only `call-tool` is declared, so the server drops the call
+  and returns an empty reply; after three of those the model announces that
+  "the necessary tools to edit files were not provided" and answers with what
+  it would have written. Every task that had to write a file failed this way.
+- **Nested JSON for file bodies.** `call-tool` puts the file content inside
+  `arguments` inside the outer object: two levels of escaping, which the model
+  gets wrong or gives up on (`Error: content is required.`).
+- **Envelopes in every shape.** `{"name": T, "arguments": {"name": T,
+  "arguments": {…}}}`, `{"arguments": {"name": T, "arguments": {…}}}` with no
+  name beside it, `{"arguments": {"commands": [...]}}`. Each shape cost a
+  refused call and a repeat until the resolver learned it (`381901c`,
+  `e2a74f3`).
+- **Twice the completion tokens** (13k against 5k): every call carries an
+  envelope and the tool name twice, and the swallowed replies still count.
 
-- **Writing files through nested JSON.** `call-tool` puts the file body inside
-  `arguments` inside the outer arguments object; two levels of JSON escaping.
-  gemma4's `files_write` calls came back malformed and were swallowed by the
-  server (empty replies), or the content arrived empty (`Error: content is
-  required.`). The three tasks that create or rewrite a file (`03`, `10`, `11`)
-  all failed this way; tasks that only patch, grep or run passed.
-- **Three times the completion tokens.** Every call is wrapped in an envelope,
-  and the model spells the tool name twice. 21k completion tokens against 6k.
-- **A listing is context debt.** Where the model did call `list-tools`, the
-  result (now ≤ ~3k characters) stayed in the transcript for the rest of the
-  run; natively the schemas cost the same on every call but never accumulate.
+### Bugs found and fixed along the way
 
-The saving is real on read-mostly work (the rename task: 25k tokens through
-the proxy against 34–109k natively; the grep question: 3.7k against 7.6k) and
-disappears on write-heavy work.
+1. **The proxy tools did not say what they reach** (`749db0d`): five tasks
+   ended with "I do not have access to your file system". The `list-tools`
+   description is now generated from the hidden tools, each with its name and
+   the start of its description (`9ffb9e3`), so the model knows what exists
+   without paying for the schemas.
+2. **`list-tools` returned everything with all arguments** (`749db0d`): a
+   search for `read file list files` produced 10.9k characters that stayed in
+   the transcript. Name matches rank first, six tools are described in full,
+   the rest are named.
+3. **Nested envelopes** (`381901c`, `e2a74f3`), see above.
+4. **The identical-call guard did not end anything** (`564e280`): after the
+   fourth identical refused call the run went on until the turn limit. The
+   tools are withdrawn for the next turn and the model asked to answer.
+5. **Empty replies did not end anything either** (`dd85f41`): three in a row
+   now withdraw the tools too, and in a proxied run the repair feedback says
+   how to reach a hidden tool through `call-tool` (`9ffb9e3`).
+6. **A hidden tool called by name was refused** ("proxy mode does not expose
+   tool"): it now runs (`9ffb9e3`). The proxy saves tokens; the agent's tool
+   list is the permission boundary.
+7. **`files_grep` stopped at 100 lines silently** (`cc2e74a`): the proxy runs
+   reached for grep where the native runs used `run_sh grep -c`, counted the
+   100 lines shown and answered "114 ERROR lines" for a log with 287.
+
+### The hybrid
+
+`useToolProxy` now keeps `files_read`, `files_grep`, `files_patch`,
+`files_write`, `files_list` and `run_sh` native (about 1k tokens of schema)
+and puts the rest behind `list-tools` and `call-tool`. An agent's
+`proxyExposedTools` names another set; an empty set is the pure proxy. On the
+benchmark the hybrid solves 12 of 13 tasks in both runs, like the native
+catalog, with 72–74 model calls for 140–143k prompt tokens: a third fewer
+tokens than native at the same pass rate, and none of the pure proxy's
+failure modes, because the calls that matter never go through an envelope.
+The remaining failure (`10-readme` once, `13-big-log` once) is the model's, not
+the proxy's: the same tasks fail natively now and then.
 
 ## When to use it
 
@@ -114,20 +137,21 @@ disappears on write-heavy work.
   agent with `github`, `web`, `mastodon` and `files` enabled at once. The
   schema cost grows with the catalog; the proxy's cost grows only with what a
   task actually asks about.
-- **Small, stable coding set: probably not.** The 23 standard tools cost about
-  3.7k tokens per call. Trimming that catalog (duplicate tools, repeated path
-  conventions in every description, the `todo` group for short tasks; see
-  `LALA.md`) attacks the same cost without adding a round trip or a listing
-  that stays in the transcript. A model that knows its tools also makes fewer
-  mistakes than one that must learn them mid-run.
-- **Hybrid worth trying.** Offer the six most used tools natively
-  (`files_read`, `files_grep`, `files_patch`, `files_write`, `run_sh`,
-  `files_list`) and put the rest behind the proxy. That keeps the per-call
-  cost near 1k tokens and still reaches everything.
+- **Small, stable coding set: the hybrid, or nothing.** The 17 standard tools
+  cost about 2.2k tokens per call after the catalog cut in `LALA.md`; the
+  hybrid brings that to about 1k plus the generated `list-tools` description,
+  at the same pass rate. The pure proxy is not worth its failure modes on a
+  catalog this small.
+- **Never the pure proxy for a coding agent.** Every file write goes through
+  two levels of JSON escaping and every hidden tool is one the model will try
+  to call by name. Reserve `proxyExposedTools: []` for measurements, or for
+  catalogs where nothing is called often enough to deserve a schema.
 
 ## Measuring it yourself
 
-    python3 tmp/bench/run.py --variant proxy
+    python3 tmp/bench/run.py --variant proxy      # every tool hidden
+    python3 tmp/bench/run.py --variant hybrid     # the default with useToolProxy
+    python3 tmp/bench/compare.py tmp/results/<run-a> tmp/results/<run-b>
     python3 tmp/bench/analyze.py tmp/results/<run-id> --detail all
 
 The `--detail` timeline shows each `list-tools` call and how many characters

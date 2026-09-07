@@ -615,8 +615,13 @@ compiled out on iOS. The iOS app continues to support Streamable HTTP only.
 
 The example MCP entry is disabled so the example remains safe to inspect. Set
 an HTTP URL or stdio command and enable it to expose all discovered tools. Set
-`useToolProxy` on an agent when models should see only MaiCore's shared
-`list-tools` and `call-tool` interface.
+`useToolProxy` on an agent to keep only the common tools (`files_read`,
+`files_grep`, `files_patch`, `files_write`, `files_list`, `run_sh`) as native
+schemas and put the rest behind MaiCore's `list-tools` and `call-tool`, whose
+description names every hidden tool. `proxyExposedTools` chooses another set of
+native tools, and an empty set hides them all; `/set tool.proxy on|all|off`
+does the same at the prompt. `doc/proxy.md` has the measurements behind the
+default.
 
 Agents can force MaiCore's emulated tool loop with `toolCallingStrategy` set to
 `text`, `xml`, or `json`. These modes send tool instructions as messages, parse
