@@ -163,3 +163,57 @@ public enum AgentAutocompaction {
     return candidates.map(\.id)
   }
 }
+
+/// The cheap half of keeping a conversation small: a file the model read
+/// two or more tool results ago has been acted on, so its body is replaced
+/// with a line that says what was there and how to get it back. Runs in
+/// `AgentContextMode.size` before each model call.
+public enum AgentContextPruning {
+  /// File bodies in the newest results stay: the model may still be working
+  /// on them.
+  public static let keepLatest = 2
+  /// Bodies shorter than this are left alone; the reference would not be smaller.
+  public static let minimumCharacters = 400
+
+  public static func prune(
+    _ messages: inout [AgentMessage],
+    keepLatest: Int = keepLatest
+  ) -> AgentTranscriptEditReport? {
+    var candidates: [Int] = []
+    for (index, message) in messages.enumerated() where message.role == .tool {
+      if message.toolResults.contains(where: { hasPrunableFile($0) }) { candidates.append(index) }
+    }
+    guard candidates.count > keepLatest else { return nil }
+    var report = AgentTranscriptEditReport(
+      charactersBefore: AgentTranscriptEditor.characterCount(of: messages))
+    for index in candidates.dropLast(keepLatest) {
+      var message = messages[index]
+      message.content = message.content.map { part in
+        guard case .toolResult(var result) = part, hasPrunableFile(result) else { return part }
+        let path = result.structuredContent?.objectValue?["path"]?.stringValue
+        result.content = result.content.map { inner in
+          guard case .file(let file) = inner, let text = file.text,
+            text.count >= minimumCharacters
+          else { return inner }
+          let lines = text.split(separator: "\n", omittingEmptySubsequences: false).count
+          return .text(
+            "[\(path ?? file.name): \(lines) lines, \(text.count) characters, read earlier and removed from the context; call files_read again if needed]"
+          )
+        }
+        report.rewritten += 1
+        return .toolResult(result)
+      }
+      messages[index] = message
+    }
+    guard report.rewritten > 0 else { return nil }
+    report.charactersAfter = AgentTranscriptEditor.characterCount(of: messages)
+    return report
+  }
+
+  private static func hasPrunableFile(_ result: ToolResult) -> Bool {
+    result.content.contains { part in
+      if case .file(let file) = part { return (file.text?.count ?? 0) >= minimumCharacters }
+      return false
+    }
+  }
+}

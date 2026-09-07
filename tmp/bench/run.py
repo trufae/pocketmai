@@ -69,7 +69,7 @@ def wait_port(port, timeout=10):
     return False
 
 
-def make_config(port, model, variant, instructions, strategy="automatic"):
+def make_config(port, model, variant, instructions, strategy="automatic", context="cache"):
     groups = ["files", "run", "todo"]
     agent = {
         "id": "coder",
@@ -79,6 +79,7 @@ def make_config(port, model, variant, instructions, strategy="automatic"):
         "model": model,
         "toolGroupNames": groups,
         "toolCallingStrategy": strategy,
+        "context": context,
         "useToolProxy": variant in ("proxy", "hybrid"),
         "toolDelegation": "subagent" if variant == "subagent" else "inline",
         "limits": {
@@ -161,7 +162,7 @@ def run_case(name, args, upstream, key):
         instructions = Path(args.system).read_text().strip()
     port = free_port()
     log = out_dir / "proxy.jsonl"
-    config = make_config(port, args.model, args.variant, instructions, args.strategy)
+    config = make_config(port, args.model, args.variant, instructions, args.strategy, args.context)
     config_path = out_dir / "pmai.json"
     config_path.write_text(json.dumps(config, indent=2))
 
@@ -213,6 +214,7 @@ def run_case(name, args, upstream, key):
         "case": name,
         "variant": args.variant,
         "strategy": args.strategy,
+        "context": args.context,
         "model": args.model,
         "prompt": prompt,
         "instructions": instructions,
@@ -240,6 +242,8 @@ def main():
     parser.add_argument("--run-id")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--system", help="file with agent instructions replacing the default")
+    parser.add_argument("--context", default="cache", choices=["cache", "size"],
+                        help="context mode of the agent: cache keeps every message, size prunes read files")
     parser.add_argument("--strategy", default="automatic",
                         choices=["automatic", "native", "text", "xml", "json"],
                         help="toolCallingStrategy of the agent")

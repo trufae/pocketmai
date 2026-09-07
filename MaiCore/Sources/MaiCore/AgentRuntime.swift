@@ -384,6 +384,14 @@ public actor AgentRuntime {
     while true {
       try Task.checkCancellation()
       try await holdWhilePaused(pid)
+      // In size mode the bodies of files read two or more results ago make
+      // way for a reference before every call; in cache mode nothing sent
+      // is ever touched, so the server's prompt cache covers it.
+      if request.context == .size, let report = AgentContextPruning.prune(&transcript) {
+        lastUsage = nil
+        await emit(.transcriptEdited(context, report))
+        await supervisor.note(pid, transcript: transcript)
+      }
       // Anything a person queued for this process since the last turn joins
       // the conversation here, after the tool results the model is about to
       // read, so a running agent can be steered without stopping it.
@@ -1418,7 +1426,8 @@ public actor AgentRuntime {
       proxyExposedTools: request.proxyExposedTools,
       toolDelegation: .inline,
       retry: request.retry,
-      autocompact: request.autocompact)
+      autocompact: request.autocompact,
+      context: request.context)
   }
 
   private func fail(
@@ -1714,7 +1723,8 @@ public actor AgentRuntime {
       proxyExposedTools: definition.proxyExposedTools,
       toolDelegation: definition.toolDelegation,
       retry: definition.retry,
-      autocompact: definition.autocompact)
+      autocompact: definition.autocompact,
+      context: definition.context)
   }
 
   static let toolBudgetExhaustedPrompt =

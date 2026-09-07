@@ -814,6 +814,16 @@ public struct AgentRetryPolicy: Codable, Equatable, Sendable {
 /// context. Context windows differ per model and most providers do not say
 /// how big theirs is, so the trigger is an absolute token count rather than
 /// a percentage.
+/// What a run optimises its conversation for. `cache` never touches a message
+/// once sent, so a server's prompt cache covers every earlier turn; `size`
+/// replaces the bodies of files read in earlier turns with a one-line
+/// reference before each model call, at the price of invalidating the cache
+/// from that message on.
+public enum AgentContextMode: String, Codable, Equatable, Sendable {
+  case cache
+  case size
+}
+
 public struct AgentAutocompact: Codable, Equatable, Sendable {
   /// Estimated tokens in the conversation at which compaction runs. Zero
   /// turns it off.
@@ -905,6 +915,9 @@ public struct AgentDefinition: Codable, Equatable, Identifiable, Sendable {
   public var retry: AgentRetryPolicy
   /// When the runtime summarizes the older part of a conversation by itself.
   public var autocompact: AgentAutocompact
+  /// Whether the run keeps every message as sent (cache) or prunes consumed
+  /// file bodies before each call (size).
+  public var context: AgentContextMode
 
   public init(
     id: String,
@@ -928,7 +941,8 @@ public struct AgentDefinition: Codable, Equatable, Identifiable, Sendable {
     proxyExposedTools: Set<String>? = nil,
     toolDelegation: AgentToolDelegation = .inline,
     retry: AgentRetryPolicy = .init(),
-    autocompact: AgentAutocompact = .init()
+    autocompact: AgentAutocompact = .init(),
+    context: AgentContextMode = .cache
   ) {
     self.id = id
     self.displayName = displayName ?? id
@@ -952,6 +966,7 @@ public struct AgentDefinition: Codable, Equatable, Identifiable, Sendable {
     self.toolDelegation = toolDelegation
     self.retry = retry
     self.autocompact = autocompact
+    self.context = context
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -961,7 +976,7 @@ public struct AgentDefinition: Codable, Equatable, Identifiable, Sendable {
       toolDelegation
     case description
     case isEnabled = "enabled"
-    case retry, autocompact
+    case retry, autocompact, context
   }
 
   public init(from decoder: Decoder) throws {
@@ -996,7 +1011,8 @@ public struct AgentDefinition: Codable, Equatable, Identifiable, Sendable {
         forKey: .toolDelegation) ?? .inline,
       retry: try container.decodeIfPresent(AgentRetryPolicy.self, forKey: .retry) ?? .init(),
       autocompact: try container.decodeIfPresent(AgentAutocompact.self, forKey: .autocompact)
-        ?? .init())
+        ?? .init(),
+      context: try container.decodeIfPresent(AgentContextMode.self, forKey: .context) ?? .cache)
   }
 }
 
@@ -1022,6 +1038,7 @@ public struct AgentRequest: Sendable {
   public var toolDelegation: AgentToolDelegation
   public var retry: AgentRetryPolicy
   public var autocompact: AgentAutocompact
+  public var context: AgentContextMode
 
   public init(
     agentID: String = "main",
@@ -1041,7 +1058,8 @@ public struct AgentRequest: Sendable {
     proxyExposedTools: Set<String>? = nil,
     toolDelegation: AgentToolDelegation = .inline,
     retry: AgentRetryPolicy = .init(),
-    autocompact: AgentAutocompact = .init()
+    autocompact: AgentAutocompact = .init(),
+    context: AgentContextMode = .cache
   ) {
     self.agentID = agentID
     self.provider = provider
@@ -1061,6 +1079,7 @@ public struct AgentRequest: Sendable {
     self.toolDelegation = toolDelegation
     self.retry = retry
     self.autocompact = autocompact
+    self.context = context
   }
 }
 

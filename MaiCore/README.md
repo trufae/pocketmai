@@ -341,6 +341,16 @@ and `Ctrl+C` cancels the active model or tool run without leaving the REPL.
 `Ctrl+Z` suspends pmai with the terminal restored; run `fg` in the shell to
 resume the same input or active run.
 
+`/set context size` (config key `context`, default `cache`) turns on the cheap
+half of that: before every model call the runtime replaces the body of any file
+read two or more tool results ago with one line saying what it was and that
+`files_read` brings it back. File bodies are the largest part of a coding
+conversation and are rarely read twice, so `size` cuts the tokens of a long
+run; the price is that a server's prompt cache is invalidated from the rewritten
+message on. `cache`, the default, never changes a message once sent, so the
+cache covers every earlier turn and each call pays only for what is new. The
+REPL prints `✂ context: rewrote 1 message (12.3k → 2.1k chars)` when it prunes.
+
 Native tools are presented as plugin-defined capability groups instead of one
 checkbox per provider-visible function. `/tools` lists the groups, `/tools
 enable|disable GROUP` changes the active agent, and `/tools show GROUP` displays

@@ -488,6 +488,7 @@ struct SessionProfile {
   var toolDelegation: AgentToolDelegation
   var retry: AgentRetryPolicy
   var autocompact: AgentAutocompact
+  var context: AgentContextMode
 
   init(definition: AgentDefinition) {
     agentID = definition.id
@@ -512,6 +513,7 @@ struct SessionProfile {
     toolDelegation = definition.toolDelegation
     retry = definition.retry
     autocompact = definition.autocompact
+    context = definition.context
   }
 
   init(provider: ProviderID, model: String, instructions: String, stream: Bool) {
@@ -550,6 +552,7 @@ struct SessionProfile {
     toolDelegation = .inline
     retry = .init()
     autocompact = .init()
+    context = .cache
   }
 
   var agentDefinition: AgentDefinition {
@@ -575,7 +578,8 @@ struct SessionProfile {
       proxyExposedTools: proxyExposedTools,
       toolDelegation: toolDelegation,
       retry: retry,
-      autocompact: autocompact)
+      autocompact: autocompact,
+      context: context)
   }
 }
 
@@ -1707,7 +1711,8 @@ struct MaiCLI {
       proxyExposedTools: profile.proxyExposedTools,
       toolDelegation: profile.toolDelegation,
       retry: profile.retry,
-      autocompact: profile.autocompact)
+      autocompact: profile.autocompact,
+      context: profile.context)
     }
 
     /// Picks a paused or interrupted task up where it stopped: the history is
@@ -2425,7 +2430,8 @@ struct MaiCLI {
         proxyExposedTools: profile.proxyExposedTools,
         toolDelegation: profile.toolDelegation,
         retry: profile.retry,
-        autocompact: profile.autocompact)
+        autocompact: profile.autocompact,
+        context: profile.context)
       let existingProcess = process
       let task = Task {
         try await runtime.run(request, process: existingProcess) { event in
@@ -2479,7 +2485,8 @@ struct MaiCLI {
       proxyExposedTools: profile.proxyExposedTools,
       toolDelegation: profile.toolDelegation,
       retry: profile.retry,
-      autocompact: profile.autocompact)
+      autocompact: profile.autocompact,
+      context: profile.context)
   }
 
   /// Visual mode runs commands in their own task already, so it can await the
@@ -5848,6 +5855,16 @@ struct MaiCLI {
         terminal: terminal)
       return
     }
+    if contextModeKeys.contains(key) {
+      await setContextMode(
+        parts: parts,
+        session: &session,
+        runtime: runtime,
+        configuration: &configuration,
+        configurationPath: configurationPath,
+        terminal: terminal)
+      return
+    }
     if key == "yolo" {
       await setYOLO(
         parts: parts,
@@ -5870,7 +5887,7 @@ struct MaiCLI {
         || levelKeys.contains(key)
     else {
       await terminal.line(
-        "Unknown setting '\(parts[0])'. Available settings: yolo, delegation, tool.calling, tool.proxy, limits.maxToolCalls, limits.maxModelTurns, limits.maxSubagents, limits.maxSubagentDepth, limits.maxTotalTokens, limits.maxSeconds, retry.attempts, retry.delay, autocompact, ui.bgline, ui.fgcolor, ui.bgcolor, ui.fgprompt, ui.bgprompt, ui.fgtoolresult, ui.bold, ui.markdown, ui.toolResultLines, ui.subagents, use.agentsmd"
+        "Unknown setting '\(parts[0])'. Available settings: yolo, delegation, tool.calling, tool.proxy, limits.maxToolCalls, limits.maxModelTurns, limits.maxSubagents, limits.maxSubagentDepth, limits.maxTotalTokens, limits.maxSeconds, retry.attempts, retry.delay, autocompact, context, ui.bgline, ui.fgcolor, ui.bgcolor, ui.fgprompt, ui.bgprompt, ui.fgtoolresult, ui.bold, ui.markdown, ui.toolResultLines, ui.subagents, use.agentsmd"
       )
       return
     }
@@ -5984,6 +6001,8 @@ struct MaiCLI {
     "tool.proxy", "tools.proxy", "toolproxy", "usetoolproxy",
   ]
 
+  private static let contextModeKeys: Set<String> = ["context", "context.mode"]
+
   private static func listToolSettings(_ profile: SessionProfile, terminal: TerminalWriter) async {
     await terminal.line("tool.calling = \(profile.toolCallingStrategy.rawValue)")
     await terminal.line("tool.proxy = \(toolProxySetting(profile))")
@@ -6079,6 +6098,41 @@ struct MaiCLI {
     }
   }
 
+  /// `/set context <cache|size>`: cache never changes a sent message, size
+  /// replaces consumed file bodies with references before each model call.
+  private static func setContextMode(
+    parts: [String],
+    session: inout REPLSession,
+    runtime: AgentRuntime,
+    configuration: inout MaiConfiguration?,
+    configurationPath: String?,
+    terminal: TerminalWriter
+  ) async {
+    guard parts.count > 1 else {
+      await terminal.line("context = \(session.profile.context.rawValue)")
+      return
+    }
+    guard parts.count == 2, let mode = AgentContextMode(rawValue: parts[1].lowercased()) else {
+      await terminal.line("Usage: /set context <cache|size>")
+      return
+    }
+    session.profile.context = mode
+    session.touch()
+    guard configuration != nil, configurationPath != nil else {
+      await terminal.line("Set context = \(mode.rawValue) for this chat.")
+      return
+    }
+    if await persistAgentProfile(
+      session: session,
+      configuration: &configuration,
+      configurationPath: configurationPath,
+      runtime: runtime,
+      terminal: terminal)
+    {
+      await terminal.line("Set context = \(mode.rawValue) for agent '\(session.profile.agentID)'.")
+    }
+  }
+
   private static func setToolCallingStrategy(
     parts: [String],
     session: inout REPLSession,
@@ -6150,6 +6204,7 @@ struct MaiCLI {
     await terminal.line("retry.attempts = \(profile.retry.attempts)")
     await terminal.line("retry.delay = \(durationSetting(profile.retry.delaySeconds))")
     await terminal.line("autocompact = \(autocompactSetting(profile.autocompact))")
+    await terminal.line("context = \(profile.context.rawValue)")
   }
 
   private static func durationSetting(_ seconds: Double) -> String {
@@ -6586,6 +6641,7 @@ struct MaiCLI {
           "retry.attempts": String(profile.retry.attempts),
           "retry.delay": durationSetting(profile.retry.delaySeconds),
           "autocompact": autocompactSetting(profile.autocompact),
+          "context": profile.context.rawValue,
         ],
         subagents: subagents)
     }
@@ -7828,6 +7884,7 @@ struct MaiCLI {
     chat.primaryAgent.toolDelegation = configured.toolDelegation
     chat.primaryAgent.useToolProxy = configured.useToolProxy
     chat.primaryAgent.proxyExposedTools = configured.proxyExposedTools
+    chat.primaryAgent.context = configured.context
     guard previousInstructions != configured.instructions else { return }
     var transcript = AgentTranscript(messages: chat.messages)
     if let index = transcript.messages.firstIndex(where: {
