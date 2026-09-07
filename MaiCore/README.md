@@ -584,8 +584,7 @@ including HolyC `.hc` files. `files_write` refuses to replace a non-empty file u
 patch. `filesRoot` confines every relative
 path to one directory (including symlink checks), while `filesWriteEnabled`
 removes the mutation tools when disabled. Mutations still go through normal
-confirmation, and deletion is marked dangerous. `read_text_file` remains
-available for compatibility with older agent configurations.
+confirmation, and deletion is marked dangerous.
 
 With the default Files workspace (no explicit `filesRoot`, or `filesRoot: "."`),
 `/cwd` prints the process working directory and `/cd PATH` changes it. The model

@@ -58,7 +58,6 @@ public struct MaiStandardToolFactory: ConfiguredToolFactory {
         MaiEchoTool(),
         MaiCurrentTimeTool(),
         MaiCalculatorTool(),
-        MaiReadTextFileTool(),
         MaiWeatherTool(
           configuration: MaiWeatherConfiguration(
             location: context.string("weatherLocation", environment: "MAI_WEATHER_LOCATION"),
@@ -120,7 +119,7 @@ public struct MaiStandardToolFactory: ConfiguredToolFactory {
         displayName: "Files",
         description:
           "List, find, grep, index, read, get or set functions, patch, write, append, rename, delete, and change directory in one workspace.",
-        toolNames: Set([MaiReadTextFileTool.name] + MaiFileWorkspaceTool.toolNames),
+        toolNames: Set(MaiFileWorkspaceTool.toolNames),
         options: [
           .init(
             id: "filesRoot",
@@ -300,43 +299,6 @@ public struct MaiCurrentTimeTool: AgentTool {
 
   public func call(arguments: JSONValue, context: ToolExecutionContext) async throws -> ToolOutput {
     ToolOutput(text: ISO8601DateFormatter().string(from: Date()))
-  }
-}
-
-public struct MaiReadTextFileTool: AgentTool {
-  public static let name = "read_text_file"
-  public static let maximumBytes = 1_048_576
-  public static let toolDefinition = ToolDefinition(
-    name: name,
-    description: "Read a UTF-8 text file from the host.",
-    inputSchema: objectSchema(
-      properties: ["path": .object(["type": .string("string")])],
-      required: ["path"]),
-    annotations: ToolAnnotations(
-      readOnly: true,
-      idempotent: true,
-      openWorld: false,
-      approval: .confirm))
-
-  public let definition = Self.toolDefinition
-
-  public init() {}
-
-  public func call(arguments: JSONValue, context: ToolExecutionContext) async throws -> ToolOutput {
-    guard let path = arguments.objectValue?["path"]?.stringValue else {
-      return ToolOutput(text: "Missing path.", isError: true)
-    }
-    let url = URL(fileURLWithPath: path)
-    let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-    guard data.count <= Self.maximumBytes else {
-      return ToolOutput(text: "File exceeds the 1 MiB CLI tool limit.", isError: true)
-    }
-    guard let text = String(data: data, encoding: .utf8) else {
-      return ToolOutput(text: "File is not valid UTF-8.", isError: true)
-    }
-    return ToolOutput(content: [
-      .file(FileContent(name: url.lastPathComponent, mimeType: "text/plain", text: text))
-    ])
   }
 }
 

@@ -468,7 +468,6 @@ func fileWorkspaceCanDisableChanges() async throws {
 
   let group = try #require(
     try await factory.toolGroups(context: context).first { $0.id == "files" })
-  #expect(group.toolNames.contains(MaiReadTextFileTool.name))
   #expect(group.toolNames.contains(MaiFileWorkspaceTool.Operation.read.rawValue))
   #expect(!group.toolNames.contains(MaiFileWorkspaceTool.Operation.write.rawValue))
   #expect(group.options.contains { $0.id == "filesWriteEnabled" })
