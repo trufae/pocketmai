@@ -27,7 +27,7 @@ once and 7 the next time because the model chose to bookkeep with `todo_*`).
 | xml protocol, after | 12/13 | 91 | 352k | 93s |
 | json protocol, after (two runs) | 12/13, 12/13 | 132, 97 | 582k, 341k | 130s, 110s |
 | tool proxy, before | 4/13 (5 refusals) | 49 | 107k | 91s |
-| tool proxy, after | see `doc/proxy.md` | | | |
+| tool proxy, after | 8/13 | 128 | 167k | 168s |
 | toolDelegation subagent | 13/13 | 86 | 454k | 81s |
 
 Three facts decide everything below:
@@ -70,7 +70,7 @@ Three facts decide everything below:
 - [x] **Tool proxy nested envelope** (`381901c`). gemma sends
   `{"name":T,"arguments":{"name":T,"arguments":{…}}}`; the inner envelope
   reached the tool, `path` was "missing", the identical call repeated 40 times.
-- [x] **Glued tool names** (`3a1655f`, plus the run-loop lookup in this pass).
+- [x] **Glued tool names** (`3a1655f`, run-loop lookup `64f5ece`).
   Servers hand over names like `run_sh Optimize:` or `files_read:`. The
   resolver now tries the leading identifier, and the run loop uses the resolver
   too (text protocols offer no tools, so the provider's resolver is empty).
@@ -87,7 +87,7 @@ Three facts decide everything below:
 - [x] **Native `respond` in a text protocol** (`c36ca7b`). The text prompt
   offers a `respond` pseudo-tool; when a server returns it as a native call it
   was "not available to this agent". It is the final answer now.
-- [x] **Tool output noise** (this pass). The call line showed raw JSON (a
+- [x] **Tool output noise** (`8f4f777`). The call line showed raw JSON (a
   `files_write` printed the whole escaped file) and the result hid under a
   heading. Calls are one readable line (`→ files_read cli.py`,
   `→ files_patch path=… find=… (+1 lines) replace=…`), results start right
