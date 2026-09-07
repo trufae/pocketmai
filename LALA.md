@@ -1,10 +1,10 @@
 # LALA — making pmai solve prompts faster with fewer tokens
 
-Findings from running 13 sample coding workflows (`tmp/cases`) through pmai on
+Findings from running 13 sample coding workflows (`test/cases`) through pmai on
 `gemma4:31b` (Ollama cloud, `env-ollamacloud.sh`) with a logging proxy between
 pmai and the endpoint, so every request body, tool schema, tool call and usage
-figure of every run is on disk (`tmp/results/<run>/<case>/proxy.jsonl`).
-`tmp/README.md` explains the harness; `doc/proxy.md` covers the tool proxy.
+figure of every run is on disk (`test/results/<run>/<case>/proxy.jsonl`).
+`test/README.md` explains the harness; `doc/proxy.md` covers the tool proxy.
 
 Each item is a todo. Ticked items were fixed in this pass, one commit each, so
 the commit log (`git log b75177e..`) can be reviewed alongside this file.

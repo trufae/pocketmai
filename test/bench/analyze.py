@@ -2,7 +2,7 @@
 """Summarize one or more benchmark runs recorded by run.py.
 
 Usage:
-  python3 tmp/bench/analyze.py tmp/results/<run-id> [more runs...] [--detail CASE]
+  python3 test/bench/analyze.py test/results/<run-id> [more runs...] [--detail CASE]
 
 Prints, per case: model calls, prompt tokens (sum and peak), completion tokens,
 tool calls by name, repeated identical calls, tool errors, bytes of tool output

@@ -23,13 +23,13 @@ The endpoint and key come from `UPSTREAM` / `UPSTREAM_KEY`, or from
 `env-ollamacloud.sh` at the repository root. pmai must be built first:
 
     (cd MaiCore && swift build --product pmai)
-    python3 tmp/bench/run.py                       # native tools, inline
-    python3 tmp/bench/run.py --strategy text       # text / xml / json protocols
-    python3 tmp/bench/run.py --variant proxy       # list-tools / call-tool
-    python3 tmp/bench/run.py --variant subagent    # toolDelegation: subagent
-    python3 tmp/bench/run.py --model gpt-oss:120b 02-fix-failing-test
-    python3 tmp/bench/analyze.py tmp/results/<run-id>
-    python3 tmp/bench/analyze.py tmp/results/<run-id> --detail 04-rename-symbol
+    python3 test/bench/run.py                       # native tools, inline
+    python3 test/bench/run.py --strategy text       # text / xml / json protocols
+    python3 test/bench/run.py --variant proxy       # list-tools / call-tool
+    python3 test/bench/run.py --variant subagent    # toolDelegation: subagent
+    python3 test/bench/run.py --model gpt-oss:120b 02-fix-failing-test
+    python3 test/bench/analyze.py test/results/<run-id>
+    python3 test/bench/analyze.py test/results/<run-id> --detail 04-rename-symbol
 
 Each run isolates `PMAI_HOME`, the chat state and the config, and unsets the
 `PMAI_*` variables so the shell's provider never leaks in. The agent uses the

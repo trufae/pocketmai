@@ -2,7 +2,7 @@
 
 `useToolProxy` on an agent replaces the whole tool catalog offered to the model
 with two tools, `list-tools` and `call-tool`. This note explains the mechanism,
-the token arithmetic behind it, what the `tmp/` benchmark measured on
+the token arithmetic behind it, what the `test/` benchmark measured on
 `gemma4:31b`, the bugs that measurement found, and when the mode pays off.
 `MaiCore/README.md` documents the setting; `doc/agents.md` covers subagents,
 the other way MaiCore keeps a transcript small.
@@ -149,10 +149,10 @@ the proxy's: the same tasks fail natively now and then.
 
 ## Measuring it yourself
 
-    python3 tmp/bench/run.py --variant proxy      # every tool hidden
-    python3 tmp/bench/run.py --variant hybrid     # the default with useToolProxy
-    python3 tmp/bench/compare.py tmp/results/<run-a> tmp/results/<run-b>
-    python3 tmp/bench/analyze.py tmp/results/<run-id> --detail all
+    python3 test/bench/run.py --variant proxy      # every tool hidden
+    python3 test/bench/run.py --variant hybrid     # the default with useToolProxy
+    python3 test/bench/compare.py test/results/<run-a> test/results/<run-b>
+    python3 test/bench/analyze.py test/results/<run-id> --detail all
 
 The `--detail` timeline shows each `list-tools` call and how many characters
 its result added (`new_tool_out`), which is exactly the context debt discussed

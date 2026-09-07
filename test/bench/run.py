@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Run pmai over the sample coding workflows in tmp/cases and record everything.
+"""Run pmai over the sample coding workflows in test/cases and record everything.
 
 Usage:
-  python3 tmp/bench/run.py [--variant inline|proxy|subagent] [--model NAME]
+  python3 test/bench/run.py [--variant inline|proxy|subagent] [--model NAME]
                            [--run-id ID] [--timeout SEC] [--system FILE] [case ...]
 
-Each case lives in tmp/cases/<case>/ with:
+Each case lives in test/cases/<case>/ with:
   prompt.txt   the user message
   fixture/     the project files copied into a fresh working directory
   setup.sh     optional, run inside the working directory before pmai
   check.sh     optional, run afterwards; exit 0 means the task was solved
                (env: FIXTURE, STDOUT, WORK)
 
-Results land in tmp/results/<run-id>/<case>/:
+Results land in test/results/<run-id>/<case>/:
   work/        the working directory after the run
   proxy.jsonl  one JSON line per model call (request, response, usage, timing)
   stdout.txt, stderr.txt, meta.json
@@ -33,8 +33,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-CASES = ROOT / "tmp" / "cases"
-RESULTS = ROOT / "tmp" / "results"
+CASES = ROOT / "test" / "cases"
+RESULTS = ROOT / "test" / "results"
 PMAI = Path(os.environ.get("PMAI_BIN", ROOT / "MaiCore" / ".build" / "debug" / "pmai"))
 PROXY = Path(__file__).resolve().parent / "proxy.py"
 

@@ -2,7 +2,7 @@
 """Compare runs side by side: tokens, calls, time, outcome, per case and in total.
 
 Usage:
-  python3 tmp/bench/compare.py tmp/results/<run-a> tmp/results/<run-b> [...]
+  python3 test/bench/compare.py test/results/<run-a> test/results/<run-b> [...]
 
 Per case it prints solved/failed, model calls, prompt and completion tokens,
 wall time and the median latency of a model call. For runs in tool-proxy mode
