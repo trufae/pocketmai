@@ -147,9 +147,17 @@ public enum ToolProxy {
     arguments: [String: AgentToolArgumentValue],
     definitions: [ToolDefinition]
   ) -> (call: ParsedToolCall?, error: String?) {
-    let requestedName =
+    var argumentValues = argumentObject(from: arguments["arguments"])
+    // Some models put the name inside the arguments object instead of next
+    // to it: {"arguments": {"name": T, "arguments": {...}}}.
+    var requestedName =
       arguments["name"]?.stringValue ?? arguments["tool_name"]?.stringValue
       ?? arguments["tool"]?.stringValue ?? ""
+    if requestedName.isEmpty,
+      let inner = argumentValues["name"]?.stringValue ?? argumentValues["tool"]?.stringValue
+    {
+      requestedName = inner
+    }
     let resolver = AgentToolNameResolver(tools: definitions)
     guard let canonicalName = resolver.canonicalName(for: requestedName) else {
       return (
@@ -160,7 +168,6 @@ public enum ToolProxy {
     guard let definition = definitions.first(where: { $0.name == canonicalName }) else {
       return (nil, "Error: unknown tool '\(requestedName)'.")
     }
-    var argumentValues = argumentObject(from: arguments["arguments"])
     // Some models wrap the call twice: {"name": T, "arguments": {"name": T,
     // "arguments": {...}}}. The inner object is what they meant, unless the
     // tool really takes an argument called "arguments".

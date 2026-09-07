@@ -59,6 +59,10 @@ func runToolsAcceptAliases() async throws {
   let viaScript = try await usabilityCall(shell, ["script": .string("printf via-script")])
   #expect(!viaScript.isError)
   #expect(viaScript.text == "via-script")
+  let viaCommands = try await usabilityCall(
+    shell, ["commands": .array([.string("printf one"), .string("printf two")])])
+  #expect(!viaCommands.isError)
+  #expect(viaCommands.text == "onetwo")
   let empty = try await usabilityCall(shell, [:])
   #expect(empty.isError)
   #expect(empty.text.contains("script is required"))

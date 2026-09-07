@@ -171,8 +171,9 @@ public struct MaiRunTool: AgentTool {
       return url
     }
 
-    /// The text to run, under its own name or the alias models reach for:
-    /// `command` and `script` mean the same thing to a shell.
+    /// The text to run, under its own name or the aliases models reach for:
+    /// `command` and `script` mean the same thing to a shell, and a
+    /// `commands` array is the same script one line at a time.
     private static func requiredText(
       _ arguments: [String: JSONValue],
       key: String,
@@ -184,6 +185,9 @@ public struct MaiRunTool: AgentTool {
         {
           return value
         }
+      }
+      if let lines = arguments["commands"]?.arrayValue?.compactMap(\.stringValue), !lines.isEmpty {
+        return lines.joined(separator: "\n")
       }
       throw MaiRunToolError.missingArgument(key)
     }

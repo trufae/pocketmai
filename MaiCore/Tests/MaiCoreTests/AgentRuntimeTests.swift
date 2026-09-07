@@ -238,6 +238,18 @@ func toolProxyNestedEnvelope() {
     definitions: definitions)
   #expect(resolved.error == nil)
   #expect(resolved.call?.argumentValues["path"] == .string("cli.py"))
+
+  // The name only inside the arguments object, nothing beside it.
+  let inside = ToolProxy.resolveCall(
+    arguments: [
+      "arguments": .object([
+        "name": .string("files_read"), "arguments": .object(["path": .string("b.py")]),
+      ])
+    ],
+    definitions: definitions)
+  #expect(inside.error == nil)
+  #expect(inside.call?.name == "files_read")
+  #expect(inside.call?.argumentValues["path"] == .string("b.py"))
 }
 
 @Test("A call repeated past the identical-call guard withdraws the tools and forces an answer")
