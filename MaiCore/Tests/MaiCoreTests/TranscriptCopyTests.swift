@@ -24,15 +24,27 @@ private let transcript: [AgentMessage] = [
   .assistant("The tool said hi."),
 ]
 
-@Test("An empty /copy argument selects the last assistant reply")
+@Test("A /copy argument is an optional count followed by an optional file path")
 func copyArgumentParsing() throws {
-  #expect(try TranscriptCopy.selection(parsing: "") == .lastAssistantReply)
-  #expect(try TranscriptCopy.selection(parsing: "  3 ") == .lastMessages(3))
+  #expect(try TranscriptCopy.command(parsing: "") == .init(selection: .lastAssistantReply))
+  #expect(try TranscriptCopy.command(parsing: "  3 ") == .init(selection: .lastMessages(3)))
+  #expect(
+    try TranscriptCopy.command(parsing: "3 ~/out.txt")
+      == .init(selection: .lastMessages(3), path: "~/out.txt"))
+  #expect(
+    try TranscriptCopy.command(parsing: " 2   my notes.txt ")
+      == .init(selection: .lastMessages(2), path: "my notes.txt"))
+  #expect(
+    try TranscriptCopy.command(parsing: "reply.md")
+      == .init(selection: .lastAssistantReply, path: "reply.md"))
+  #expect(
+    try TranscriptCopy.command(parsing: "3.txt")
+      == .init(selection: .lastAssistantReply, path: "3.txt"))
   #expect(throws: TranscriptCopyError.invalidCount("0")) {
-    try TranscriptCopy.selection(parsing: "0")
+    try TranscriptCopy.command(parsing: "0")
   }
-  #expect(throws: TranscriptCopyError.invalidCount("many")) {
-    try TranscriptCopy.selection(parsing: "many")
+  #expect(throws: TranscriptCopyError.invalidCount("-1")) {
+    try TranscriptCopy.command(parsing: "-1 out.txt")
   }
 }
 

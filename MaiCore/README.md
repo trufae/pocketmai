@@ -101,7 +101,10 @@ unchanged.
 without reasoning blocks. `/copy N` copies the last `N` conversation messages
 instead; several messages are labelled `User:`, `Assistant:`, and `Tool:`, while
 tool calls, tool results, and attachments are summarized on their own lines.
-Instructions are never copied. macOS uses the native pasteboard; other platforms
+Instructions are never copied. A trailing path writes the same text to a file
+instead of the clipboard: `/copy reply.md` saves the last reply and
+`/copy 4 ~/notes/chat.txt` the last four messages, replacing an existing file.
+`/help copy` lists the forms. macOS uses the native pasteboard; other platforms
 use the first of `wl-copy`, `xclip`, `xsel`, `pbcopy`, or `clip.exe` found in
 `PATH`.
 

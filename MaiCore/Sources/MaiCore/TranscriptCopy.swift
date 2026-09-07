@@ -1,7 +1,7 @@
 import Foundation
 
-/// Selects transcript messages for copying into a clipboard and renders them as
-/// plain text. Instructions (system and developer messages) are never copied.
+/// Selects transcript messages for copying into a clipboard or a file and
+/// renders them as plain text. Instructions (system and developer messages) are never copied.
 public enum TranscriptCopy {
   public enum Selection: Equatable, Sendable {
     /// The most recent assistant reply, as pasteable text without reasoning.
@@ -20,15 +20,33 @@ public enum TranscriptCopy {
     }
   }
 
-  /// Parses the argument of a `/copy` command: empty selects the last assistant
-  /// reply, otherwise a positive message count.
-  public static func selection(parsing argument: String) throws -> Selection {
-    let trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return .lastAssistantReply }
-    guard let count = Int(trimmed), count > 0 else {
-      throw TranscriptCopyError.invalidCount(trimmed)
+  /// A parsed `/copy` command: which messages to copy and, when a path was
+  /// given, the file to write them to instead of the clipboard.
+  public struct Command: Equatable, Sendable {
+    public var selection: Selection
+    public var path: String?
+
+    public init(selection: Selection, path: String? = nil) {
+      self.selection = selection
+      self.path = path
     }
-    return .lastMessages(count)
+  }
+
+  /// Parses the argument of a `/copy` command: an optional message count, then
+  /// an optional file path. Empty copies the last assistant reply, `3` the last
+  /// three messages, `notes.txt` the last reply into that file, and
+  /// `3 notes.txt` the last three messages into it. A first word that reads as
+  /// an integer is always a count, so `0` is an error rather than a file name.
+  public static func command(parsing argument: String) throws -> Command {
+    let trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return Command(selection: .lastAssistantReply) }
+    let fields = trimmed.split(maxSplits: 1, whereSeparator: \.isWhitespace).map(String.init)
+    guard let count = Int(fields[0]) else {
+      return Command(selection: .lastAssistantReply, path: trimmed)
+    }
+    guard count > 0 else { throw TranscriptCopyError.invalidCount(fields[0]) }
+    let path = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+    return Command(selection: .lastMessages(count), path: path.isEmpty ? nil : path)
   }
 
   public static func text(

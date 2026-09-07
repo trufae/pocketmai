@@ -186,6 +186,8 @@ private enum CLIError: LocalizedError {
   case noProvider
   case noProject
   case invalidImage(String)
+  case isDirectory(String)
+  case missingFolder(String)
   case stdinServesProtocol
   case stdinWithoutTerminal
   case apiKeySourcesConflict
@@ -207,6 +209,8 @@ private enum CLIError: LocalizedError {
     case .configNotFound(let path): "Configuration file not found: \(path)"
     case .noProvider: "No provider is configured."
     case .invalidImage(let path): "Unable to load image: \(path)"
+    case .isDirectory(let path): "\(path) is a folder; give a file name."
+    case .missingFolder(let path): "The folder \(path) does not exist; create it first."
     }
   }
 }
@@ -1719,25 +1723,25 @@ struct MaiCLI {
     func chatRequest() -> AgentRequest {
       let profile = session.profile
       return AgentRequest(
-      agentID: profile.agentID,
-      provider: profile.provider,
-      model: profile.model,
-      messages: session.history.messages,
-      toolNames: profile.toolNames,
-      toolGroupNames: profile.toolGroupNames,
-      subagentNames: profile.subagentNames,
-      toolChoice: profile.toolChoice,
-      responseFormat: profile.responseFormat,
-      options: profile.options,
-      limits: profile.limits,
-      stream: profile.stream,
-      toolCallingStrategy: profile.toolCallingStrategy,
-      useToolProxy: profile.useToolProxy,
-      proxyExposedTools: profile.proxyExposedTools,
-      toolDelegation: profile.toolDelegation,
-      retry: profile.retry,
-      autocompact: profile.autocompact,
-      context: profile.context)
+        agentID: profile.agentID,
+        provider: profile.provider,
+        model: profile.model,
+        messages: session.history.messages,
+        toolNames: profile.toolNames,
+        toolGroupNames: profile.toolGroupNames,
+        subagentNames: profile.subagentNames,
+        toolChoice: profile.toolChoice,
+        responseFormat: profile.responseFormat,
+        options: profile.options,
+        limits: profile.limits,
+        stream: profile.stream,
+        toolCallingStrategy: profile.toolCallingStrategy,
+        useToolProxy: profile.useToolProxy,
+        proxyExposedTools: profile.proxyExposedTools,
+        toolDelegation: profile.toolDelegation,
+        retry: profile.retry,
+        autocompact: profile.autocompact,
+        context: profile.context)
     }
 
     /// Picks a paused or interrupted task up where it stopped: the history is
@@ -2635,13 +2639,15 @@ struct MaiCLI {
         await terminal.line(queueHelp)
       case "export", "/export":
         await terminal.line(exportHelp)
+      case "copy", "/copy":
+        await terminal.line(copyHelp)
       case "stats", "/stats":
         await terminal.line(statsHelp)
       case "skills", "skill", "/skills", "/skill":
         await terminal.line(skillsHelp)
       default:
         await terminal.line(
-          "Unknown help topic '\(argument)'. Try /help, or /help set, memory, todo, prompts, agents, chat, edit, tools, skills, queue, export, or stats."
+          "Unknown help topic '\(argument)'. Try /help, or /help set, memory, todo, prompts, agents, chat, edit, tools, skills, queue, export, copy, or stats."
         )
       }
     case "/cwd", "/pwd":
@@ -4734,7 +4740,8 @@ struct MaiCLI {
 
     case "tools":
       guard words.count == 3 else {
-        await terminal.line("Usage: /agent tools ID GROUPS   (a,b,c replaces; +a,-b adjusts; - clears)")
+        await terminal.line(
+          "Usage: /agent tools ID GROUPS   (a,b,c replaces; +a,-b adjusts; - clears)")
         return
       }
       guard
@@ -4778,7 +4785,8 @@ struct MaiCLI {
         return nil
       }
       if let saved {
-        await terminal.line("Agent '\(saved.id)' model: \(saved.model.isEmpty ? "-" : saved.model).")
+        await terminal.line(
+          "Agent '\(saved.id)' model: \(saved.model.isEmpty ? "-" : saved.model).")
       }
 
     case "provider":
@@ -4851,10 +4859,12 @@ struct MaiCLI {
         await terminal.line("Usage: /agent use ID")
         return
       }
-      await selectAgent(words[1], session: &session, configuration: configuration, terminal: terminal)
+      await selectAgent(
+        words[1], session: &session, configuration: configuration, terminal: terminal)
 
     default:
-      await selectAgent(words[0], session: &session, configuration: configuration, terminal: terminal)
+      await selectAgent(
+        words[0], session: &session, configuration: configuration, terminal: terminal)
     }
   }
 
@@ -4993,7 +5003,8 @@ struct MaiCLI {
         "\(providerID)\(model.isEmpty ? "" : " \(model)"), "
         + (groups.isEmpty ? "no tool groups" : "tool groups \(groups.joined(separator: ", "))")
         + ", system prompt '\(promptName)'"
-      let hint = session.profile.agentID == name ? "" : " /agent use \(name) switches this chat to it."
+      let hint =
+        session.profile.agentID == name ? "" : " /agent use \(name) switches this chat to it."
       await terminal.line("\(isNew ? "Added" : "Updated") agent '\(name)': \(summary).\(hint)")
     } catch {
       await terminal.line("error: \(error.localizedDescription)", to: .standardError)
@@ -5184,7 +5195,8 @@ struct MaiCLI {
       let encoder = JSONEncoder()
       encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
       let data = try encoder.encode(current)
-      guard let edited = await editTemporaryData(data, suffix: "agent-\(id).json", terminal: terminal)
+      guard
+        let edited = await editTemporaryData(data, suffix: "agent-\(id).json", terminal: terminal)
       else { return }
       var definition = try JSONDecoder().decode(AgentDefinition.self, from: edited)
       guard definition.id == id else {
@@ -6376,7 +6388,8 @@ struct MaiCLI {
       } else if let seconds = parseDurationSeconds(raw) {
         limits.maxSeconds = seconds
       } else {
-        await terminal.line("Usage: /set limits.maxSeconds <off|N|Nm|Nh>  (wall-clock time per run)")
+        await terminal.line(
+          "Usage: /set limits.maxSeconds <off|N|Nm|Nh>  (wall-clock time per run)")
         return
       }
     case "limits.maxTotalTokens":
@@ -6479,13 +6492,15 @@ struct MaiCLI {
     var notes: [String] = []
     if key == "autocompact", autocompact.isEnabled {
       notes.append(
-        "Older exchanges are summarized before a model turn once the conversation is estimated at \(autocompact.tokens) tokens; the newest exchange is kept verbatim.")
+        "Older exchanges are summarized before a model turn once the conversation is estimated at \(autocompact.tokens) tokens; the newest exchange is kept verbatim."
+      )
     }
     let applied = current()
     guard var draft = configuration, let configurationPath,
       let index = draft.agents.firstIndex(where: { $0.id == session.profile.agentID })
     else {
-      await terminal.line((["Set \(key) = \(applied) for this chat."] + notes).joined(separator: " "))
+      await terminal.line(
+        (["Set \(key) = \(applied) for this chat."] + notes).joined(separator: " "))
       return
     }
     draft.agents[index].retry = retry
@@ -6618,7 +6633,8 @@ struct MaiCLI {
     process: AgentPID?,
     terminal: TerminalWriter
   ) async {
-    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(String.init)
+    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
+      String.init)
     guard let first = fields.first, let format = ChatExportFormat(argument: first) else {
       await terminal.line(exportHelp)
       return
@@ -6690,9 +6706,11 @@ struct MaiCLI {
       let data = try ChatExport.data(for: chat, format: format, generator: "pmai", debug: debug)
       try data.write(to: target, options: .atomic)
       await terminal.line(
-        "Exported \(format.displayName) (\(AgentProcessInfo.compactCount(data.count)) bytes) to \(target.path)")
+        "Exported \(format.displayName) (\(AgentProcessInfo.compactCount(data.count)) bytes) to \(target.path)"
+      )
     } catch {
-      await terminal.line("error: Could not export: \(error.localizedDescription)", to: .standardError)
+      await terminal.line(
+        "error: Could not export: \(error.localizedDescription)", to: .standardError)
     }
   }
 
@@ -6787,27 +6805,75 @@ struct MaiCLI {
     chat title and written to the current directory.
     """
 
+  private static let copyHelp = """
+    Copy conversation text to the clipboard, or into a file:
+
+      /copy                  The last assistant reply, without its reasoning
+      /copy N                The last N messages, oldest first, labelled by role
+      /copy PATH             The last reply, written to the file PATH
+      /copy N PATH           The last N messages, written to the file PATH
+
+    Tool calls, tool results, images, and other attachments are summarized on
+    their own lines; system instructions are never copied. PATH may start with
+    ~ and is resolved from the current directory; an existing file is replaced,
+    and a folder is refused.
+    """
+
+  /// `/copy [N] [PATH]`: the last reply or the last N messages, on the system
+  /// clipboard or, when PATH is given, in that file.
   private static func copyToClipboard(
     _ argument: String,
     session: REPLSession,
     terminal: TerminalWriter
   ) async {
+    if argument.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "help" {
+      await terminal.line(copyHelp)
+      return
+    }
     do {
-      let selection = try TranscriptCopy.selection(parsing: argument)
-      let result = try TranscriptCopy.text(for: selection, in: session.history.messages)
-      try SystemClipboard.write(result.text)
+      let command = try TranscriptCopy.command(parsing: argument)
+      let result = try TranscriptCopy.text(for: command.selection, in: session.history.messages)
       let count = result.messages.count
       let subject =
-        selection == .lastAssistantReply
+        command.selection == .lastAssistantReply
         ? "the last reply" : "\(count) message\(count == 1 ? "" : "s")"
+      let destination: String
+      if let path = command.path {
+        destination = try writeCopiedText(result.text, to: path).path
+      } else {
+        try SystemClipboard.write(result.text)
+        destination = "the clipboard"
+      }
       await terminal.line(
-        "Copied \(subject) (\(result.text.count) characters) to the clipboard.")
+        "Copied \(subject) (\(result.text.count) characters) to \(destination).")
     } catch let error as TranscriptCopyError {
       await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      if case .invalidCount = error { await terminal.line("Usage: /copy [N]") }
+      if case .invalidCount = error { await terminal.line("Usage: /copy [N] [PATH] (/help copy)") }
     } catch {
       await terminal.line("error: \(error.localizedDescription)", to: .standardError)
     }
+  }
+
+  /// Writes `/copy` output to a file: `~` expands, a relative path resolves
+  /// against the working directory, an existing file is replaced, and a folder
+  /// is refused rather than inventing a name inside it. Text files end with a
+  /// newline even though clipboard text does not.
+  private static func writeCopiedText(_ text: String, to path: String) throws -> URL {
+    let current = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let expanded = NSString(string: path).expandingTildeInPath
+    let target = URL(fileURLWithPath: expanded, relativeTo: current).standardizedFileURL
+    var isDirectory: ObjCBool = false
+    let exists = FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory)
+    if path.hasSuffix("/") || (exists && isDirectory.boolValue) {
+      throw CLIError.isDirectory(target.path)
+    }
+    let parent = target.deletingLastPathComponent()
+    guard FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDirectory),
+      isDirectory.boolValue
+    else { throw CLIError.missingFolder(parent.path) }
+    let contents = text.hasSuffix("\n") ? text : text + "\n"
+    try contents.write(to: target, atomically: true, encoding: .utf8)
+    return target
   }
 
   /// `/attach PATH` converts a document to text the model can read and queues it
@@ -8058,7 +8124,7 @@ struct MaiCLI {
       "/mcp add ", "/mcp enable ", "/mcp disable ",
       "/edit prompt", "/edit compact", "/edit config", "/edit mcps", "/chat compact ",
       "/image tiny ", "/image small ", "/image medium ", "/image big ", "/image full ",
-      "/image ocr ", "/attach ", "/attach clear", "/copy", "/clear", "/chat list",
+      "/image ocr ", "/attach ", "/attach clear", "/copy", "/help copy", "/clear", "/chat list",
       "/chat list active", "/chat list archived", "/chat list all", "/chat new ",
       "/chat use ", "/chat next", "/chat previous", "/chat info", "/chat rename ",
       "/chat archive", "/chat unarchive ", "/chat close confirm", "/chat messages",
@@ -8356,7 +8422,7 @@ struct MaiCLI {
     /image MODE PATH    Attach at tiny/small/medium/big/full size, or OCR to Markdown
     /attach PATH        Attach a Word, PDF, JSON, or text file as Markdown/plain text
     /attach clear       Drop the attachments queued for the next message
-    /copy [N]           Copy the last reply, or the last N messages, to the clipboard
+    /copy [N] [PATH]    Copy the last reply, or N messages, to the clipboard or a file
     /export FORMAT [PATH]  Save this chat as markdown, json, debug, epub, or docx
     /stats              Tokens/s and time in use for every provider:model, as bars
     \(visualHelp)/clear              Clear conversation history
