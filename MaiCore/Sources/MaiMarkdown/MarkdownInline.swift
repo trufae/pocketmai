@@ -100,6 +100,9 @@ public enum MarkdownInlineParser {
   private indirect enum InlineNode {
     /// `sourceStart` is set when every character maps 1:1 onto the source.
     case text(String, sourceStart: Int?)
+    /// A rendered LaTex expression maps many source characters to one run, but
+    /// the original closing delimiter is still a safe streaming boundary.
+    case math(String, sourceEnd: Int)
     case code(String)
     case lineBreak
     case link([InlineNode], destination: String)
@@ -145,6 +148,7 @@ public enum MarkdownInlineParser {
         switch char {
         case "\\": scanEscape()
         case "`": scanCodeSpan()
+        case "$": scanMath()
         case "*", "_", "~": scanDelimiterRun()
         case "[" where allowsLinks: scanLink(open: index, isImage: false)
         case "!" where allowsLinks: scanImage()
@@ -177,6 +181,44 @@ public enum MarkdownInlineParser {
     private mutating func appendNode(_ node: InlineNode) {
       flushLiteral()
       nodes.append(node)
+    }
+
+    /// Math must be scanned as one unit so streaming never writes its opening
+    /// delimiter and `\\text{` commands before the closing delimiter arrives.
+    private mutating func scanMath() {
+      let delimiterLength = index + 1 < chars.count && chars[index + 1] == "$" ? 2 : 1
+      let start = index
+      var cursor = index + delimiterLength
+      while cursor < chars.count {
+        if chars[cursor] == "\\" {
+          cursor += 2
+          continue
+        }
+        guard chars[cursor] == "$" else {
+          cursor += 1
+          continue
+        }
+        if delimiterLength == 2 {
+          guard cursor + 1 < chars.count, chars[cursor + 1] == "$" else {
+            cursor += 1
+            continue
+          }
+        }
+        let end = cursor + delimiterLength
+        let source = String(chars[start..<end])
+        if let rendered = MarkdownMath.render(delimited: source) {
+          appendNode(.math(rendered, sourceEnd: end))
+          index = end
+          return
+        }
+        break
+      }
+      // A `$` expression may be split across provider deltas. Keeping it
+      // unresolved holds the whole formula, while a complete line still shows
+      // malformed source literally instead of silently deleting it.
+      markUnresolved(start)
+      appendLiteral("$", at: start)
+      index = start + 1
     }
 
     private mutating func scanEscape() {
@@ -527,6 +569,9 @@ public enum MarkdownInlineParser {
               splits.append(sourceStart + offset + 1)
             }
           }
+        case .math(let text, let sourceEnd):
+          runs.append(MarkdownInlineRun(text, style: style, destination: destination))
+          if depth == 0, style.isEmpty { splits.append(sourceEnd) }
         case .code(let code):
           runs.append(MarkdownInlineRun(code, style: style.union(.code), destination: destination))
         case .lineBreak:

@@ -93,6 +93,23 @@ func inlineRuns() {
       == "a * b c http://h.o alt")
 }
 
+@Test("LaTex formula delimiters and text commands are terminal-friendly")
+func latexRendering() {
+  let source = """
+    $$\\text{Throughput} = \\frac{\\text{Total Tokens Transfered}}{\\text{Total Time (seconds)}}$$
+    Higher Score $\\rightarrow$ More Efficient: $\\frac{\\text{Tokens}}{\\text{Time} \\times \\text{Requests}}$.
+    """
+  let output = stripANSI(MarkdownTerminalRenderer.render(source, theme: .plain))
+  #expect(output.contains("Throughput = Total Tokens Transfered / Total Time (seconds)"))
+  #expect(output.contains("Higher Score → More Efficient: Tokens / Time × Requests."))
+  #expect(!output.contains("$"))
+  #expect(!output.contains("\\\\text{"))
+
+  var renderer = MarkdownTerminalRenderer(theme: .plain)
+  #expect(renderer.feed("Rate: $$\\text{Through") == "Rate: ")
+  #expect(renderer.feed("put} = \\frac{a}{b}$$") == "Throughput = a / b")
+}
+
 @Test("Streamable length stops before unfinished constructs")
 func streamableLength() {
   #expect(MarkdownInlineParser.streamableLength(of: "Hello world") == 6)
