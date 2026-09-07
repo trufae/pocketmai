@@ -627,7 +627,8 @@ public final class VisualWorkspace {
   public func removeUsageStats(id: String) {
     let runtime = runtime
     Task { [weak self] in
-      guard let store = await runtime.usageStatsStore(), await store.remove(id: id) else {
+      guard let store = await runtime.usageStatsStore(), await store.remove(matching: id) > 0
+      else {
         return
       }
       await self?.refreshUsageStats()

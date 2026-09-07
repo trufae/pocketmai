@@ -6755,7 +6755,7 @@ struct MaiCLI {
           "warning: statistics could not be saved: \(error)", to: .standardError)
       }
     }
-    if let metric = ModelUsageReport.Metric(rawValue: action) {
+    if let metric = ModelUsageReport.Metric.named(action) {
       await printReport([metric])
       return
     }

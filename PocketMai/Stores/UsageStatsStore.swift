@@ -35,8 +35,7 @@ final class UsageStatsStore: ObservableObject {
   }
 
   func record(_ stats: GenerationStats, assistantMessageID: UUID?) {
-    guard stats.inputTokens > 0 || stats.outputTokens > 0 else { return }
-    ledger.record(stats)
+    guard ledger.record(stats) != nil else { return }
     persistLedger()
 
     if let assistantMessageID {
@@ -63,13 +62,9 @@ final class UsageStatsStore: ObservableObject {
     persistLedger()
   }
 
-  func remove(id: String) {
-    ledger.remove(id: id)
-    persistLedger()
-  }
-
-  func remove(providerLabel: String) {
-    ledger.remove(providerLabel: providerLabel)
+  /// Drops one model (its row id) or every model of a provider (its label).
+  func remove(matching target: String) {
+    ledger.remove(matching: target)
     persistLedger()
   }
 

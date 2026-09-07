@@ -186,7 +186,7 @@ func ledgerAccumulatesRows() {
   #expect(qwen.lastUsedAt == start.addingTimeInterval(60))
   #expect(qwen.title == "thor — qwen")
 
-  #expect(ledger.sortedBySpeed.map(\.id) == ["thor|qwen", "openai|big"])
+  #expect(ledger.sorted(by: .speed).map(\.id) == ["thor|qwen", "openai|big"])
   #expect(ledger.sortedByLastUsed.map(\.id) == ["thor|qwen", "openai|big"])
   #expect(ledger.callCount == 3)
   #expect(abs(ledger.totalSeconds - 21) < 0.0001)
@@ -195,8 +195,8 @@ func ledgerAccumulatesRows() {
   #expect(providers[1].modelCount == 1)
   #expect(providers[1].callCount == 2)
 
-  #expect(ledger.remove(id: "nope") == false)
-  #expect(ledger.remove(providerLabel: "thor") == 1)
+  #expect(ledger.remove(matching: "nope") == 0)
+  #expect(ledger.remove(matching: "thor") == 1)
   #expect(ledger.totals.map(\.id) == ["openai|big"])
   ledger.reset()
   #expect(ledger.isEmpty)
@@ -251,7 +251,7 @@ func storePersistsAndReloads() async throws {
 
   let reopened = ModelUsageStore(url: url)
   #expect(await reopened.totals().map(\.id) == ["thor|qwen"])
-  #expect(await reopened.remove(id: "thor|qwen"))
+  #expect(await reopened.remove(matching: "thor|qwen") == 1)
   #expect(await ModelUsageStore(url: url).totals().isEmpty)
   #expect(await store.lastPersistenceError == nil)
 }
@@ -304,17 +304,18 @@ func reportRanksAndRenders() {
 
   let report = ModelUsageReport(ledger)
   #expect(report.rows.map(\.id) == ["thor|qwen3.8:27b", "openai|big-pickle", "hello|hello"])
-  #expect(report.rows[0].speedFraction == 1)
-  #expect(abs(report.rows[1].speedFraction - 0.5) < 0.0001)
-  #expect(report.rows[2].speed == nil)
-  #expect(report.rows[0].secondsFraction == 1)
+  #expect(report.rows[0].fraction(.speed) == 1)
+  #expect(abs(report.rows[1].fraction(.speed) - 0.5) < 0.0001)
+  #expect(report.rows[2].number(.speed) == nil)
+  #expect(report.rows[0].fraction(.time) == 1)
   #expect(report.rows(for: .time).map(\.id).first == "thor|qwen3.8:27b")
-  #expect(report.rows[0].color == ModelUsagePalette.color(forProviderLabel: "thor"))
+  #expect(report.rows[0].color == ModelUsagePalette.color(forModel: "thor|qwen3.8:27b"))
+  #expect(report.rows[0].color != report.rows[1].color)
   #expect(report.headline.contains("3 models"))
   #expect(report.headline.contains("3 requests"))
   #expect(report.headline.contains("2m4s in use"))
   #expect(report.headline.contains("~5.9k tokens"))
-  #expect(report.rows[1].detail(.speed) == "20s · 1 req · ~900 tok")
+  #expect(report.rows[1].detail(.speed) == "20s · 45.0 tok/s/req · 1 req · ~900 tok")
   #expect(report.rows[0].value(.time) == "1m44s")
 
   var painted: [ModelUsageColor] = []
@@ -383,7 +384,9 @@ func formatsAndPalette() {
   #expect(thor != ModelUsagePalette.color(forProviderLabel: "openai"))
   #expect(thor.hex.count == 7)
   #expect(thor.hex.hasPrefix("#"))
-  let hue = ModelUsagePalette.hue(forProviderLabel: "thor")
+  let hue = ModelUsagePalette.hue(for: "thor")
+  #expect(
+    ModelUsagePalette.color(forModel: "thor|a") != ModelUsagePalette.color(forModel: "thor|b"))
   #expect(hue >= 0 && hue < 1)
   let red = ModelUsagePalette.color(hue: 0, saturation: 1, brightness: 1)
   #expect(red == ModelUsageColor(red: 1, green: 0, blue: 0))
@@ -441,11 +444,13 @@ func efficiencyScoreAndRanking() throws {
   // 7,000 tokens over 150 s in use and 2 requests.
   let thor = try #require(ledger.totals(id: "thor|qwen3.8:27b"))
   #expect(abs((thor.efficiency ?? 0) - 7_000 / (150 * 2)) < 0.0001)
-  #expect(thor.value(.efficiency) == thor.efficiency)
-  #expect(thor.value(.time) == 150)
+  #expect(ModelUsageReport.Metric.efficiency.number(of: thor) == thor.efficiency)
+  #expect(ModelUsageReport.Metric.time.number(of: thor) == 150)
   #expect(abs((ledger.totals(id: "openai|big-pickle")?.efficiency ?? 0) - 45) < 0.0001)
   #expect(ledger.totals(id: "hello|hello")?.efficiency == nil)
-  #expect(ledger.sortedByEfficiency.map(\.id) == ["openai|big-pickle", "thor|qwen3.8:27b"])
+  #expect(
+    ledger.sorted(by: .efficiency).map(\.id)
+      == ["openai|big-pickle", "thor|qwen3.8:27b", "hello|hello"])
   #expect(abs((ledger.efficiency ?? 0) - 7_903 / (170 * 4)) < 0.0001)
   #expect(ModelUsageTotals.efficiency(tokens: 10, seconds: 0, requests: 1) == nil)
   #expect(ModelUsageFormat.efficiency(23.333) == "23.3 tok/s/req")
@@ -467,14 +472,15 @@ func efficiencyScoreAndRanking() throws {
   #expect(report.lines(width: 100).contains("Efficiency"))
   #expect(ModelUsageReport.Metric.allCases == [.speed, .time, .efficiency])
   #expect(ModelUsageReport.Metric.efficiency.label == "Efficiency")
+  #expect(ModelUsageReport.Metric.named("time") == .time)
+  #expect(ModelUsageReport.Metric.named("nope") == nil)
   #expect(ModelUsageReport.Metric.time.text(nil) == "<1s")
 }
 
 @Test("Command-line targets name a row, a provider, or PROVIDER:MODEL")
 func ledgerMatchesTargets() async {
   var ledger = ModelUsageLedger()
-  for (provider, model) in [("thor", "qwen3.8:27b"), ("thor", "gemma"), ("openai", "big-pickle")]
-  {
+  for (provider, model) in [("thor", "qwen3.8:27b"), ("thor", "gemma"), ("openai", "big-pickle")] {
     ledger.record(
       ModelCallStats(providerLabel: provider, modelID: model, inputTokens: 1, outputTokens: 1),
       at: start)
@@ -526,7 +532,8 @@ func summariesAndDetailLines() throws {
   let provider = try #require(ledger.providerTotals.first)
   #expect(
     provider.summary
-      == "1 model · ~40 sent · ~3.9k recv · 100 thinking · 1 image · 1 req · 1m44s in use")
+      == "1 model · ~40 sent · ~3.9k recv · 100 thinking · 1 image · 200 cached · 1 req · 1m44s in use"
+  )
   #expect(abs((provider.efficiency ?? 0) - 5_000 / 104) < 0.0001)
 
   let call = ModelCallStats(
@@ -594,9 +601,9 @@ func measuredFromUsagePayload() {
 
 @Test("UserDefaults persistence round-trips a ledger under its key")
 func userDefaultsPersistence() async throws {
-  let suite = "MaiCoreTests.usage.\(UUID().uuidString)"
-  defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
-  let persistence = UserDefaultsModelUsagePersistence(key: "usage", suiteName: suite)
+  let key = "MaiCoreTests.usage.\(UUID().uuidString)"
+  defer { UserDefaults.standard.removeObject(forKey: key) }
+  let persistence = UserDefaultsModelUsagePersistence(key: key)
   #expect(try persistence.load().isEmpty)
 
   var ledger = ModelUsageLedger()
@@ -605,7 +612,7 @@ func userDefaultsPersistence() async throws {
     at: start)
   try persistence.save(ledger)
   #expect(try persistence.load() == ledger)
-  #expect(UserDefaults(suiteName: suite)?.data(forKey: "usage") != nil)
+  #expect(UserDefaults.standard.data(forKey: key) != nil)
 
   let store = ModelUsageStore(persistence: persistence)
   #expect(await store.ledger == ledger)

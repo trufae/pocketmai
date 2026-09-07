@@ -1,36 +1,33 @@
 import MaiCore
 import SwiftUI
 
-/// Settings → Statistics: lifetime token consumption, generation speed, time
-/// in use, and efficiency for every provider/model that has been used. A bar
-/// chart on top ranks the models by the chosen metric; tapping a bar names it
-/// below the chart. The numbers, rankings, descriptions, and provider colors
-/// come from MaiCore, the same code behind the pmai REPL's `/stats`.
+/// Settings → Statistics: the report the pmai REPL prints with `/stats` —
+/// lifetime tokens, speed, time in use, and efficiency per provider/model —
+/// as a bar chart ranked by the chosen metric, with the models and providers
+/// listed below it. Untick a row to leave it out of the chart; long-press
+/// one for every recorded fact. Numbers, rankings, descriptions, and colors
+/// all come from MaiCore.
 struct UsageStatsView: View {
   private typealias Metric = ModelUsageReport.Metric
 
   @ObservedObject private var stats = UsageStatsStore.shared
   @State private var metric: Metric = .speed
   @State private var selectedID: String?
-  @State private var selectedModelIDs: Set<String> = []
-  @State private var selectedProviderLabels: Set<String> = []
-  @State private var hasInitializedSelections = false
+  /// Rows left out of the chart; everything is in until unticked.
+  @State private var hiddenModelIDs: Set<String> = []
+  @State private var hiddenProviders: Set<String> = []
   @State private var confirmingReset = false
-  @State private var detailEntry: ModelUsageTotals?
-  @State private var deletingProvider: ProviderUsageTotals?
+  /// A long-pressed row: its title, its facts, and what deleting it removes.
+  @State private var inspected: (title: String, facts: String, target: String)?
 
   private static let chartHeight: CGFloat = 120
 
-  /// The models and providers ticked in the lists are the ones the chart
-  /// and the totals cover.
-  private var filteredLedger: ModelUsageLedger {
-    ModelUsageLedger(
+  private var report: ModelUsageReport {
+    ModelUsageReport(
       totals: stats.totals.filter {
-        selectedProviderLabels.contains($0.providerLabel) && selectedModelIDs.contains($0.id)
+        !hiddenProviders.contains($0.providerLabel) && !hiddenModelIDs.contains($0.id)
       })
   }
-
-  private var report: ModelUsageReport { ModelUsageReport(filteredLedger) }
 
   /// Rows with a number for the chosen metric, best first.
   private var chartRows: [ModelUsageReport.Row] {
@@ -40,10 +37,6 @@ struct UsageStatsView: View {
   private var selectedRow: ModelUsageReport.Row? {
     chartRows.first { $0.id == selectedID } ?? chartRows.first
   }
-
-  private var allModelTotals: [ModelUsageTotals] { stats.ledger.sortedByLastUsed }
-
-  private var providerTotals: [ProviderUsageTotals] { stats.ledger.providerTotals }
 
   var body: some View {
     List {
@@ -56,7 +49,7 @@ struct UsageStatsView: View {
         ContentUnavailableView(
           "No Statistics Selected",
           systemImage: "line.3.horizontal.decrease.circle",
-          description: Text("Select at least one model and provider to show statistics."))
+          description: Text("Tick at least one model and provider to show statistics."))
       } else {
         Section {
           Picker("Metric", selection: $metric) {
@@ -64,22 +57,32 @@ struct UsageStatsView: View {
           }
           .pickerStyle(.segmented)
           chart
-          Text(report.headline)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .monospacedDigit()
-            .frame(maxWidth: .infinity)
-          tokenSummary
+          caption(report.headline)
+          caption(
+            [
+              "~\(ModelUsageFormat.count(report.ledger.userInputTokens)) sent",
+              "~\(ModelUsageFormat.count(report.ledger.receivedTextTokens)) recv",
+              report.ledger.imageInputs > 0 ? "\(report.ledger.imageInputs) images" : nil,
+            ].compactMap { $0 }.joined(separator: " · "))
         } header: {
           Text(metric.title)
         } footer: {
           Text("\(metric.title): \(metric.explanation).")
         }
       }
-      if !allModelTotals.isEmpty {
+      if !stats.totals.isEmpty {
         Section {
-          ForEach(allModelTotals) { entry in
-            modelRow(entry)
+          ForEach(stats.ledger.sortedByLastUsed) { entry in
+            row(
+              title: entry.title,
+              value: metric.number(of: entry).flatMap { $0 > 0 ? metric.text($0) : nil },
+              summary: entry.summary,
+              color: ModelUsagePalette.color(forModel: entry.id),
+              hidden: $hiddenModelIDs,
+              key: entry.id
+            ) {
+              inspected = (entry.title, entry.detailLines.joined(separator: "\n"), entry.id)
+            }
           }
         } header: {
           Text("Models")
@@ -88,21 +91,27 @@ struct UsageStatsView: View {
             Text("~ marks token counts estimated from text length (~4 characters per token).")
           }
         }
-      }
-      if !providerTotals.isEmpty {
         Section {
-          ForEach(providerTotals) { provider in
-            providerRow(provider)
+          ForEach(stats.ledger.providerTotals) { provider in
+            row(
+              title: provider.providerLabel,
+              value: metric == .efficiency
+                ? provider.efficiency.map(ModelUsageFormat.efficiency) : nil,
+              summary: provider.summary,
+              color: ModelUsagePalette.color(forProviderLabel: provider.providerLabel),
+              hidden: $hiddenProviders,
+              key: provider.providerLabel
+            ) {
+              inspected = (provider.providerLabel, provider.summary, provider.providerLabel)
+            }
           }
         } header: {
           Text("Providers")
         } footer: {
           Text(
-            "Select models and providers to include them in the chart and totals. Long-press a row for every recorded fact."
+            "Untick a model or a provider to leave it out of the chart. Long-press a row for every recorded fact."
           )
         }
-      }
-      if !stats.totals.isEmpty {
         Section {
           Button(role: .destructive) {
             confirmingReset = true
@@ -113,12 +122,6 @@ struct UsageStatsView: View {
       }
     }
     .navigationTitle("Statistics")
-    .onAppear {
-      guard !hasInitializedSelections else { return }
-      selectedModelIDs = Set(allModelTotals.map(\.id))
-      selectedProviderLabels = Set(providerTotals.map(\.providerLabel))
-      hasInitializedSelections = true
-    }
     .confirmationDialog(
       "Reset all usage statistics?",
       isPresented: $confirmingReset,
@@ -126,63 +129,38 @@ struct UsageStatsView: View {
     ) {
       Button("Reset Statistics", role: .destructive) {
         stats.reset()
-        selectedID = nil
-        selectedModelIDs = []
-        selectedProviderLabels = []
+        hiddenModelIDs = []
+        hiddenProviders = []
       }
     }
     .confirmationDialog(
-      detailEntry?.title ?? "",
+      inspected?.title ?? "",
       isPresented: Binding(
-        get: { detailEntry != nil },
-        set: { if !$0 { detailEntry = nil } }
+        get: { inspected != nil },
+        set: { if !$0 { inspected = nil } }
       ),
       titleVisibility: .visible,
-      presenting: detailEntry
-    ) { entry in
+      presenting: inspected
+    ) { item in
       Button("Delete Statistics", role: .destructive) {
-        stats.remove(id: entry.id)
-        selectedModelIDs.remove(entry.id)
+        stats.remove(matching: item.target)
       }
-    } message: { entry in
-      Text(entry.detailLines.joined(separator: "\n"))
-    }
-    .confirmationDialog(
-      deletingProvider.map { "Delete all statistics for \($0.providerLabel)?" } ?? "",
-      isPresented: Binding(
-        get: { deletingProvider != nil },
-        set: { if !$0 { deletingProvider = nil } }
-      ),
-      titleVisibility: .visible,
-      presenting: deletingProvider
-    ) { provider in
-      Button("Delete Statistics", role: .destructive) {
-        let removedIDs = Set(
-          stats.totals.filter { $0.providerLabel == provider.providerLabel }.map(\.id))
-        stats.remove(providerLabel: provider.providerLabel)
-        selectedModelIDs.subtract(removedIDs)
-        selectedProviderLabels.remove(provider.providerLabel)
-      }
-    } message: { provider in
-      Text(provider.summary)
+    } message: { item in
+      Text(item.facts)
     }
   }
 
   /// One bar per model, its height the row's share of the best value for the
-  /// chosen metric, in the provider's shared color.
+  /// chosen metric, in the model's shared color; the tapped one is named.
   private var chart: some View {
-    let rows = chartRows
-    return VStack(spacing: 10) {
-      if rows.isEmpty {
-        Text("No \(metric.label.lowercased()) recorded for the selected models yet.")
-          .font(.caption)
-          .foregroundStyle(.secondary)
+    VStack(spacing: 10) {
+      if chartRows.isEmpty {
+        caption("No \(metric.label.lowercased()) recorded for the shown models yet.")
       }
       HStack(alignment: .bottom, spacing: 6) {
-        ForEach(rows) { row in
-          let isSelected = row.id == selectedRow?.id
+        ForEach(chartRows) { row in
           Rectangle()
-            .fill(Color(row.color).opacity(isSelected ? 1 : 0.35))
+            .fill(Color(row.color).opacity(row.id == selectedRow?.id ? 1 : 0.35))
             .clipShape(UnevenRoundedRectangle(topLeadingRadius: 4, topTrailingRadius: 4))
             .frame(maxWidth: 48)
             .frame(height: max(6, Self.chartHeight * row.fraction(metric)))
@@ -195,141 +173,80 @@ struct UsageStatsView: View {
       }
       .animation(.snappy(duration: 0.2), value: selectedID)
       if let row = selectedRow {
-        VStack(spacing: 2) {
-          HStack(spacing: 6) {
-            Text(row.title)
-              .font(.caption)
-              .foregroundStyle(.secondary)
-              .lineLimit(1)
-              .truncationMode(.middle)
-            Text(row.value(metric))
-              .font(.caption.weight(.semibold))
-              .monospacedDigit()
-          }
-          Text(row.detail(metric))
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            .monospacedDigit()
-        }
-        .frame(maxWidth: .infinity)
+        caption("\(row.title) · \(row.value(metric))")
+        caption(row.detail(metric))
       }
     }
     .padding(.vertical, 6)
   }
 
-  private var tokenSummary: some View {
-    let ledger = filteredLedger
-    return HStack(spacing: 12) {
-      Label("~\(ModelUsageFormat.count(ledger.userInputTokens)) sent", systemImage: "arrow.up")
-      Label(
-        "~\(ModelUsageFormat.count(ledger.receivedTextTokens)) recv", systemImage: "arrow.down")
-      if ledger.imageInputs > 0 {
-        Label("\(ledger.imageInputs) images", systemImage: "photo")
-      }
-    }
-    .font(.caption.weight(.medium))
-    .foregroundStyle(.secondary)
-    .monospacedDigit()
-    .frame(maxWidth: .infinity)
+  private func caption(_ text: String) -> some View {
+    Text(text)
+      .font(.caption)
+      .foregroundStyle(.secondary)
+      .monospacedDigit()
+      .multilineTextAlignment(.center)
+      .frame(maxWidth: .infinity)
   }
 
-  private func modelRow(_ entry: ModelUsageTotals) -> some View {
-    let isSelected = selectedModelIDs.contains(entry.id)
+  /// A model or provider row: its color, name, the chosen metric's number,
+  /// the summary line, and a tick that keeps it in the chart.
+  private func row(
+    title: String,
+    value: String?,
+    summary: String,
+    color: ModelUsageColor,
+    hidden: Binding<Set<String>>,
+    key: String,
+    inspect: @escaping () -> Void
+  ) -> some View {
+    let shown = !hidden.wrappedValue.contains(key)
     return Button {
-      if isSelected {
-        selectedModelIDs.remove(entry.id)
+      if shown {
+        hidden.wrappedValue.insert(key)
       } else {
-        selectedModelIDs.insert(entry.id)
+        hidden.wrappedValue.remove(key)
       }
     } label: {
       HStack(spacing: 10) {
+        Circle()
+          .fill(Color(color))
+          .frame(width: 10, height: 10)
         VStack(alignment: .leading, spacing: 3) {
           HStack {
-            Text(entry.title)
+            Text(title)
               .font(.subheadline.weight(.medium))
               .foregroundStyle(.primary)
               .lineLimit(1)
               .truncationMode(.middle)
             Spacer()
-            if let number = entry.value(metric), number > 0 {
-              Text(metric.text(number))
+            if let value {
+              Text(value)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
             }
           }
-          Text(entry.summary)
+          Text(summary)
             .font(.caption)
             .foregroundStyle(.secondary)
             .monospacedDigit()
         }
-        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-          .foregroundStyle(isSelected ? Color.accentColor : .secondary)
-      }
-    }
-    .padding(.vertical, 2)
-    .buttonStyle(.plain)
-    .listRowBackground(
-      isSelected ? Color(providerLabel: entry.providerLabel).opacity(0.14) : Color.clear
-    )
-    .onLongPressGesture {
-      detailEntry = entry
-    }
-    .accessibilityLabel(entry.title)
-    .accessibilityValue(isSelected ? "Selected" : "Not selected")
-  }
-
-  private func providerRow(_ provider: ProviderUsageTotals) -> some View {
-    let isSelected = selectedProviderLabels.contains(provider.providerLabel)
-    return Button {
-      if isSelected {
-        selectedProviderLabels.remove(provider.providerLabel)
-      } else {
-        selectedProviderLabels.insert(provider.providerLabel)
-      }
-    } label: {
-      HStack(spacing: 10) {
-        Circle()
-          .fill(Color(providerLabel: provider.providerLabel))
-          .frame(width: 10, height: 10)
-        VStack(alignment: .leading, spacing: 3) {
-          HStack {
-            Text(provider.providerLabel)
-              .foregroundStyle(.primary)
-            Spacer()
-            if let efficiency = provider.efficiency, metric == .efficiency {
-              Text(ModelUsageFormat.efficiency(efficiency))
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
-            }
-          }
-          Text(provider.summary)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .monospacedDigit()
-        }
-        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-          .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+        Image(systemName: shown ? "checkmark.circle.fill" : "circle")
+          .foregroundStyle(shown ? Color.accentColor : .secondary)
       }
     }
     .buttonStyle(.plain)
-    .onLongPressGesture {
-      deletingProvider = provider
-    }
-    .accessibilityLabel(provider.providerLabel)
-    .accessibilityValue("\(isSelected ? "Selected" : "Not selected"), \(provider.summary)")
+    .onLongPressGesture(perform: inspect)
+    .accessibilityLabel(title)
+    .accessibilityValue("\(shown ? "Shown" : "Hidden"), \(summary)")
   }
 }
 
 extension Color {
-  /// The shared palette's color, so a provider looks the same here as in the
-  /// pmai visual workspace.
+  /// The shared palette's color, so a model looks the same here as in the
+  /// pmai REPL and visual workspace.
   fileprivate init(_ color: ModelUsageColor) {
     self.init(red: color.red, green: color.green, blue: color.blue)
-  }
-
-  fileprivate init(providerLabel: String) {
-    self.init(ModelUsagePalette.color(forProviderLabel: providerLabel))
   }
 }
