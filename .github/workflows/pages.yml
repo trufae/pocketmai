@@ -1,0 +1,67 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "www/**"
+      - ".github/workflows/pages.yml"
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Package website
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout website source
+        uses: actions/checkout@v6
+        with:
+          # Pages always reflects the default branch. A release completion
+          # requests a fresh deployment without letting an older tag roll the
+          # website back.
+          ref: main
+
+      - name: Verify static website
+        run: |
+          set -eu
+          test -f www/index.html
+          test -f www/styles.css
+          test -f www/app.js
+          test -f www/install.sh
+          test -f www/mai-logo.png
+          test -f www/icon-192.png
+          test -f www/swift.svg
+          test -x www/install.sh
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload website
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: www
+
+  deploy:
+    name: Deploy website
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
