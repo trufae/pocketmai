@@ -353,7 +353,7 @@ checkpoint and the task continues on its own; the token and time caps always
 stop, since they exist to bound the spend. A model call that fails — a dropped
 connection, a 5xx — is repeated after `retry.delay` seconds up to
 `retry.attempts` times (`↻ retry 1/2 in 5s: …`) before the turn fails.
-`/set autocompact 120k` makes the runtime summarize the older part of the
+`/set ctx.compact 120k` makes the runtime summarize the older part of the
 conversation, in place and before a model turn, once it is estimated to hold
 that many tokens (from the provider's own count when it reports one); the
 newest exchange stays verbatim, the compact prompt gets a focus on finishing
@@ -382,7 +382,7 @@ and `Ctrl+C` cancels the active model or tool run without leaving the REPL.
 `Ctrl+Z` suspends pmai with the terminal restored; run `fg` in the shell to
 resume the same input or active run.
 
-`/set context size` (config key `context`, default `cache`) turns on the cheap
+`/set ctx.strategy size` (config key `context`, default `cache`) turns on the cheap
 half of that: before every model call the runtime replaces the body of any file
 read while answering an *earlier* prompt with one line saying what it was and
 that `files_read` brings it back. Everything read for the prompt in progress
@@ -393,7 +393,7 @@ a server's prompt cache is invalidated from the rewritten message on. `cache`, t
 cache covers every earlier turn and each call pays only for what is new. The
 REPL prints `✂ context: rewrote 1 message (12.3k → 2.1k chars)` when it prunes.
 
-`/effort LEVEL [TEXT]` sets how hard the model thinks, with one scale for every
+`/set effort LEVEL [TEXT]` sets how hard the model thinks, with one scale for every
 provider: `low`, `medium`, `high`, `xhigh`, or `max` (the REPL completes them).
 The level is stored as the agent's `options.reasoningEffort` and
 `ReasoningEffort` (in `MaiCore`) turns it into whatever the endpoint's API
@@ -405,8 +405,8 @@ family takes — `reasoning_effort` for OpenAI (only on models that reason, with
 overridden, and a value that is not one of the levels (`minimal`, say) is sent
 as `reasoning_effort` unchanged. The runtime also adds a system prompt section
 that says how much care the task deserves, followed by `TEXT` when given, so a
-model without a reasoning control hears it too. `/effort` shows the current
-setting, `/effort off` clears it, and both persist on the agent like `/set`.
+model without a reasoning control hears it too. `/set effort` shows the current
+setting, `/set effort off` clears it, and both persist on the agent.
 
 Native tools are presented as plugin-defined capability groups instead of one
 checkbox per provider-visible function. `/tools` lists the groups, `/tools

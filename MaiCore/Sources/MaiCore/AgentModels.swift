@@ -656,7 +656,7 @@ public struct GenerationOptions: Codable, Equatable, Sendable {
   /// is.
   public var reasoningEffort: String?
   /// Extra guidance for the system prompt that goes with the effort, as
-  /// `/effort LEVEL TEXT` sets it.
+  /// `/set effort LEVEL TEXT` sets it.
   public var reasoningGuidance: String?
   public var includeStreamUsage: Bool
   public var additional: [String: JSONValue]

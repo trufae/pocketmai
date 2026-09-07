@@ -1,6 +1,6 @@
 import Foundation
 
-/// How hard a model is asked to think before it answers, as `/effort` sets
+/// How hard a model is asked to think before it answers, as `/set effort` sets
 /// it. One level serves every provider: `requestFields` turns it into the
 /// fields each API family understands (`reasoning_effort` for OpenAI, `think`
 /// for Ollama, `enable_thinking` for Qwen, `thinking` for DeepSeek, the

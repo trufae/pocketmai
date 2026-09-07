@@ -138,7 +138,7 @@ configuration, and clearing it in the editor restores the default.
 
 | template | used by | must contain | edit with |
 |---|---|---|---|
-| `compact` | `/chat compact`, and autocompact (`/set autocompact N`) with a built-in focus on the task in hand | `{{transcript}}` (`{{focus}}` optional) | `/edit compact` |
+| `compact` | `/chat compact`, and autocompact (`/set ctx.compact N`) with a built-in focus on the task in hand | `{{transcript}}` (`{{focus}}` optional) | `/edit compact` |
 | `delegation` | the brief a child agent receives | `{{task}}` (`{{context}}`, `{{output}}`, `{{agent}}`, `{{cwd}}` optional) | `/edit delegation` |
 | `worker` | the derived `<agent>.worker` instructions | — | `/edit worker` |
 | `memory` | `/memory learn` | `{{transcript}}` (`{{memory}}`, `{{focus}}` optional) | `/edit memory-prompt` |

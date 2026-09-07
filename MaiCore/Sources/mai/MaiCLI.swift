@@ -2644,6 +2644,8 @@ struct MaiCLI {
         await terminal.line(promptHelp)
       case "agents", "agent", "/agents", "/agent":
         await terminal.line(agentsHelp)
+      case "mcp", "/mcp":
+        await terminal.line(mcpCommandHelp)
       case "chat", "/chat":
         await terminal.line(chatHelp)
       case "edit", "/edit":
@@ -2660,11 +2662,9 @@ struct MaiCLI {
         await terminal.line(statsHelp)
       case "skills", "skill", "/skills", "/skill":
         await terminal.line(skillsHelp)
-      case "effort", "/effort":
-        await terminal.line(effortHelp)
       default:
         await terminal.line(
-          "Unknown help topic '\(argument)'. Try /help, or /help set, effort, memory, todo, prompts, agents, chat, edit, tools, skills, queue, export, copy, or stats."
+          "Unknown help topic '\(argument)'. Try /help, or /help set, memory, todo, prompts, agents, mcp, chat, edit, tools, skills, queue, export, copy, or stats."
         )
       }
     case "/cwd", "/pwd":
@@ -2677,14 +2677,6 @@ struct MaiCLI {
         session: &session,
         runtime: runtime,
         approvalHandler: visual.approvalHandler,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        terminal: terminal)
-    case "/effort":
-      await handleEffortCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
         configuration: &configuration,
         configurationPath: visual.configurationPath,
         terminal: terminal)
@@ -5582,8 +5574,9 @@ struct MaiCLI {
 
   // MARK: Effort
 
-  /// `/effort` shows the reasoning level and guidance of the current agent;
-  /// `/effort LEVEL [TEXT]` sets them and `/effort off` clears them. The level
+  /// `/set effort` shows the reasoning level and guidance of the current
+  /// agent; `/set effort LEVEL [TEXT]` sets them and `/set effort off` clears
+  /// them. The level
   /// reaches the provider as the field its API family takes and, with the
   /// guidance, the system prompt; both persist on the agent like /set does.
   private static func handleEffortCommand(
@@ -6012,6 +6005,16 @@ struct MaiCLI {
     }
     let key = parts[0].lowercased()
     let displayedKey = key == "ui.toolresultlines" ? "ui.toolResultLines" : key
+    if key == "effort" {
+      await handleEffortCommand(
+        parts.dropFirst().joined(separator: " "),
+        session: &session,
+        runtime: runtime,
+        configuration: &configuration,
+        configurationPath: configurationPath,
+        terminal: terminal)
+      return
+    }
     if key == "ui" || key == "ui." {
       await listUISettings(configuration?.ui ?? .init(), terminal: terminal)
       return
@@ -6128,7 +6131,7 @@ struct MaiCLI {
         || levelKeys.contains(key)
     else {
       await terminal.line(
-        "Unknown setting '\(parts[0])'. Available settings: yolo, delegation, tool.calling, tool.proxy, limits.maxToolCalls, limits.maxModelTurns, limits.maxSubagents, limits.maxSubagentDepth, limits.maxTotalTokens, limits.maxSeconds, retry.attempts, retry.delay, autocompact, context, ui.bgline, ui.fgcolor, ui.bgcolor, ui.fgprompt, ui.bgprompt, ui.fgtoolresult, ui.bold, ui.markdown, ui.toolResultLines, ui.subagents, use.agentsmd, use.plan"
+        "Unknown setting '\(parts[0])'. Available settings: effort, yolo, delegation, tool.calling, tool.proxy, limits.maxToolCalls, limits.maxModelTurns, limits.maxSubagents, limits.maxSubagentDepth, limits.maxTotalTokens, limits.maxSeconds, retry.attempts, retry.delay, ctx.compact, ctx.strategy, ui.bgline, ui.fgcolor, ui.bgcolor, ui.fgprompt, ui.bgprompt, ui.fgtoolresult, ui.bold, ui.markdown, ui.toolResultLines, ui.subagents, use.agentsmd, use.plan"
       )
       return
     }
@@ -6219,15 +6222,14 @@ struct MaiCLI {
     "limits.maxtime": "limits.maxSeconds",
   ]
 
-  /// Lowercased `/set` keys for the retry and autocompact policies.
+  /// Lowercased `/set` keys for retry and context-compaction policies.
   private static let recoverySettingKeys = [
     "retry.attempts": "retry.attempts",
     "retry.count": "retry.attempts",
     "retries": "retry.attempts",
     "retry.delay": "retry.delay",
     "retry.delayseconds": "retry.delay",
-    "autocompact": "autocompact",
-    "autocompact.tokens": "autocompact",
+    "ctx.compact": "ctx.compact",
   ]
 
   private static let delegationSettingKeys: Set<String> = [
@@ -6242,7 +6244,7 @@ struct MaiCLI {
     "tool.proxy", "tools.proxy", "toolproxy", "usetoolproxy",
   ]
 
-  private static let contextModeKeys: Set<String> = ["context", "context.mode"]
+  private static let contextModeKeys: Set<String> = ["ctx.strategy"]
 
   private static func listToolSettings(_ profile: SessionProfile, terminal: TerminalWriter) async {
     await terminal.line("tool.calling = \(profile.toolCallingStrategy.rawValue)")
@@ -6339,7 +6341,7 @@ struct MaiCLI {
     }
   }
 
-  /// `/set context <cache|size>`: cache never changes a sent message, size
+  /// `/set ctx.strategy <cache|size>`: cache never changes a sent message, size
   /// replaces consumed file bodies with references before each model call.
   private static func setContextMode(
     parts: [String],
@@ -6350,17 +6352,17 @@ struct MaiCLI {
     terminal: TerminalWriter
   ) async {
     guard parts.count > 1 else {
-      await terminal.line("context = \(session.profile.context.rawValue)")
+      await terminal.line("ctx.strategy = \(session.profile.context.rawValue)")
       return
     }
     guard parts.count == 2, let mode = AgentContextMode(rawValue: parts[1].lowercased()) else {
-      await terminal.line("Usage: /set context <cache|size>")
+      await terminal.line("Usage: /set ctx.strategy <cache|size>")
       return
     }
     session.profile.context = mode
     session.touch()
     guard configuration != nil, configurationPath != nil else {
-      await terminal.line("Set context = \(mode.rawValue) for this chat.")
+      await terminal.line("Set ctx.strategy = \(mode.rawValue) for this chat.")
       return
     }
     if await persistAgentProfile(
@@ -6370,7 +6372,7 @@ struct MaiCLI {
       runtime: runtime,
       terminal: terminal)
     {
-      await terminal.line("Set context = \(mode.rawValue) for agent '\(session.profile.agentID)'.")
+      await terminal.line("Set ctx.strategy = \(mode.rawValue) for agent '\(session.profile.agentID)'.")
     }
   }
 
@@ -6444,8 +6446,8 @@ struct MaiCLI {
   {
     await terminal.line("retry.attempts = \(profile.retry.attempts)")
     await terminal.line("retry.delay = \(durationSetting(profile.retry.delaySeconds))")
-    await terminal.line("autocompact = \(autocompactSetting(profile.autocompact))")
-    await terminal.line("context = \(profile.context.rawValue)")
+    await terminal.line("ctx.compact = \(autocompactSetting(profile.autocompact))")
+    await terminal.line("ctx.strategy = \(profile.context.rawValue)")
   }
 
   private static func durationSetting(_ seconds: Double) -> String {
@@ -6638,7 +6640,7 @@ struct MaiCLI {
     }
   }
 
-  /// `retry.attempts`, `retry.delay`, and `autocompact`: what a run does when
+  /// `retry.attempts`, `retry.delay`, and `ctx.compact`: what a run does when
   /// a model call fails, and when it summarizes its own conversation. Saved
   /// on the chat's agent like the limits.
   private static func setRecoverySetting(
@@ -6686,7 +6688,7 @@ struct MaiCLI {
         autocompact.tokens = tokens
       } else {
         await terminal.line(
-          "Usage: /set autocompact <off|N|Nk>  (summarize the chat once it holds about N tokens)")
+          "Usage: /set ctx.compact <off|N|Nk>  (summarize the chat once it holds about N tokens)")
         return
       }
     }
@@ -6694,7 +6696,7 @@ struct MaiCLI {
     session.profile.autocompact = autocompact
     session.touch()
     var notes: [String] = []
-    if key == "autocompact", autocompact.isEnabled {
+    if key == "ctx.compact", autocompact.isEnabled {
       notes.append(
         "Older exchanges are summarized before a model turn once the conversation is estimated at \(autocompact.tokens) tokens; the newest exchange is kept verbatim."
       )
@@ -6925,8 +6927,8 @@ struct MaiCLI {
           "limits.maxSeconds": limitValue("limits.maxSeconds", in: profile.limits),
           "retry.attempts": String(profile.retry.attempts),
           "retry.delay": durationSetting(profile.retry.delaySeconds),
-          "autocompact": autocompactSetting(profile.autocompact),
-          "context": profile.context.rawValue,
+          "ctx.compact": autocompactSetting(profile.autocompact),
+          "ctx.strategy": profile.context.rawValue,
         ],
         subagents: subagents)
     }
@@ -8373,8 +8375,8 @@ struct MaiCLI {
     skills: [AgentSkill] = []
   ) -> [String] {
     var values = [
-      "/help", "/help set", "/help effort", "/exit", "/quit", "/set yolo on", "/set yolo off",
-      "/set ui.", "/effort", "/effort off",
+      "/help", "/help set", "/exit", "/quit", "/set yolo on", "/set yolo off",
+      "/set ui.", "/set effort", "/set effort off",
       "/btw ",
       "/help memory", "/help agents", "/help chat", "/help edit", "/help tools",
       "/agent acp list", "/agent acp add ", "/agents acp list",
@@ -8385,7 +8387,8 @@ struct MaiCLI {
       "/todo clear", "/todo path",
       "/set limits.", "/set limits.maxToolCalls ", "/set limits.maxModelTurns ",
       "/set limits.maxSubagents ", "/set limits.maxSeconds ", "/set limits.maxTotalTokens ",
-      "/set retry.attempts ", "/set retry.delay ", "/set autocompact ", "/set autocompact off",
+      "/set retry.attempts ", "/set retry.delay ", "/set ctx.strategy ", "/set ctx.compact ",
+      "/set ctx.compact off",
       "/continue", "/retry",
       "/set tool.", "/set tool.calling automatic", "/set tool.calling native",
       "/set tool.calling text", "/set tool.calling xml", "/set tool.calling json",
@@ -8475,7 +8478,7 @@ struct MaiCLI {
         ])
     }
     for level in ReasoningEffort.names {
-      values.append("/effort \(level)")
+      values.append("/set effort \(level)")
     }
     for group in groupNames {
       values.append("/tools show \(group)")
@@ -8680,7 +8683,6 @@ struct MaiCLI {
 
   private static let replHelp = """
     /set [SETTING VALUE]   Show or change settings; /help set lists them
-    /effort [LEVEL] [TEXT] Show or set how hard the model thinks (low, medium, high, xhigh, max) and extra guidance
     /cwd                  Print the current working directory
     /cd PATH              Change the current working directory
     /plugins            List statically and dynamically loaded plugins
@@ -8693,32 +8695,16 @@ struct MaiCLI {
     /continue           Pick a paused or interrupted task up where it stopped (/retry is the same)
     /memory             Show, edit, learn, or scope this project's durable memory
     /todo               Show, add to, tick off, or edit this project's todo list
-    /prompts            List named system prompts and which agents use them
-    /prompt [NAME]      Show or select the current agent's system prompt
-    /prompt add|edit|rm NAME   Create, edit, or drop a named system prompt (/help prompts)
+    /prompt[s]          Manage named system prompts; /help prompt lists commands
     /chat               List, switch, archive, rename, or edit this project's chats
     /project            Show, list, rename, or tint the project (the start directory)
     /edit TARGET        Edit a prompt, agent, config, MCP list, or message in $EDITOR
-    /agents             List agent setups and the running agent tree
-    /agents tree        Show running agents as a tree of pids
-    /agents kill PID    Stop a running agent and everything it started
-    /agents log PID     Print a running or finished agent's own transcript
-    /agents clear       Forget finished agents so the tree lists only running ones
-    /agents focus PID   Send what you type to a running agent (focus main returns)
+    /agents             Manage agent definitions and running agents; /help agents lists commands
     /queue              List, push, pop, or drop messages waiting for an agent
-    /agents enable|disable ID   Park an agent setup without deleting it
-    /agents describe ID TEXT    Set the purpose a model reads when picking agents
-    /agent [use] ID     Set the current chat's primary agent
-    /agent add NAME MODEL GROUPS PROMPT   Save a reusable agent in one line (/help agents)
-    /agent tools|model|prompt|provider ID VALUE   Change one saved agent
-    /agent remove ID    Drop a saved agent
-    /agent acp ...      Register an external ACP agent (gemini, claude, codex, ...)
+    /agent              Select or edit this chat's agent; /help agent lists commands
     /tools              List logical tool groups for the current agent
     /skills             List, enable, disable, or send skills (/help skills)
-    /mcp list           List configured MCP servers and connection state
-    /mcp add ...        Add, connect, persist, and enable a stdio MCP server
-    /mcp enable ID      Connect and enable a configured MCP server
-    /mcp disable ID     Disconnect and disable a configured MCP server
+    /mcp                Manage MCP servers; /help mcp lists commands
     /image MODE PATH    Attach at tiny/small/medium/big/full size, or OCR to Markdown
     /attach PATH        Attach a Word, PDF, JSON, or text file as Markdown/plain text
     /attach clear       Drop the attachments queued for the next message
@@ -8741,22 +8727,23 @@ struct MaiCLI {
 
   private static let effortHelp = """
     Reasoning effort:
-      /effort                    Show the current agent's reasoning effort and guidance
-      /effort LEVEL              Set it: low, medium, high, xhigh, or max. The provider gets the
+      /set effort                Show the current agent's reasoning effort and guidance
+      /set effort LEVEL          Set it: low, medium, high, xhigh, or max. The provider gets the
                                  field its API takes (reasoning_effort, think, enable_thinking,
                                  thinking…) and the system prompt says how much care to take
-      /effort LEVEL TEXT         The level plus TEXT, added to the system prompt as guidance
-      /effort off                Back to the provider's default, with no guidance
+      /set effort LEVEL TEXT     The level plus TEXT, added to the system prompt as guidance
+      /set effort off            Back to the provider's default, with no guidance
 
     Examples:
-      /effort high
-      /effort max Check every edge case and verify the result before answering
-      /effort low Keep answers to one paragraph
+      /set effort high
+      /set effort max Check every edge case and verify the result before answering
+      /set effort low Keep answers to one paragraph
     """
 
   private static let setHelp = """
     Settings commands:
       /set                         List current settings and their values
+      /set effort [LEVEL] [TEXT]   Show or set reasoning effort and optional guidance
       /set yolo BOOL               Permit all tool calls without asking (on/off); kept for later runs
       /set tool.                   List the tool calling settings
       /set tool.calling MODE       Use automatic/native tools, or text/XML/JSON emulation
@@ -8771,7 +8758,8 @@ struct MaiCLI {
       /set limits.maxSeconds <off|N|Nm|Nh>   Wall-clock time a run may take before it pauses
       /set retry.attempts N        Times a failed model call is repeated (default 2)
       /set retry.delay SECONDS     Wait before each retry (default 5)
-      /set autocompact <off|N|Nk>  Summarize older exchanges once the chat holds ~N tokens
+      /set ctx.compact <off|N|Nk>  Summarize older exchanges once the chat holds ~N tokens
+      /set ctx.strategy <cache|size>  Keep prompt-cache history intact, or compact old file reads
       /set ui.                     List terminal UI settings
       /set ui.bgline COLOR         Set the input-line background
       /set ui.fgcolor COLOR        Set the input foreground

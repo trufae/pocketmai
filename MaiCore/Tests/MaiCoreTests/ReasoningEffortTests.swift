@@ -4,7 +4,7 @@ import Testing
 @testable import MaiCore
 @testable import MaiOpenAI
 
-// `/effort` sets one level for every provider. The level becomes the fields
+// `/set effort` sets one level for every provider. The level becomes the fields
 // each API family takes and a system prompt section, so a model with no
 // reasoning control still hears how much care the task deserves.
 
