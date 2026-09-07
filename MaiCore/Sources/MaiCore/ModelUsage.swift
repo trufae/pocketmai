@@ -971,11 +971,20 @@ public struct ModelUsageReport: Equatable, Sendable {
       id: "efficiency", title: "Efficiency",
       explanation: "total tokens divided by seconds in use and by requests",
       missing: "no score", compute: { $0.efficiency }, format: ModelUsageFormat.efficiency)
+    /// The sum of a model's positions in speed, time in use, and efficiency.
+    /// Lower is better: first place in every category is 3 points.
+    public static let ranking = Metric(
+      id: "ranking", title: "Ranking",
+      explanation: "the sum of its positions in speed, time in use, and efficiency; lower is better",
+      missing: "no ranking", compute: { _ in nil }, format: { "\(Int($0)) points" })
+    /// The three measured categories that contribute to the combined ranking.
     public static let allCases = [speed, time, efficiency]
+    /// Metrics shown by `/stats` and chart pickers, including the combined ranking.
+    public static let displayCases = [ranking, speed, time, efficiency]
 
-    /// The metric a user named on a command line: `speed`, `time`, `efficiency`.
+    /// The metric a user named on a command line: `ranking`, `speed`, `time`, or `efficiency`.
     public static func named(_ id: String) -> Metric? {
-      allCases.first { $0.id == id }
+      displayCases.first { $0.id == id }
     }
 
     /// `Speed`, for a picker.
@@ -996,11 +1005,17 @@ public struct ModelUsageReport: Equatable, Sendable {
     public var color: ModelUsageColor
     /// Each metric's number relative to the best row, 0...1; zero without one.
     public var fractions: [Metric: Double]
+    /// The 1-based position in each measured category.
+    public var positions: [Metric: Int]
+    /// The sum of `positions`; a smaller score is a better overall ranking.
+    public var rankingScore: Int
 
     public var id: String { totals.id }
     public var title: String { totals.title }
 
-    public func number(_ metric: Metric) -> Double? { metric.number(of: totals) }
+    public func number(_ metric: Metric) -> Double? {
+      metric == .ranking ? Double(rankingScore) : metric.number(of: totals)
+    }
     public func fraction(_ metric: Metric) -> Double { fractions[metric] ?? 0 }
 
     /// The bar's number: `42.1 tok/s`, `12m34s`, or `3.2 tok/s/req`.
@@ -1009,7 +1024,12 @@ public struct ModelUsageReport: Equatable, Sendable {
     /// What the row says after its bar — the other metrics, then requests and
     /// tokens — so every ranking reads whole: `12m34s · 3.2 tok/s/req · 45 req · 120.3k tok`.
     public func detail(_ metric: Metric) -> String {
-      (Metric.allCases.filter { $0 != metric }.compactMap { other in
+      if metric == .ranking {
+        return Metric.allCases.compactMap { category in
+          positions[category].map { "\(category.label) #\($0)" }
+        }.joined(separator: " · ")
+      }
+      return (Metric.allCases.filter { $0 != metric }.compactMap { other in
         number(other).map { other.text($0) }
       }
         + [
@@ -1028,14 +1048,30 @@ public struct ModelUsageReport: Equatable, Sendable {
     let best = Metric.allCases.map { metric in
       (metric, ledger.totals.compactMap(metric.number(of:)).max() ?? 0)
     }
-    rows = ledger.sorted(by: .speed).map { entry in
+    let entries = ledger.sorted(by: .speed)
+    let positions = Dictionary(uniqueKeysWithValues: Metric.allCases.map { metric in
+      (metric, Dictionary(uniqueKeysWithValues: Self.sorted(entries, by: metric).enumerated().map {
+        ($0.element.id, $0.offset + 1)
+      }))
+    })
+    let scores = Dictionary(uniqueKeysWithValues: entries.map { entry in
+      (entry.id, Metric.allCases.reduce(0) { $0 + (positions[$1]?[entry.id] ?? 0) })
+    })
+    let bestScore = scores.values.min() ?? 0
+    let worstScore = scores.values.max() ?? 0
+    rows = entries.map { entry in
       Row(
         totals: entry,
         color: ModelUsagePalette.color(forModel: entry.id),
         fractions: Dictionary(
           uniqueKeysWithValues: best.map { metric, top in
             (metric, top > 0 ? (metric.number(of: entry) ?? 0) / top : 0)
-          }))
+          }).merging([.ranking: bestScore == worstScore ? 1 : Double(worstScore - (scores[entry.id] ?? 0)) / Double(worstScore - bestScore)],
+                     uniquingKeysWith: { _, ranking in ranking }),
+        positions: Dictionary(uniqueKeysWithValues: Metric.allCases.map {
+          ($0, positions[$0]?[entry.id] ?? 0)
+        }),
+        rankingScore: scores[entry.id] ?? 0)
     }
   }
 
@@ -1048,7 +1084,24 @@ public struct ModelUsageReport: Equatable, Sendable {
   /// Rows ranked for one metric, best first; rows without it keep their
   /// speed ranking at the end.
   public func rows(for metric: Metric) -> [Row] {
-    rows.sorted { ($0.number(metric) ?? -1) > ($1.number(metric) ?? -1) }
+    if metric == .ranking {
+      return rows.sorted { lhs, rhs in
+        lhs.rankingScore == rhs.rankingScore ? lhs.id < rhs.id : lhs.rankingScore < rhs.rankingScore
+      }
+    }
+    return rows.sorted { lhs, rhs in
+      let lhsValue = lhs.number(metric) ?? -1
+      let rhsValue = rhs.number(metric) ?? -1
+      return lhsValue == rhsValue ? lhs.id < rhs.id : lhsValue > rhsValue
+    }
+  }
+
+  private static func sorted(_ entries: [ModelUsageTotals], by metric: Metric) -> [ModelUsageTotals] {
+    entries.sorted { lhs, rhs in
+      let lhsValue = metric.number(of: lhs) ?? -1
+      let rhsValue = metric.number(of: rhs) ?? -1
+      return lhsValue == rhsValue ? lhs.id < rhs.id : lhsValue > rhsValue
+    }
   }
 
   /// `2 models · 57 requests · 15m36s in use · 150.4k tokens · efficiency 2.8 tok/s/req`
@@ -1092,7 +1145,7 @@ public struct ModelUsageReport: Equatable, Sendable {
 
   /// The report as styled runs, one array per line: a headline, then one
   /// bar per model for each metric, sized to fit `width` columns.
-  public func runs(width: Int = 80, metrics: [Metric] = Metric.allCases) -> [[Run]] {
+  public func runs(width: Int = 80, metrics: [Metric] = Metric.displayCases) -> [[Run]] {
     guard !isEmpty else { return [[Run(Self.emptyMessage)]] }
     var lines: [[Run]] = [[Run("Model usage: ", .heading), Run(headline, .headline)]]
     let labelWidth = min(28, rows.map { $0.title.count }.max() ?? 0)
@@ -1133,7 +1186,7 @@ public struct ModelUsageReport: Equatable, Sendable {
   /// any surface can print it.
   public func lines(
     width: Int = 80,
-    metrics: [Metric] = Metric.allCases,
+    metrics: [Metric] = Metric.displayCases,
     paint: (String, Style) -> String = { text, _ in text }
   ) -> [String] {
     runs(width: width, metrics: metrics).map { line in

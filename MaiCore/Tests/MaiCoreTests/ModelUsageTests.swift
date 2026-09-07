@@ -330,11 +330,12 @@ func reportRanksAndRenders() {
   #expect(lines.contains("Average output speed"))
   #expect(lines.contains("Time in use"))
   #expect(lines.contains("Efficiency"))
+  #expect(lines.contains("Ranking"))
   #expect(lines.contains { $0.contains("thor — qwen3.8:27b") && $0.contains("40.0 tok/s") })
   #expect(lines.contains { $0.contains("openai — big-pickle") && $0.contains("20.0 tok/s") })
   #expect(lines.contains { $0.contains("hello") && $0.contains("no speed") })
   #expect(lines.last?.hasPrefix("~ marks") == true)
-  #expect(painted.count == 9)
+  #expect(painted.count == 12)
   #expect(styles.prefix(2) == [.heading, .headline])
   #expect(styles.contains(.value) && styles.contains(.detail) && styles.contains(.note))
   #expect(
@@ -343,7 +344,10 @@ func reportRanksAndRenders() {
         ModelUsageReport.Run("Model usage: ", .heading),
         ModelUsageReport.Run(report.headline, .headline),
       ])
-  let speedBars = lines.filter { $0.contains("<") }.prefix(3).map {
+  let speedBars = report.lines(width: 100, metrics: [.speed]) { text, style in
+    guard case .bar = style else { return text }
+    return "<\(text)>"
+  }.filter { $0.contains("<") }.map {
     $0.split(separator: "<")[1].split(separator: ">")[0]
   }
   #expect(Set(speedBars.map(\.count)).count == 1)
@@ -351,6 +355,34 @@ func reportRanksAndRenders() {
   #expect(speedBars[2].allSatisfy { $0 == " " })
 
   #expect(ModelUsageReport(ModelUsageLedger()).lines() == [ModelUsageReport.emptyMessage])
+}
+
+@Test("Combined ranking sums category positions and gives the lowest score the largest bar")
+func combinedRanking() {
+  var ledger = ModelUsageLedger()
+  ledger.record(
+    ModelCallStats(
+      providerLabel: "fast", modelID: "one", inputTokens: 100, outputTokens: 900,
+      generationSeconds: 10), at: start)
+  ledger.record(
+    ModelCallStats(
+      providerLabel: "steady", modelID: "two", inputTokens: 100, outputTokens: 400,
+      generationSeconds: 10), at: start)
+  ledger.record(
+    ModelCallStats(
+      providerLabel: "slow", modelID: "three", inputTokens: 100, outputTokens: 100,
+      generationSeconds: 10), at: start)
+
+  let report = ModelUsageReport(ledger)
+  let ranking = report.rows(for: .ranking)
+  #expect(ranking.map(\.id) == ["fast|one", "steady|two", "slow|three"])
+  #expect(ranking.map(\.rankingScore) == [3, 7, 8])
+  #expect(ranking[0].value(.ranking) == "3 points")
+  #expect(ranking[1].detail(.ranking) == "Speed #2 · Time #3 · Efficiency #2")
+  #expect(ranking[0].fraction(.ranking) == 1)
+  #expect(ranking[2].fraction(.ranking) == 0)
+  #expect(report.lines(width: 100, metrics: [.ranking]).contains("Ranking"))
+  #expect(ModelUsageReport.Metric.named("ranking") == .ranking)
 }
 
 @Test("Formats and the palette are stable")

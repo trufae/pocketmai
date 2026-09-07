@@ -2,7 +2,7 @@ import MaiCore
 import SwiftUI
 
 /// Settings → Statistics: the report the pmai REPL prints with `/stats` —
-/// lifetime tokens, speed, time in use, and efficiency per provider/model —
+/// lifetime tokens plus a combined ranking, speed, time in use, and efficiency per provider/model —
 /// as a bar chart ranked by the chosen metric, with the models and providers
 /// listed below it. Untick a row to leave it out of the chart; long-press
 /// one for every recorded fact. Numbers, rankings, descriptions, and colors
@@ -11,7 +11,7 @@ struct UsageStatsView: View {
   private typealias Metric = ModelUsageReport.Metric
 
   @ObservedObject private var stats = UsageStatsStore.shared
-  @State private var metric: Metric = .speed
+  @State private var metric: Metric = .ranking
   @State private var selectedID: String?
   /// Rows left out of the chart; everything is in until unticked.
   @State private var hiddenModelIDs: Set<String> = []
@@ -53,7 +53,7 @@ struct UsageStatsView: View {
       } else {
         Section {
           Picker("Metric", selection: $metric) {
-            ForEach(Metric.allCases, id: \.self) { Text($0.label).tag($0) }
+            ForEach(Metric.displayCases, id: \.self) { Text($0.label).tag($0) }
           }
           .pickerStyle(.segmented)
           chart

@@ -275,8 +275,8 @@ long its run has been going (`5 turns · 2 tools · 2.1k tok · 1m4s`), and
 of the whole tree. When a turn ends the REPL prints `✓ took 5s` in cyan, or
 `✗ took 5s` in red when it failed or was cancelled.
 
-`/stats` ranks every provider:model pair ever used three times, one colored
-bar per model: by average output speed, by time in use, and by efficiency,
+`/stats` ranks every provider:model pair by a combined ranking, then by its
+three measured categories: average output speed, time in use, and efficiency,
 with the request and token counts beside each bar. The runtime records every
 provider call it makes — REPL turns, one-shot runs, tool-loop rounds, child
 agents, and the visual workspace — into `ModelUsageStore`, kept in
@@ -286,7 +286,9 @@ text length and marked `~` when it reports none; speed is visible output
 tokens over the first→last token window of the stream, time in use adds the
 wait for the first token, and efficiency is total tokens divided by seconds in
 use and by requests (`tokens / (seconds × requests)`, printed as `tok/s/req`).
-`/stats speed`, `/stats time`, and `/stats efficiency` print one ranking,
+`/stats ranking`, `/stats speed`, `/stats time`, and `/stats efficiency` print one ranking.
+`Ranking` sums each model's position in the three measured categories, so the
+lowest score wins.
 `/stats show PROVIDER[:MODEL]` prints every fact recorded about a model or a
 provider, `/stats rm PROVIDER[:MODEL]` drops one row or a whole provider,
 `/stats reset` forgets everything, and `/stats path` prints the file.

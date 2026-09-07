@@ -3,7 +3,7 @@ import MaiCore
 import SwiftTUIRuntime
 
 /// Lifetime usage per provider/model: the report the REPL prints with
-/// `/stats` — one colored bar per model for speed, time in use, and
+/// `/stats` — one colored bar per model for combined ranking, speed, time in use, and
 /// efficiency — drawn from its styled runs, so both surfaces lay the table
 /// out identically and a model keeps its color across the three rankings.
 struct StatsScreen: View {

@@ -6715,8 +6715,8 @@ struct MaiCLI {
   }
 
   /// `/stats`: the usage ledger the runtime fills after every model call,
-  /// printed as one colored bar per provider:model for speed, time in use,
-  /// and efficiency. `/stats METRIC` shows one ranking; `/stats show TARGET`
+  /// printed as one colored bar per provider:model for the combined ranking,
+  /// speed, time in use, and efficiency. `/stats METRIC` shows one ranking; `/stats show TARGET`
   /// every fact recorded about a model or a provider.
   private static func handleStatsCommand(
     _ argument: String,
@@ -6761,10 +6761,10 @@ struct MaiCLI {
     }
     switch action {
     case "", "list":
-      await printReport(ModelUsageReport.Metric.allCases)
+      await printReport(ModelUsageReport.Metric.displayCases)
     case "show":
       guard !target.isEmpty else {
-        await printReport(ModelUsageReport.Metric.allCases)
+        await printReport(ModelUsageReport.Metric.displayCases)
         return
       }
       let rows = await store.ledger.totals(matching: target)
@@ -6807,8 +6807,8 @@ struct MaiCLI {
 
   private static let statsHelp = """
     Statistics commands:
-      /stats                 Rank every provider:model used by tokens/s, time in use, and efficiency
-      /stats METRIC          One ranking: speed, time, or efficiency
+      /stats                 Rank every provider:model by combined ranking, tokens/s, time in use, and efficiency
+      /stats METRIC          One ranking: ranking, speed, time, or efficiency
       /stats show PROVIDER[:MODEL]  Every fact recorded about one model or a whole provider
       /stats rm PROVIDER[:MODEL]  Drop the statistics of one model or a whole provider
       /stats reset           Forget every statistic
@@ -8140,7 +8140,7 @@ struct MaiCLI {
       "/agents", "/agents tree", "/agents clear", "/agents log ", "/agents kill ", "/agents focus ",
       "/agents focus main", "/queue", "/queue push ", "/queue pop", "/queue drop",
       "/help queue", "/help export", "/export markdown ", "/export json ", "/export debug ",
-      "/stats", "/stats speed", "/stats time", "/stats efficiency", "/stats show ",
+      "/stats", "/stats ranking", "/stats speed", "/stats time", "/stats efficiency", "/stats show ",
       "/stats reset", "/stats rm ", "/stats path", "/help stats",
       "/export epub ", "/export docx ", "/set ui.subagents all", "/set ui.subagents tools",
       "/set ui.subagents stats", "/set ui.subagents none",
@@ -8454,7 +8454,7 @@ struct MaiCLI {
     /attach clear       Drop the attachments queued for the next message
     /copy [N] [PATH]    Copy the last reply, or N messages, to the clipboard or a file
     /export FORMAT [PATH]  Save this chat as markdown, json, debug, epub, or docx
-    /stats              Tokens/s, time in use, and efficiency per provider:model, as bars
+    /stats              Combined ranking, tokens/s, time in use, and efficiency per provider:model, as bars
     \(visualHelp)/clear              Clear conversation history
     /exit               Exit the REPL
 
