@@ -79,8 +79,27 @@ public struct MaiRunTool: AgentTool {
   }
 
   #if os(macOS) || os(Linux)
+    enum OutputMode: String {
+      /// Return output up to the configured limit; spill any excess to a file.
+      case automatic = "auto"
+      /// Return output up to the configured limit and discard any excess.
+      case inline
+      /// Write all output to temporary files, returning only their paths.
+      case file
+      /// Discard stdout and stderr. Exit status is still returned.
+      case none
+    }
+
     private func execute(_ arguments: [String: JSONValue]) async throws -> ToolOutput {
-      let environment = ProcessInfo.processInfo.environment
+      var environment = ProcessInfo.processInfo.environment
+      // Pipes are not terminals, but many CLIs honour one of these even when
+      // output is redirected.  Keep output plain before applying the final
+      // ANSI scrubber below.
+      environment["NO_COLOR"] = "1"
+      environment["CLICOLOR"] = "0"
+      environment["CLICOLOR_FORCE"] = "0"
+      environment["FORCE_COLOR"] = "0"
+      environment["TERM"] = "dumb"
       let launcher = try MaiHostProcess.resolve(configuration.shell, environment: environment)
       let workingDirectory = try Self.workingDirectory(arguments["cwd"]?.stringValue)
       let timeout = min(
@@ -89,6 +108,7 @@ public struct MaiRunTool: AgentTool {
         MaiRunConfiguration.maximumTimeout)
       let stdin = arguments["stdin"]?.stringValue
       let script = try Self.requiredText(arguments, key: "script", alias: "command")
+      let outputMode = try Self.outputMode(arguments["output"]?.stringValue)
       let scriptURL = try Self.writeScript(script, extension: "sh")
       defer { try? FileManager.default.removeItem(at: scriptURL) }
       var extraArguments = [scriptURL.path]
@@ -103,8 +123,17 @@ public struct MaiRunTool: AgentTool {
         environment: environment,
         stdin: stdin,
         timeout: timeout,
-        outputLimit: configuration.outputLimit)
+        outputLimit: configuration.outputLimit,
+        outputMode: outputMode)
       return Self.output(for: outcome, timeout: timeout, workingDirectory: workingDirectory)
+    }
+
+    private static func outputMode(_ raw: String?) throws -> OutputMode {
+      guard let raw, !raw.isEmpty else { return .automatic }
+      guard let mode = OutputMode(rawValue: raw.lowercased()) else {
+        throw MaiRunToolError.invalidOutputMode(raw)
+      }
+      return mode
     }
 
     private static func output(
@@ -112,9 +141,9 @@ public struct MaiRunTool: AgentTool {
       timeout: TimeInterval,
       workingDirectory: URL
     ) -> ToolOutput {
-      let stdout = String(decoding: outcome.stdout, as: UTF8.self)
+      let stdout = stripANSI(String(decoding: outcome.stdout, as: UTF8.self))
         .trimmingCharacters(in: .newlines)
-      let stderr = String(decoding: outcome.stderr, as: UTF8.self)
+      let stderr = stripANSI(String(decoding: outcome.stderr, as: UTF8.self))
         .trimmingCharacters(in: .newlines)
       var sections: [String] = []
       if !stdout.isEmpty { sections.append(stdout) }
@@ -125,6 +154,8 @@ public struct MaiRunTool: AgentTool {
       if outcome.stderrDropped > 0 {
         sections.append("[stderr truncated: \(outcome.stderrDropped) more bytes not shown]")
       }
+      if let path = outcome.stdoutFile { sections.append("[full stdout saved to \(path)]") }
+      if let path = outcome.stderrFile { sections.append("[full stderr saved to \(path)]") }
       if outcome.timedOut {
         sections.append("[timed out after \(Int(timeout)) seconds; the process was killed]")
       } else if outcome.exitCode != 0 {
@@ -139,8 +170,54 @@ public struct MaiRunTool: AgentTool {
           "durationMs": .integer(Int(outcome.duration * 1000)),
           "truncated": .bool(outcome.stdoutDropped > 0 || outcome.stderrDropped > 0),
           "cwd": .string(workingDirectory.path),
+          "stdoutFile": outcome.stdoutFile.map(JSONValue.string) ?? .null,
+          "stderrFile": outcome.stderrFile.map(JSONValue.string) ?? .null,
         ]),
         isError: outcome.timedOut || outcome.exitCode != 0)
+    }
+
+    /// Removes CSI, OSC, and the common two-byte terminal escape sequences.
+    /// This deliberately works on scalars rather than a regex so an OSC title
+    /// terminated by either BEL or ST is handled without leaking fragments.
+    private static func stripANSI(_ text: String) -> String {
+      let scalars = Array(text.unicodeScalars)
+      var result = String.UnicodeScalarView()
+      var index = 0
+      while index < scalars.count {
+        let scalar = scalars[index].value
+        guard scalar == 0x1B || scalar == 0x9B || scalar == 0x9D else {
+          result.append(scalars[index])
+          index += 1
+          continue
+        }
+        let isEscape = scalar == 0x1B
+        let next = isEscape && index + 1 < scalars.count ? scalars[index + 1].value : scalar
+        if next == 0x5B || scalar == 0x9B { // CSI
+          index += isEscape ? 2 : 1
+          while index < scalars.count {
+            let value = scalars[index].value
+            index += 1
+            if (0x40...0x7E).contains(value) { break }
+          }
+        } else if next == 0x5D || scalar == 0x9D { // OSC
+          index += isEscape ? 2 : 1
+          while index < scalars.count {
+            if scalars[index].value == 0x07 {
+              index += 1
+              break
+            }
+            if scalars[index].value == 0x1B, index + 1 < scalars.count, scalars[index + 1].value == 0x5C {
+              index += 2
+              break
+            }
+            index += 1
+          }
+        } else {
+          // ESC followed by a final byte, including charset selection.
+          index += min(isEscape ? 2 : 1, scalars.count - index)
+        }
+      }
+      return String(result)
     }
 
     private static func workingDirectory(_ rawPath: String?) throws -> URL {
@@ -211,10 +288,16 @@ public struct MaiRunTool: AgentTool {
       "description": .string(
         "Seconds before the process is killed, 1-\(Int(MaiRunConfiguration.maximumTimeout)). Default: \(Int(configuration.defaultTimeout))."),
     ])
+    properties["output"] = .object([
+      "type": .string("string"),
+      "enum": .array([.string("auto"), .string("inline"), .string("file"), .string("none")]),
+      "description": .string(
+        "Output handling. auto (default) returns small output and saves an over-limit stream to a temporary file; inline drops excess; file saves both streams to temporary files; none discards both streams. ANSI escape sequences are removed from returned text."),
+    ])
     return ToolDefinition(
       name: name,
       description:
-        "Run a shell command line or script with '\(configuration.shell)' from the current directory and return its stdout, stderr, and exit code.",
+        "Run a shell command line or script with '\(configuration.shell)' from the current directory and return its stdout, stderr, and exit code. Commands run with colors disabled; returned text has ANSI escape sequences removed.",
       inputSchema: objectSchema(properties: properties, required: []),
       annotations: ToolAnnotations(
         readOnly: false,
@@ -234,6 +317,7 @@ enum MaiRunToolError: LocalizedError {
   case notDirectory(String)
   case scriptWriteFailed(String)
   case interpreterNotFound(String)
+  case invalidOutputMode(String)
 
   var errorDescription: String? {
     switch self {
@@ -242,6 +326,7 @@ enum MaiRunToolError: LocalizedError {
     case .scriptWriteFailed(let path): "Could not write the temporary script '\(path)'."
     case .interpreterNotFound(let name):
       "Interpreter '\(name)' was not found in PATH; configure the Run group with its full path."
+    case .invalidOutputMode(let mode): "Unknown output mode '\(mode)'; use auto, inline, file, or none."
     }
   }
 }
@@ -255,6 +340,8 @@ enum MaiRunToolError: LocalizedError {
     var exitCode: Int32
     var timedOut: Bool
     var duration: TimeInterval
+    var stdoutFile: String?
+    var stderrFile: String?
   }
 
   /// Runs one child process with bounded output, a kill-on-timeout watchdog,
@@ -295,7 +382,8 @@ enum MaiRunToolError: LocalizedError {
       environment: [String: String],
       stdin: String?,
       timeout: TimeInterval,
-      outputLimit: Int
+      outputLimit: Int,
+      outputMode: MaiRunTool.OutputMode
     ) async throws -> MaiHostProcessOutcome {
       let session = ProcessSession(
         executable: executable,
@@ -303,7 +391,8 @@ enum MaiRunToolError: LocalizedError {
         workingDirectory: workingDirectory,
         environment: environment,
         hasInput: stdin != nil,
-        outputLimit: outputLimit)
+        outputLimit: outputLimit,
+        outputMode: outputMode)
       try session.start()
       if let stdin { session.send(stdin) }
       let watchdog = Task {
@@ -328,11 +417,14 @@ enum MaiRunToolError: LocalizedError {
       private let stderrPipe = Pipe()
       private let stdinPipe: Pipe?
       private let outputLimit: Int
+      private let outputMode: MaiRunTool.OutputMode
       private let started = Date()
       private var stdout = Data()
       private var stderr = Data()
       private var stdoutDropped = 0
       private var stderrDropped = 0
+      private var stdoutFile: URL?
+      private var stderrFile: URL?
       private var stdoutClosed = false
       private var stderrClosed = false
       private var exited = false
@@ -348,9 +440,11 @@ enum MaiRunToolError: LocalizedError {
         workingDirectory: URL,
         environment: [String: String],
         hasInput: Bool,
-        outputLimit: Int
+        outputLimit: Int,
+        outputMode: MaiRunTool.OutputMode
       ) {
         self.outputLimit = outputLimit
+        self.outputMode = outputMode
         stdinPipe = hasInput ? Pipe() : nil
         process.executableURL = executable
         process.arguments = arguments
@@ -370,7 +464,9 @@ enum MaiRunToolError: LocalizedError {
             stderrDropped: stderrDropped,
             exitCode: exited ? process.terminationStatus : -1,
             timedOut: timedOut,
-            duration: Date().timeIntervalSince(started))
+            duration: Date().timeIntervalSince(started),
+            stdoutFile: stdoutFile?.path,
+            stderrFile: stderrFile?.path)
         }
       }
 
@@ -442,23 +538,55 @@ enum MaiRunToolError: LocalizedError {
             }
             return
           }
-          if isStderr {
-            append(data, to: &stderr, dropped: &stderrDropped)
-          } else {
-            append(data, to: &stdout, dropped: &stdoutDropped)
-          }
+          if isStderr { append(data, to: &stderr, dropped: &stderrDropped, file: &stderrFile, stream: "stderr") }
+          else { append(data, to: &stdout, dropped: &stdoutDropped, file: &stdoutFile, stream: "stdout") }
         }
         finishIfComplete()
       }
 
-      private func append(_ data: Data, to buffer: inout Data, dropped: inout Int) {
+      private func append(
+        _ data: Data,
+        to buffer: inout Data,
+        dropped: inout Int,
+        file: inout URL?,
+        stream: String
+      ) {
+        if outputMode == .none { return }
+        if outputMode == .file, file == nil {
+          file = temporaryOutputFile(stream: stream)
+        }
+        if let file {
+          append(data, to: file)
+          return
+        }
         let room = outputLimit - buffer.count
         if room >= data.count {
           buffer.append(data)
         } else {
           if room > 0 { buffer.append(data.prefix(room)) }
-          dropped += data.count - max(room, 0)
+          if outputMode == .automatic, let spill = temporaryOutputFile(stream: stream) {
+            file = spill
+            append(buffer, to: spill)
+            append(data.dropFirst(max(room, 0)), to: spill)
+            buffer.removeAll(keepingCapacity: false)
+          } else {
+            dropped += data.count - max(room, 0)
+          }
         }
+      }
+
+      private func temporaryOutputFile(stream: String) -> URL? {
+        let url = FileManager.default.temporaryDirectory
+          .appendingPathComponent("pmai-run-\(UUID().uuidString)-\(stream).log")
+        return FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
+          ? url : nil
+      }
+
+      private func append(_ data: Data, to file: URL) {
+        guard let handle = try? FileHandle(forWritingTo: file) else { return }
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
       }
 
       private func markExited() {

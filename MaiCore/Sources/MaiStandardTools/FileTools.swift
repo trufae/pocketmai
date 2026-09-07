@@ -1385,7 +1385,8 @@ private struct MaiFileWorkspace: Sendable {
           environment: environment,
           stdin: nil,
           timeout: 5,
-          outputLimit: 8_000_000)
+          outputLimit: 8_000_000,
+          outputMode: .inline)
       } catch is CancellationError {
         throw CancellationError()
       } catch {

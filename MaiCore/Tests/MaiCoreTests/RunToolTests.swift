@@ -103,11 +103,41 @@ func runToolsEnforceTimeout() async throws {
 @Test("Run tools cap captured output")
 func runToolsTruncateOutput() async throws {
   let tool = MaiRunTool(configuration: MaiRunConfiguration(outputLimit: 1_024))
-  let output = try await call(tool, ["command": .string("head -c 5000 /dev/zero | tr '\\0' x")])
+  let output = try await call(tool, [
+    "command": .string("head -c 5000 /dev/zero | tr '\\0' x"),
+    "output": .string("inline"),
+  ])
   #expect(!output.isError)
   #expect(output.text.hasPrefix(String(repeating: "x", count: 1_024)))
   #expect(output.text.contains("[stdout truncated: 3976 more bytes not shown]"))
   #expect(output.structuredContent?.objectValue?["truncated"] == .bool(true))
+}
+
+@Test("Run tools spill large output, suppress output, and strip ANSI escapes")
+func runToolsManageOutput() async throws {
+  let tool = MaiRunTool(configuration: MaiRunConfiguration(outputLimit: 1_024))
+  let spilled = try await call(tool, ["command": .string("head -c 5000 /dev/zero | tr '\\0' x")])
+  let path = try #require(spilled.structuredContent?.objectValue?["stdoutFile"]?.stringValue)
+  defer { try? FileManager.default.removeItem(atPath: path) }
+  #expect(spilled.text.contains("[full stdout saved to \(path)]"))
+  #expect(!spilled.text.contains(String(repeating: "x", count: 100)))
+  #expect((try Data(contentsOf: URL(fileURLWithPath: path))).count == 5_000)
+
+  let ansi = try await call(tool, ["command": .string("printf '\\033[31mred\\033[0m'")])
+  #expect(ansi.text == "red")
+
+  let saved = try await call(tool, [
+    "command": .string("printf retained"), "output": .string("file"),
+  ])
+  let savedPath = try #require(saved.structuredContent?.objectValue?["stdoutFile"]?.stringValue)
+  defer { try? FileManager.default.removeItem(atPath: savedPath) }
+  #expect(saved.text.contains("[full stdout saved to \(savedPath)]"))
+  #expect(String(decoding: try Data(contentsOf: URL(fileURLWithPath: savedPath)), as: UTF8.self) == "retained")
+
+  let silent = try await call(tool, [
+    "command": .string("printf hidden; printf hidden >&2"), "output": .string("none"),
+  ])
+  #expect(silent.text == "(no output; exit code 0)")
 }
 
 @Test("Run tools terminate the child when the task is cancelled")
