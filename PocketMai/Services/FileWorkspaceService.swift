@@ -331,7 +331,7 @@ enum FileWorkspaceService {
       var lines = ["Index of \(display)\(suffix): \(entries.count) \(noun)"]
       if document.conversionNote != nil {
         lines.append(
-          "Line numbers refer to the converted text returned by files_read_document and files_read_range.")
+          "Line numbers refer to the converted text returned by files_read and files_read_range.")
       }
       for entry in entries.prefix(maxIndexEntries) {
         lines.append("\(entry.line): \(entry.title)")
@@ -344,7 +344,7 @@ enum FileWorkspaceService {
   }
 
   /// Returns a numbered range of lines. Word, PDF, and JSON files are read
-  /// through the same conversion as files_read_document, so line numbers match
+  /// through the same conversion as files_read, so line numbers match
   /// the files_read_index output.
   static func readRange(
     arguments: [String: AgentToolArgumentValue],

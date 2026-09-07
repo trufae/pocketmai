@@ -64,8 +64,7 @@ enum BuiltInToolCatalog {
       return await PocketMaiPluginHost.shared.call(
         tool: tool, arguments: call.argumentValues)
     case FileWorkspaceTool.listName, FileWorkspaceTool.findName, FileWorkspaceTool.grepName,
-      FileWorkspaceTool.readName,
-      FileWorkspaceTool.readDocumentName, FileWorkspaceTool.readIndexName,
+      FileWorkspaceTool.readName, FileWorkspaceTool.readIndexName,
       FileWorkspaceTool.readRangeName, FileWorkspaceTool.replaceRangeName,
       FileWorkspaceTool.patchName,
       FileWorkspaceTool.writeName, FileWorkspaceTool.renameName, FileWorkspaceTool.deleteName:
@@ -529,7 +528,6 @@ enum FileWorkspaceTool {
   static let findName = MaiFileWorkspaceTool.Operation.find.rawValue
   static let grepName = MaiFileWorkspaceTool.Operation.grep.rawValue
   static let readName = MaiFileWorkspaceTool.Operation.read.rawValue
-  static let readDocumentName = MaiFileWorkspaceTool.Operation.readDocument.rawValue
   static let readIndexName = MaiFileWorkspaceTool.Operation.readIndex.rawValue
   static let readRangeName = MaiFileWorkspaceTool.Operation.readRange.rawValue
   static let replaceRangeName = MaiFileWorkspaceTool.Operation.replaceRange.rawValue

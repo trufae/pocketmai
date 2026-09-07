@@ -37,7 +37,6 @@ public struct MaiFileWorkspaceTool: AgentTool {
     case find = "files_find"
     case grep = "files_grep"
     case read = "files_read"
-    case readDocument = "files_read_document"
     case readIndex = "files_read_index"
     case getFunction = "files_get_function"
     case setFunction = "files_set_function"
@@ -51,8 +50,7 @@ public struct MaiFileWorkspaceTool: AgentTool {
 
     var changesFiles: Bool {
       switch self {
-      case .list, .find, .grep, .read, .readDocument, .readIndex, .getFunction, .readRange,
-        .chdir:
+      case .list, .find, .grep, .read, .readIndex, .getFunction, .readRange, .chdir:
         false
       case .setFunction, .replaceRange, .patch, .write, .rename, .delete: true
       }
@@ -108,8 +106,6 @@ public struct MaiFileWorkspaceTool: AgentTool {
         return try await workspace.grep(arguments)
       case .read:
         return try workspace.read(arguments)
-      case .readDocument:
-        return try workspace.readDocument(arguments)
       case .readIndex:
         return try workspace.readIndex(arguments)
       case .getFunction:
@@ -264,7 +260,8 @@ public struct MaiFileWorkspaceTool: AgentTool {
     case .read:
       return ToolDefinition(
         name: operation.rawValue,
-        description: "Read a UTF-8 text file in the configured workspace '\(workspaceName)'.",
+        description:
+          "Read a text file in the configured workspace '\(workspaceName)'. PDF and DOCX files are converted to Markdown.",
         parameters: [
           path,
           ToolParameterDef(
@@ -276,26 +273,6 @@ public struct MaiFileWorkspaceTool: AgentTool {
             name: "offset",
             type: "integer",
             description: "Byte offset for continuing a large file. Default: 0.",
-            required: false),
-        ],
-        annotations: ToolAnnotations(
-          readOnly: true, idempotent: true, openWorld: false, approval: .confirm))
-    case .readDocument:
-      return ToolDefinition(
-        name: operation.rawValue,
-        description:
-          "Read a document in '\(workspaceName)': DOCX and PDF become Markdown, JSON becomes an outline, and text remains UTF-8.",
-        parameters: [
-          path,
-          ToolParameterDef(
-            name: "max_bytes",
-            type: "integer",
-            description: "Maximum converted-text bytes to return, up to 500000. Default: 120000.",
-            required: false),
-          ToolParameterDef(
-            name: "offset",
-            type: "integer",
-            description: "Byte offset for continuing through converted text. Default: 0.",
             required: false),
         ],
         annotations: ToolAnnotations(
@@ -876,6 +853,10 @@ private struct MaiFileWorkspace: Sendable {
     return ToolOutput(content: [.text(text)], structuredContent: .object(structured))
   }
 
+  /// Formats whose bytes are useless to a model and whose text the document
+  /// importer can produce; everything else is read as UTF-8.
+  private static let convertedExtensions: Set<String> = ["pdf", "docx"]
+
   func read(_ arguments: [String: JSONValue]) throws -> ToolOutput {
     let rawPath = try requiredPath(arguments, key: "path")
     let file = try resolve(rawPath, allowRoot: false, mustExist: true)
@@ -884,6 +865,9 @@ private struct MaiFileWorkspace: Sendable {
       !isDirectory.boolValue
     else {
       throw MaiFileWorkspaceError.notFile(displayPath(rawPath))
+    }
+    if Self.convertedExtensions.contains(file.pathExtension.lowercased()) {
+      return try readDocument(rawPath: rawPath, file: file, arguments: arguments)
     }
     let data = try Data(contentsOf: file, options: [.mappedIfSafe])
     guard !looksBinary(data) else { throw MaiFileWorkspaceError.binary(displayPath(rawPath)) }
@@ -905,9 +889,9 @@ private struct MaiFileWorkspace: Sendable {
       ]))
   }
 
-  func readDocument(_ arguments: [String: JSONValue]) throws -> ToolOutput {
-    let rawPath = try requiredPath(arguments, key: "path")
-    let file = try resolve(rawPath, allowRoot: false, mustExist: true)
+  private func readDocument(rawPath: String, file: URL, arguments: [String: JSONValue]) throws
+    -> ToolOutput
+  {
     let attachment = try DocumentAttachmentImporter.attachment(at: file)
     guard case .file(let content) = attachment.content, let text = content.text else {
       throw MaiFileWorkspaceError.invalidUTF8(displayPath(rawPath))

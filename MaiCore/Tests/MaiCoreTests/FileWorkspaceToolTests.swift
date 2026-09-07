@@ -36,18 +36,24 @@ func fileWorkspaceToolsManageFiles() async throws {
   #expect(read.text == "one\ntwo")
   #expect(read.structuredContent?.objectValue?["truncated"] == .bool(false))
 
+  // JSON stays raw: a model editing a config file wants the bytes it will patch.
   _ = try await call(
     tool(tools, .write),
     ["path": .string("record.json"), "content": .string("{\"name\":\"Mai\"}")])
+  let json = try await call(tool(tools, .read), ["path": .string("record.json")])
+  #expect(json.text == "{\"name\":\"Mai\"}")
+
+  // Word and PDF files are converted by the same read tool.
+  let fixtures = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Fixtures")
+  try FileManager.default.copyItem(
+    at: fixtures.appendingPathComponent("sample.docx"),
+    to: root.appendingPathComponent("sample.docx"))
   let document = try await call(
-    tool(tools, .readDocument),
-    ["path": .string("record.json"), "max_bytes": .integer(4)])
-  #expect(document.text == "name")
-  #expect(document.structuredContent?.objectValue?["nextOffset"] == .integer(4))
+    tool(tools, .read), ["path": .string("sample.docx"), "max_bytes": .integer(40)])
+  #expect(document.text.contains("Fixture Report"))
   #expect(document.structuredContent?.objectValue?["truncated"] == .bool(true))
-  #expect(
-    document.structuredContent?.objectValue?["conversion"]
-      == .string("converted from JSON to an indented outline"))
+  #expect(document.structuredContent?.objectValue?["conversion"] != nil)
 
   let listing = try await call(tool(tools, .list), ["path": .string("notes")])
   let entries = listing.structuredContent?.objectValue?["entries"]?.arrayValue
