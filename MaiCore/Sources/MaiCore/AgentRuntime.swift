@@ -478,10 +478,11 @@ public actor AgentRuntime {
         options: request.options,
         stream: usesTextToolProtocol ? false : request.stream)
       let call: ProviderCall
+      let repairsEmptyReply = localToolCalls > 0 && localModelTurns < request.limits.maxModelTurns
       do {
         call = try await complete(
           providerRequest, with: provider, retry: request.retry, budget: budget,
-          context: context, pid: pid, emit: emit
+          context: context, pid: pid, retriesEmptyReply: !repairsEmptyReply, emit: emit
         ) { event in
           if usesTextToolProtocol, case .textDelta = event {
             return
@@ -492,6 +493,15 @@ public actor AgentRuntime {
         // Time ran out inside the call. The reply is lost, but the transcript
         // is whole, so the pause is as clean as one at the top of the loop.
         return await pause(budget.timeInterruption)
+      } catch is ProviderEmptyResponseError where repairsEmptyReply {
+        // A model that answers a tool result with nothing at all is told what
+        // is expected of it, as after a malformed call; retrying the same
+        // request twice and then failing the whole run threw the work away.
+        let feedback = AgentToolLoopPolicy.repairFeedbackAfterToolResult(
+          mode: textToolMode ?? .native)
+        transcript.append(.assistant(feedback))
+        await supervisor.note(pid, transcript: transcript)
+        continue
       }
       var providerResponse = call.response
       try Task.checkCancellation()
@@ -677,6 +687,7 @@ public actor AgentRuntime {
     budget: RunBudget,
     context: AgentEventContext,
     pid: AgentPID,
+    retriesEmptyReply: Bool = true,
     emit: @escaping AgentEventHandler,
     onEvent: @escaping ProviderEventHandler
   ) async throws -> ProviderCall {
@@ -695,6 +706,8 @@ public actor AgentRuntime {
         throw CancellationError()
       } catch is RunDeadlineExceeded {
         throw RunDeadlineExceeded()
+      } catch is ProviderEmptyResponseError where !retriesEmptyReply {
+        throw ProviderEmptyReply()
       } catch {
         guard attempt < retry.attempts else { throw error }
         attempt += 1
@@ -1762,6 +1775,10 @@ extension AgentRuntime {
     }
   }
 }
+
+/// Rethrown by the run loop's completion wrapper for an empty model reply it
+/// was told not to retry.
+struct ProviderEmptyReply: ProviderEmptyResponseError {}
 
 public enum AgentRuntimeError: LocalizedError, Equatable, Sendable {
   case invalidProviderID

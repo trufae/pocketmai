@@ -289,7 +289,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         || !message.toolCalls.isEmpty
     else {
-      throw OpenAICompatibleProviderError.emptyResponse
+      throw OpenAICompatibleEmptyReply()
     }
 
     if !message.reasoning.isEmpty { await emit(.reasoningDelta(message.reasoning)) }
@@ -429,7 +429,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     }
     guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !completedCalls.isEmpty
     else {
-      throw OpenAICompatibleProviderError.emptyResponse
+      throw OpenAICompatibleEmptyReply()
     }
     var parts: [ContentPart] = []
     if !reasoning.isEmpty { parts.append(.reasoning(reasoning)) }
@@ -736,6 +736,8 @@ public enum OpenAICompatibleProviderError: LocalizedError, Equatable, Sendable {
   case invalidBaseURL(String)
   case missingModel
   case emptyResponse
+  /// The call succeeded but the model produced neither text nor a tool call.
+  case emptyModelReply
   case invalidResponse(String)
   case providerFailure(String)
   case invalidToolArguments(tool: String, arguments: String)
@@ -748,7 +750,7 @@ public enum OpenAICompatibleProviderError: LocalizedError, Equatable, Sendable {
       "Invalid OpenAI-compatible base URL: \(value)"
     case .missingModel:
       "An OpenAI-compatible model must be selected. Use /model NAME or --model NAME."
-    case .emptyResponse:
+    case .emptyResponse, .emptyModelReply:
       "The provider returned an empty response."
     case .invalidResponse(let message), .providerFailure(let message),
       .unsupportedContent(let message):
@@ -793,3 +795,7 @@ extension ProviderStopReason {
     }
   }
 }
+
+/// Only a reply with nothing in it is a repairable turn; an empty HTTP body is
+/// still a transport failure.
+public struct OpenAICompatibleEmptyReply: ProviderEmptyResponseError {}

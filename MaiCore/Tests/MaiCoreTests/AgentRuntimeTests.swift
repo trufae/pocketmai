@@ -991,6 +991,43 @@ func textToolAcceptsNativeCalls() async throws {
   #expect(!result.transcript.contains { $0.text.contains("missing_tool_call") })
 }
 
+@Test("An empty reply after a tool result becomes repair feedback instead of retries and failure")
+func emptyReplyAfterToolResultIsRepaired() async throws {
+  let provider = ScriptedProvider(
+    responses: [
+      ProviderResponse(
+        message: AgentMessage(
+          role: .assistant,
+          content: [.toolCall(ToolCall(id: "c1", name: "probe", arguments: .object([:])))]),
+        stopReason: .toolCall),
+      ProviderResponse(message: .assistant("Probed."), stopReason: .stop),
+    ],
+    failures: [1: EmptyReplyFailure()])
+  let runtime = AgentRuntime()
+  try await runtime.register(provider)
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "probe", description: "Probe")) { _, _ in
+      ToolOutput(text: "42")
+    })
+
+  let result = try await runtime.run(
+    AgentRequest(
+      provider: "scripted",
+      model: "fixture",
+      messages: [.user("probe")],
+      toolNames: ["probe"],
+      retry: AgentRetryPolicy(attempts: 2, delaySeconds: 0)))
+
+  #expect(result.response.text == "Probed.")
+  #expect(result.toolCalls == 1)
+  // Turn one called the tool, turn two said nothing and was fed back, turn three answered.
+  #expect(result.modelTurns == 3)
+  #expect(result.transcript.contains { $0.text.contains("missing_tool_call") })
+  #expect(await provider.requests.count == 3)
+}
+
+private struct EmptyReplyFailure: ProviderEmptyResponseError {}
+
 @Test("A call without reported usage is estimated, marked as such, and still counts against the budget")
 func estimatedUsage() async throws {
   let provider = ScriptedProvider(responses: [
@@ -1961,17 +1998,21 @@ private actor ProviderEventRecorder {
 private actor ScriptedProvider: ChatProvider {
   nonisolated let descriptor: ProviderDescriptor
   private var responses: [ProviderResponse]
+  /// Errors thrown instead of a response, by zero-based request index.
+  private var failures: [Int: any Error]
   private(set) var requests: [ProviderRequest] = []
 
   init(
     responses: [ProviderResponse],
-    capabilities: ProviderCapabilities = [.streaming, .nativeToolCalling, .imageInput]
+    capabilities: ProviderCapabilities = [.streaming, .nativeToolCalling, .imageInput],
+    failures: [Int: any Error] = [:]
   ) {
     descriptor = ProviderDescriptor(
       id: "scripted",
       displayName: "Scripted",
       capabilities: capabilities)
     self.responses = responses
+    self.failures = failures
   }
 
   func complete(
@@ -1979,6 +2020,7 @@ private actor ScriptedProvider: ChatProvider {
     emit: @escaping ProviderEventHandler
   ) async throws -> ProviderResponse {
     requests.append(request)
+    if let failure = failures.removeValue(forKey: requests.count - 1) { throw failure }
     guard !responses.isEmpty else { throw TestError.missingResponse }
     let response = responses.removeFirst()
     if !response.message.reasoning.isEmpty {
