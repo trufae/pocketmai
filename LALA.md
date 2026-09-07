@@ -29,6 +29,19 @@ once and 7 the next time because the model chose to bookkeep with `todo_*`).
 | tool proxy, before | 4/13 (5 refusals) | 49 | 107k | 91s |
 | tool proxy, after | 8/13 | 128 | 167k | 168s |
 | toolDelegation subagent | 13/13 | 86 | 454k | 81s |
+| **after the catalog cut (section 3)** | | | | |
+| native tools | 12/13 | 89 | 242k | 81s |
+| text protocol | 11/13 | 101 | 234k | 97s |
+| toolDelegation subagent | 12/13 | 94 | 311k | 84s |
+
+The catalog cut took the fixed cost per call from 23 tools / 16.1k characters
+(3,756 prompt tokens on the first call) to 17 tools / 8.9k characters (2,153),
+and the text-protocol prompt from 12.8k to 7.2k characters. The remaining
+failures after the cut are the `13-big-log` shell mistake the model makes every
+time, the `10-readme` respond dump in the text protocol (section 4), and, in
+the first sweep only, `07-find-usage`: the benchmark's work directory is
+git-ignored and `files_grep` searched nothing, which `fb248bf` fixes; the case
+passes again in 2 calls.
 
 Three facts decide everything below:
 
@@ -99,49 +112,48 @@ Three facts decide everything below:
 
 ## 3. Tool catalog: the 3.7k tokens paid on every call
 
-- [ ] **Remove duplicate tools (negative LOC).** `read_text_file` duplicates
-  `files_read` (no workspace check, no offset); `run_system` (`command`) duplicates
-  `run_sh` (`script`): the model used both interchangeably (`run_system×8` in one
-  json run). Dropping the two saves ~1.1k characters per call and two decisions
-  for the model. `MaiStandardTools/StandardTools.swift`, `RunTools.swift`.
-- [ ] **Fold interpreters into one run tool.** `run_python` and `run_js` each
-  cost ~900 characters of schema and were used once in 300+ calls; a
-  `language`/`interpreter` argument on `run_sh` (or just `python3 - <<EOF` in
-  the shell, which the model already does) covers them. Negative LOC.
-- [ ] **Merge `files_read_document` into `files_read`** by extension
-  (`.pdf`, `.docx` → converted text, `.json` → outline on request). One tool,
-  one description. Negative LOC.
-- [ ] **Question `files_chdir`.** Every path argument already accepts a
-  relative or absolute path; a working-directory state the model must track is
-  a source of errors, and no task used it. Remove, or keep out of the coding
-  default group.
-- [ ] **Stop repeating the path convention 15 times.** "File path relative to
-  the current directory, or an absolute path inside the workspace" appears in
-  every files tool (~1.3k characters per call); the workspace name `'work'`
-  appears in every description. Say it once in the system prompt (or once in
-  the group), describe parameters as `path` only.
-- [ ] **Trim rarely used parameters** from `files_grep` / `files_find`
-  (`include_ignored`, `depth`, `case_sensitive`, `limit`): together ~1.5k
-  characters. Keep them in the implementation with sensible defaults; expose
-  the two or three that change results (`glob`, `regex`).
-- [ ] **Budget.** Target for the coding set: ≤ 8k characters of schema
-  (~2k tokens), i.e. halve the fixed cost. Every 1k characters removed saves
-  ~250 tokens × calls per task × tasks: ~19k tokens per 13-task sweep at the
-  current call counts.
-- [ ] **`todo` group out of the coding default (negative LOC or config).**
-  The baseline run spent 8 turns and 54k tokens (13% of the run) on `todo_add`
-  + 7× `todo_done` for one rename task; the xml run 12 turns / 60k. Each
-  `todo_done` returns the whole list (~490 characters) that then stays in
-  context. If the group stays: `todo_done` should accept several items, return
-  one line, and the descriptions should say "only for work of five steps or more".
-- [ ] **`toolDelegation: subagent` costs +13% and delegated nothing.** It adds
-  four `agent_*` schemas (+1.1k tokens per call) while keeping every concrete
-  tool visible, so gemma4 never called `agent_start` in 13 tasks.
-  `AgentDelegation.swift` says the mode "hides the concrete tools";
-  `AgentRuntime.visibleDefinitions` says delegation "never takes the tools
-  away". One of them is wrong. Either implement the hiding (the mode then
-  forces delegation and can be measured) or remove the mode and its plumbing
-  (negative LOC) and rely on explicit `subagentNames`.
+Done in this pass, one commit each; the schema set went from 23 tools and
+16,098 characters to 17 tools and 8,940 characters (−44%), the text-protocol
+prompt from 12,812 to 7,163 characters, and MaiStandardTools lost more lines
+than it gained.
+
+- [x] **Duplicate tools removed** (`818b499`, `613f4cf`). `read_text_file`
+  duplicated `files_read`; `run_system` duplicated `run_sh`. Gone, with their
+  schemas (~1.1k characters per call).
+- [x] **One run tool** (`613f4cf`). `run_python` and `run_js` (used once in 300
+  calls) are folded into `run_sh`; other languages go through the shell
+  (`python3 - <<'EOF' … EOF`). The `runPython`/`runNode` options went with them.
+- [x] **`files_read_document` merged into `files_read`** (`8b68ed5`): `.pdf`
+  and `.docx` are converted to Markdown, everything else, JSON included, stays
+  the raw text a model can patch. The iOS host lost only the removed name.
+- [x] **`files_chdir` removed** (`ffd1fa8`). Every path argument takes a
+  relative or absolute path; `/cd` stays for the person at the prompt.
+- [x] **Path convention said once** (`67413d5`). `files_list` states it; every
+  other path argument is "File path." and each tool has a one-sentence
+  description without the workspace name (~1.3k characters per call).
+- [x] **Rare search arguments dropped** (`67413d5`). `files_find` lost `depth`,
+  `include_ignored`, `limit`; `files_grep` lost those and `case_sensitive`,
+  with the implementation that served them. Defaults: smart case, 100 matches,
+  source paths only. Follow-up (`fb248bf`): a folder the repository ignores
+  now falls back to the filesystem walk instead of "No matching lines."
+- [x] **Budget met.** Target was ≤ 8k characters for the coding set; the
+  `files` + `run` groups are 7.9k, `todo` adds 1.0k. First-call prompt tokens
+  3,756 → 2,153; a 13-task sweep 334–386k → 242k prompt tokens with the same
+  model calls.
+- [x] **Todo tools slimmed** (`2b8d876`). `todo_done` takes several items per
+  call, `todo_add`/`todo_done` answer in one line instead of echoing the list,
+  and the descriptions say "work of five or more steps". The group stays in
+  the default set; measure whether to drop it from coding agents once the
+  system prompt (section 6) exists.
+- [x] **Delegation described truthfully, agent_* schemas halved** (`06edcea`).
+  `AgentDelegation.swift` claimed the subagent mode hides the concrete tools;
+  the runtime and `doc/agents.md` keep them and add `agent_*`, and that is
+  what the comment says now, with its cost. The four schemas went from ~3.2k
+  to ~2.4k characters. Still open: the mode delegated nothing in 26 tasks;
+  section 8 decides whether it earns its place.
+- [ ] **Not yet verified on iOS.** `PocketMai/Services/ToolAgent.swift` and
+  `FileWorkspaceService.swift` only lost references to the removed name, but
+  the app was not built in this pass.
 
 ## 4. Text protocols
 
