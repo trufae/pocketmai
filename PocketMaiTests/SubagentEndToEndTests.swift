@@ -206,6 +206,18 @@ final class SubagentEndToEndTests: XCTestCase {
     try await super.tearDown()
   }
 
+  /// What the stub recorded, one line per request — its roles and the start
+  /// of its newest user message — for a failure message.
+  private func requestShapes() -> String {
+    StubChatEndpoint.log.enumerated().map { index, entry in
+      let roles = (entry.request["messages"] as? [[String: Any]] ?? [])
+        .compactMap { $0["role"] as? String }
+        .joined(separator: ",")
+      let user = entry.lastUserText.replacingOccurrences(of: "\n", with: " ").prefix(50)
+      return "#\(index + 1) [\(roles)] user=\"\(user)\""
+    }.joined(separator: "; ")
+  }
+
   /// A chat on the stub endpoint whose agent may start children.
   private func makeDelegatingConversation() -> Conversation {
     let endpoint = OpenAIEndpoint(
@@ -327,9 +339,11 @@ final class SubagentEndToEndTests: XCTestCase {
       lastArrival, firstAnswer,
       "the second child was asked only after the first had answered")
 
+    // Both hang off the chat's one process. Pids go to whichever start
+    // reached the supervisor first, so their order is not the call order.
     await store.refreshAgentProcesses()
     let processes = store.agentChildren(of: conversation.id)
-    XCTAssertEqual(processes.map(\.task), ["A", "B"])
+    XCTAssertEqual(Set(processes.map(\.task)), ["A", "B"])
     XCTAssertEqual(processes.map(\.state), [.completed, .completed])
     XCTAssertTrue(processes.allSatisfy(\.isCollected))
   }
@@ -362,17 +376,47 @@ final class SubagentEndToEndTests: XCTestCase {
       store: store)
 
     // The start answered at once; the answer came later as a message, which
-    // the parent read without ever calling agent_result.
+    // the parent read without ever calling agent_result. Nothing here indexes
+    // into what was recorded: the child's and the parent's requests can come
+    // in either order, and a run that ended early recorded fewer of them.
+    let shapes = requestShapes()
     XCTAssertEqual(result.toolRuns.map(\.name), [AgentProcessTools.startToolName])
-    XCTAssertTrue(result.toolRuns[0].result.hasPrefix("Started Main.worker as #"), result.toolRuns[0].result)
-    XCTAssertTrue(result.text.hasPrefix("Parent read: Agent #"), result.text)
-    XCTAssertTrue(result.text.contains("(Main.worker) finished. Its answer:\nChild answer"), result.text)
-    XCTAssertEqual(result.conversation.messages.map(\.role), [.user, .assistant, .user, .assistant])
-    XCTAssertTrue(result.conversation.messages[1].text.contains("Waiting for the child."))
-    XCTAssertTrue(result.conversation.messages[2].text.contains("finished. Its answer:\nChild answer"))
+    let started = result.toolRuns.first?.result ?? ""
+    XCTAssertTrue(started.hasPrefix("Started Main.worker as #"), started)
     // Four model calls: the parent's, the child's, the parent's "waiting",
     // and the parent's reading of the delivery.
-    XCTAssertEqual(StubChatEndpoint.requests.count, 4)
+    XCTAssertEqual(StubChatEndpoint.requests.count, 4, "requests: \(shapes)")
+    let deliveryRequest = StubChatEndpoint.log.first {
+      $0.lastUserText.contains("finished. Its answer:")
+    }
+    XCTAssertNotNil(deliveryRequest, "no request carried the delivery; requests: \(shapes)")
+    if let deliveryRequest {
+      XCTAssertTrue(deliveryRequest.lastUserText.hasPrefix("Agent #"), deliveryRequest.lastUserText)
+      XCTAssertTrue(deliveryRequest.lastUserText.contains("Child answer"), deliveryRequest.lastUserText)
+    }
+    // The parent's follow-up — the last request made — carries the delivery
+    // text as its newest user message, after the turn that started the child.
+    let followUp = StubChatEndpoint.log.last
+    XCTAssertTrue(followUp?.lastUserText.contains("finished. Its answer:") == true, shapes)
+    let followUpTexts = (followUp?.request["messages"] as? [[String: Any]] ?? [])
+      .compactMap { $0["content"] as? String }
+    XCTAssertTrue(
+      followUpTexts.contains { $0.contains("Started Main.worker as #") },
+      "follow-up messages: \(followUpTexts.map { $0.prefix(60) })")
+    XCTAssertTrue(result.text.hasPrefix("Parent read: Agent #"), result.text)
+    XCTAssertTrue(result.text.contains("(Main.worker) finished. Its answer:\nChild answer"), result.text)
+    let messages = result.conversation.messages
+    XCTAssertEqual(
+      messages.map(\.role), [.user, .assistant, .user, .assistant],
+      "messages: \(messages.map { "\($0.role): \($0.text.prefix(60))" })")
+    XCTAssertTrue(
+      messages.contains { $0.role == .assistant && $0.text.contains("Waiting for the child.") },
+      "no waiting turn; messages: \(messages.map(\.text))")
+    XCTAssertTrue(
+      messages.contains {
+        $0.role == .user && $0.text.contains("finished. Its answer:\nChild answer")
+      },
+      "no delivery message; messages: \(messages.map(\.text))")
 
     await store.refreshAgentProcesses()
     let child = try XCTUnwrap(store.agentChildren(of: conversation.id).first)

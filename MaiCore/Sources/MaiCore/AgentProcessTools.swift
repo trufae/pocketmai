@@ -503,18 +503,21 @@ public enum AgentProcessTools {
     }
   }
 
-  /// Holds while `pid` has a child still working and nothing in its inbox,
-  /// and answers whether a message is waiting to be read. A run calls it when
-  /// its model has answered: true means go round once more, false means
-  /// nothing is on its way and the run may end.
-  public static func awaitAnyChild(
+  /// Holds while `pid` has a child still working, unless a person's message
+  /// is waiting in its inbox, and answers whether anything is waiting to be
+  /// read. A run calls it when its model has answered: true means go round
+  /// once more — with every child's delivery in the inbox by then, so one
+  /// turn takes all of them in rather than one turn per child — and false
+  /// means nothing is on its way and the run may end.
+  public static func awaitChildren(
     of pid: AgentPID,
     supervisor: AgentSupervisor
   ) async throws -> Bool {
     while true {
-      if await supervisor.hasQueuedMessages(pid) { return true }
+      let queued = await supervisor.queuedMessages(for: pid)
+      if queued.contains(where: { deliveredChildPID(of: $0.message) == nil }) { return true }
       let working = await supervisor.tree().children(of: pid).contains { !$0.state.isTerminal }
-      guard working else { return false }
+      guard working else { return !queued.isEmpty }
       try await Task.sleep(for: .milliseconds(100))
     }
   }
@@ -545,10 +548,12 @@ public enum AgentProcessTools {
     queued: Bool,
     slots: Int
   ) -> ToolResult {
+    let follow =
+      "Its answer arrives here as a message when it finishes; \(resultToolName) with pid \"\(pid.rawValue)\" collects it sooner, \(statusToolName) shows progress."
     let text =
       queued
-      ? "Queued \(agentID) as \(pid): all \(slots) subagent slot\(slots == 1 ? " is" : "s are") busy, so it starts when one frees up. Poll \(statusToolName), then \(resultToolName) with pid \"\(pid.rawValue)\"."
-      : "Started \(agentID) as \(pid). Poll \(statusToolName), then \(resultToolName) with pid \"\(pid.rawValue)\"."
+      ? "Queued \(agentID) as \(pid): all \(slots) subagent slot\(slots == 1 ? " is" : "s are") busy, so it starts when one frees up. \(follow)"
+      : "Started \(agentID) as \(pid). \(follow)"
     return ToolResult(
       callID: callID,
       content: [.text(text)],

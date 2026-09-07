@@ -1044,7 +1044,13 @@ public enum AgentTooling {
     case .string(let string):
       return string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     case .bool(let bool):
-      return !bool
+      // False is only a default when the description says so: `wait` on
+      // `agent_start` defaults to true, and dropping its false made every
+      // start block.
+      guard !bool else { return false }
+      let description = parameter.description.lowercased()
+      return description.contains("default: false") || description.contains("default false")
+        || description.contains("defaults to false")
     case .integer(let int):
       let description = parameter.description.lowercased()
       return description.contains("default: \(int)") || description.contains("default \(int)")

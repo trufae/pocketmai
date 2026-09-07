@@ -590,7 +590,7 @@ enum FileWorkspaceTool {
     workspaceName name: String,
     includeAdvancedTools: Bool
   ) -> [ToolDefinition] {
-    var definitions = MaiFileWorkspaceTool.makeTools(
+    let definitions = MaiFileWorkspaceTool.makeTools(
       configuration: MaiFileWorkspaceConfiguration(
         rootURL: PocketMaiDirectories.filesWorkspaceURL,
         displayName: name),

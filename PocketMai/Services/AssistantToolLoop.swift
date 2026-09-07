@@ -412,6 +412,10 @@ enum AssistantToolLoop {
 
     while state.toolCallCount < maxToolCalls && state.repairTurnCount < maxRepairTurns {
       try Task.checkCancellation()
+      // A run started without a process gets one the first time it uses an
+      // agent tool, registered under its conversation; from then on its
+      // children report into that process's inbox.
+      let process = process ?? store.agentProcessIDs[conversation.id]
       if let process {
         try await holdWhilePaused(process, store: store)
         // Messages queued for this child join its conversation before the
@@ -489,7 +493,7 @@ enum AssistantToolLoop {
         // the run holds for it and goes round once more, where the drain at
         // the top of the loop reads its answer under a fresh assistant turn.
         if let process,
-          try await AgentProcessTools.awaitAnyChild(of: process, supervisor: store.agentSupervisor)
+          try await AgentProcessTools.awaitChildren(of: process, supervisor: store.agentSupervisor)
         {
           state = State()
           continue

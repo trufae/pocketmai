@@ -7,3 +7,14 @@ xcuserdata/
 env.sh
 env-*.sh
 .pmai/
+# Python bytecode left behind by the benchmark fixtures and check scripts
+__pycache__/
+*.py[cod]
+# Benchmark runs (proxy logs, work dirs); test/.gitignore covers it too
+test/results/
+# Xcode and SwiftPM leftovers
+*.xcresult
+.swiftpm/
+# Local agent tooling state
+.codex-derived/
+.codex-profiles/

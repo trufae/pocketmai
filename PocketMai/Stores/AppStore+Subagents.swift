@@ -41,6 +41,15 @@ extension AppStore {
       displayName: agentName,
       task: conversation.displayTitle,
       depth: 0)
+    // Two agent calls of one reply ask at once; the first registration to
+    // land is the chat's process and the other is dropped, so every child
+    // hangs off the same root.
+    if let existing = agentProcessIDs[conversation.id], existing != pid,
+      await agentSupervisor.info(existing) != nil
+    {
+      await agentSupervisor.forget(pid)
+      return existing
+    }
     agentProcessIDs[conversation.id] = pid
     return pid
   }
@@ -82,14 +91,24 @@ extension AppStore {
   /// untouched.
   func awaitAgentDeliveriesAndAppendAssistant(in conversationID: UUID) async throws -> UUID? {
     guard let pid = agentProcessIDs[conversationID] else { return nil }
-    while !(await agentSupervisor.hasQueuedMessages(pid)) {
+    // Holds while any child works, so one turn takes every delivery in
+    // rather than one turn per child — unless a person's message is waiting,
+    // in the chat's own queue or in the process's inbox, which wins.
+    while true {
       if hasQueuedUserMessages(in: conversationID) {
         return injectQueuedUserMessagesAndAppendAssistant(in: conversationID)
+      }
+      let queued = await agentSupervisor.queuedMessages(for: pid)
+      if queued.contains(where: { AgentProcessTools.deliveredChildPID(of: $0.message) == nil }) {
+        break
       }
       let working = await agentSupervisor.tree().children(of: pid).contains {
         !$0.state.isTerminal
       }
-      guard working else { return nil }
+      guard working else {
+        guard !queued.isEmpty else { return nil }
+        break
+      }
       try await Task.sleep(for: .milliseconds(100))
     }
     let delivered = await agentSupervisor.drainInbox(pid).filter { $0.role == .user }

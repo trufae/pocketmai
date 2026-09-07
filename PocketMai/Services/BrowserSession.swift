@@ -49,11 +49,21 @@ final class BrowserSession: NSObject, ObservableObject {
     webView.scrollView.contentInsetAdjustmentBehavior = .never
     self.webView = webView
     observations = [
-      webView.observe(\.title, options: [.new]) { [weak self] _, _ in self?.refreshState() },
-      webView.observe(\.url, options: [.new]) { [weak self] _, _ in self?.refreshState() },
-      webView.observe(\.isLoading, options: [.new]) { [weak self] _, _ in self?.refreshState() },
-      webView.observe(\.canGoBack, options: [.new]) { [weak self] _, _ in self?.refreshState() },
-      webView.observe(\.canGoForward, options: [.new]) { [weak self] _, _ in self?.refreshState() },
+      webView.observe(\.title, options: [.new]) { [weak self] _, _ in
+        Task { @MainActor in self?.refreshState() }
+      },
+      webView.observe(\.url, options: [.new]) { [weak self] _, _ in
+        Task { @MainActor in self?.refreshState() }
+      },
+      webView.observe(\.isLoading, options: [.new]) { [weak self] _, _ in
+        Task { @MainActor in self?.refreshState() }
+      },
+      webView.observe(\.canGoBack, options: [.new]) { [weak self] _, _ in
+        Task { @MainActor in self?.refreshState() }
+      },
+      webView.observe(\.canGoForward, options: [.new]) { [weak self] _, _ in
+        Task { @MainActor in self?.refreshState() }
+      },
     ]
   }
 
@@ -185,7 +195,7 @@ final class BrowserSession: NSObject, ObservableObject {
       return string
     case let number as NSNumber:
       return number.stringValue
-    case let value:
+    case let value?:
       guard JSONSerialization.isValidJSONObject(value),
         let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted]),
         let string = String(data: data, encoding: .utf8)

@@ -188,38 +188,68 @@ public struct ToolGroupDefinition: Codable, Equatable, Sendable {
 /// parameters it takes — the schema the model receives, in a form a person
 /// can read.
 public enum ToolGroupHelp {
-  public static func lines(for group: ToolGroupDefinition, tools: [ToolDefinition]) -> [String] {
+  /// What a piece of a help line is, so a host can color the name, the
+  /// traits, the description, and each parameter differently. The default
+  /// painter leaves the text alone, so the plain lines read the same.
+  public enum Style: Equatable, Sendable {
+    /// The group's own description.
+    case group
+    case tool
+    /// The traits after a tool's name: read-only, asks approval, ...
+    case trait
+    case description
+    case parameter
+    /// A parameter's type and whether it is required.
+    case parameterType
+    case parameterDetail
+    /// "Parameters: none."
+    case note
+    /// A tool the group names that no source registered.
+    case missing
+  }
+
+  public static func lines(
+    for group: ToolGroupDefinition,
+    tools: [ToolDefinition],
+    paint: (String, Style) -> String = { text, _ in text }
+  ) -> [String] {
     var lines: [String] = []
     let description = group.description.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !description.isEmpty { lines.append(description) }
+    if !description.isEmpty { lines.append(paint(description, .group)) }
     let byName = Dictionary(tools.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
     for name in group.toolNames.sorted() {
       lines.append("")
       if let tool = byName[name] {
-        lines.append(contentsOf: self.lines(for: tool))
+        lines.append(contentsOf: self.lines(for: tool, paint: paint))
       } else {
-        lines.append("\(name)  [not registered]")
+        lines.append(paint(name, .tool) + "  " + paint("[not registered]", .missing))
       }
     }
     return lines
   }
 
-  public static func lines(for tool: ToolDefinition) -> [String] {
-    var lines = ["\(tool.name)  [\(traits(of: tool.annotations).joined(separator: ", "))]"]
+  public static func lines(
+    for tool: ToolDefinition,
+    paint: (String, Style) -> String = { text, _ in text }
+  ) -> [String] {
+    let traits = "[\(self.traits(of: tool.annotations).joined(separator: ", "))]"
+    var lines = [paint(tool.name, .tool) + "  " + paint(traits, .trait)]
     let description = tool.description.trimmingCharacters(in: .whitespacesAndNewlines)
     for line in description.split(separator: "\n", omittingEmptySubsequences: false) {
-      lines.append("  " + line)
+      lines.append("  " + paint(String(line), .description))
     }
     let parameters = tool.parameters
     guard !parameters.isEmpty else {
-      lines.append("  Parameters: none.")
+      lines.append("  " + paint("Parameters: none.", .note))
       return lines
     }
     for parameter in parameters.filter(\.required) + parameters.filter({ !$0.required }) {
+      let requirement = parameter.required ? "required" : "optional"
       var line =
-        "  \(parameter.name) (\(parameter.type), \(parameter.required ? "required" : "optional"))"
+        "  " + paint(parameter.name, .parameter) + " "
+        + paint("(\(parameter.type), \(requirement))", .parameterType)
       let detail = parameter.description.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !detail.isEmpty { line += ": \(detail)" }
+      if !detail.isEmpty { line += ": " + paint(detail, .parameterDetail) }
       lines.append(line)
     }
     return lines

@@ -686,14 +686,14 @@ public actor AgentRuntime {
       let calls = providerResponse.message.toolCalls
       if calls.isEmpty {
         // A message that arrived while the model was answering is not left
-        // behind for a run that is about to end, and neither is a child
-        // started without waiting: the run holds until its answer lands in
-        // the inbox, then goes round once more so the answer takes it into
-        // account. A run out of turns ends anyway and leaves the message
-        // queued for its host.
+        // behind for a run that is about to end, and neither are children
+        // started without waiting: the run holds until every one of them has
+        // delivered, then goes round once more so the answer takes them all
+        // into account. A run out of turns ends anyway and leaves the
+        // messages queued for its host.
         if localModelTurns < request.limits.maxModelTurns,
           await budget.canClaimModelTurn(),
-          try await AgentProcessTools.awaitAnyChild(of: pid, supervisor: supervisor)
+          try await AgentProcessTools.awaitChildren(of: pid, supervisor: supervisor)
         {
           continue
         }
@@ -810,6 +810,13 @@ public actor AgentRuntime {
         guard let result = results[index] else { continue }
         if !result.isError { completedToolRuns[ToolCallKey(call)] = result.text }
         transcript.append(AgentMessage(role: .tool, content: [.toolResult(result)]))
+        // A call that changed something makes repeating an earlier call
+        // reasonable again — the tests run after each fix are the common
+        // case — so every other call's identical-call count starts over.
+        if !result.isError, Self.changesState(call, in: concreteDefinitions) {
+          let own = ToolCallKey(call)
+          repeatedCalls = repeatedCalls.filter { $0.key == own }
+        }
       }
       await supervisor.note(pid, transcript: transcript)
     }
@@ -823,6 +830,14 @@ public actor AgentRuntime {
   ) -> Bool {
     let name = canonicalToolName(call.name)
     return definitions.contains { $0.name == name && $0.annotations.concurrent }
+  }
+
+  /// Whether `call` names a tool that may change what a later call sees: not
+  /// read-only, and not one of the agent tools.
+  private static func changesState(_ call: ToolCall, in definitions: [ToolDefinition]) -> Bool {
+    let name = canonicalToolName(call.name)
+    guard !reservedToolNames.contains(name) else { return false }
+    return definitions.contains { $0.name == name && !$0.annotations.readOnly }
   }
 
   /// A one-shot signal a concurrent call gives once it is under way — a
@@ -1240,7 +1255,12 @@ public actor AgentRuntime {
       named.toolNames = start.narrowed(named.toolNames)
       definition = named
     } else if request.toolDelegation.delegatesTools {
-      definition = derivedWorker(for: request, toolNames: start.narrowed(request.toolNames))
+      // A parent that narrowed the child's tools and left the agent family
+      // out said what the child may use: that child is a leaf and pays for
+      // no agent schemas. Otherwise the worker is a peer.
+      let delegates = start.tools.map { $0.contains(where: AgentProcessTools.isAgentTool) } ?? true
+      definition = derivedWorker(
+        for: request, toolNames: start.narrowed(request.toolNames), delegates: delegates)
     } else {
       return await fail(
         call,
@@ -1254,7 +1274,7 @@ public actor AgentRuntime {
         call, "this agent may not start children (limits.maxSubagents is 0).",
         parent: parent, emit: emit)
     }
-    guard await budget.allowsChild(depth: depth + 1) else {
+    guard depth + 1 <= request.limits.maxSubagentDepth else {
       return await fail(
         call, "the subagent depth limit for this run is reached.",
         parent: parent, emit: emit)
@@ -1269,6 +1289,11 @@ public actor AgentRuntime {
     // per-session header carries the same value for the whole tree.
     let childRequest = self.request(
       for: definition, messages: [.user(prompt)], sessionID: request.sessionID)
+    // Limits belong to an agent, not to its whole delegation tree. A child
+    // receives a fresh allowance from its own definition while its parent
+    // retains control over how many children it may start and how deep they
+    // may be.
+    let childBudget = RunBudget(limits: childRequest.limits)
     let childRunID = UUID()
     let childDepth = depth + 1
     // A child past the concurrency limit is not refused: it is registered as
@@ -1305,8 +1330,8 @@ public actor AgentRuntime {
         limit: request.limits.maxSubagents,
         admitted: admitted,
         background: !start.wait,
-        queueDeadline: budget.deadline.map {
-          AgentProcessTools.QueueDeadline(instant: $0, interruption: budget.timeInterruption)
+        queueDeadline: childBudget.deadline.map {
+          AgentProcessTools.QueueDeadline(instant: $0, interruption: childBudget.timeInterruption)
         },
         onAdmitted: { await emit(.childStarted(parent, child: childContext)) }
       ) {
@@ -1316,7 +1341,7 @@ public actor AgentRuntime {
           pid: childPID,
           parentRunID: parent.runID,
           depth: childDepth,
-          budget: budget,
+          budget: childBudget,
           emit: emit)
       }
     }
@@ -1399,7 +1424,8 @@ public actor AgentRuntime {
   /// would leave an agent with no way to do anything.
   private func derivedWorker(
     for request: AgentRequest,
-    toolNames: Set<String>
+    toolNames: Set<String>,
+    delegates: Bool = true
   ) -> AgentDefinition {
     AgentDefinition(
       id: "\(request.agentID).worker",
@@ -1407,16 +1433,16 @@ public actor AgentRuntime {
       instructions: workerInstructions ?? AgentDelegationPrompt.workerInstructions,
       provider: request.provider,
       model: request.model,
-      toolNames: toolNames.union(Self.agentToolNames),
+      toolNames: delegates ? toolNames.union(Self.agentToolNames) : toolNames,
       toolGroupNames: request.toolGroupNames ?? [],
-      subagentNames: request.subagentNames,
+      subagentNames: delegates ? request.subagentNames : [],
       stream: request.stream,
       limits: request.limits,
       options: request.options,
       toolCallingStrategy: request.toolCallingStrategy,
       useToolProxy: request.useToolProxy,
       proxyExposedTools: request.proxyExposedTools,
-      toolDelegation: request.toolDelegation,
+      toolDelegation: delegates ? request.toolDelegation : .inline,
       retry: request.retry,
       autocompact: request.autocompact,
       context: request.context)
@@ -1632,9 +1658,9 @@ public enum AgentRuntimeError: LocalizedError, Equatable, Sendable {
   }
 }
 
-/// What one run and every child it starts share: the turn and token counts
-/// against the root's limits, and the deadline. Concurrency of children is
-/// the supervisor's business, since background children outlive the run.
+/// The limits for one agent run. Every delegated child receives its own
+/// instance from that child's definition. Concurrency of children is the
+/// supervisor's business, since background children outlive the run.
 private actor RunBudget {
   private let limits: AgentRunLimits
   private var modelTurns = 0
@@ -1681,10 +1707,6 @@ private actor RunBudget {
     guard toolCalls < limits.maxToolCalls else { return false }
     toolCalls += 1
     return true
-  }
-
-  func allowsChild(depth: Int) -> Bool {
-    depth <= limits.maxSubagentDepth
   }
 
   func record(tokens newTokens: Int) {

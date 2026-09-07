@@ -1,0 +1,1 @@
+Write OVERVIEW.md with one paragraph per package in pkg/ describing what it does and its public functions.

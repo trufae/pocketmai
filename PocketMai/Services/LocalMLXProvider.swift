@@ -88,12 +88,6 @@ actor LocalMLXProvider {
   // Minimum headroom reserved for output tokens within the KV window.
   private static let outputHeadroom = 512
 
-  private init() {
-    // MLX 0.31.6 resolves its default device from the C++ core. This provider
-    // requires Metal, so make the intended device explicit on iOS.
-    Device.setDefault(device: .gpu)
-  }
-
   func load(
     modelID rawModelID: String,
     progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }

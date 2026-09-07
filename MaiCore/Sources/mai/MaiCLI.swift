@@ -5490,22 +5490,53 @@ struct MaiCLI {
       }
     case "show":
       let count = group.toolNames.count
-      let state = isToolGroupEnabled(group, profile: session.profile) ? "enabled" : "disabled"
+      let enabled = isToolGroupEnabled(group, profile: session.profile)
+      // Names in the bold cyan of headings, traits yellow, parameter names
+      // green with their type dim, so the eye can jump from tool to tool and
+      // the descriptions read as prose in between.
+      let colors = await terminal.paintsOutput
+      func paint(_ text: String, _ code: String?) -> String {
+        guard colors, let code else { return text }
+        return "\u{1B}[\(code)m\(text)\u{1B}[0m"
+      }
       await terminal.line(
-        "\(group.displayName) (\(group.catalogID)): \(count) tool\(count == 1 ? "" : "s"), \(state) for agent \(session.profile.agentID)"
-      )
-      for line in ToolGroupHelp.lines(for: group, tools: await runtime.availableTools()) {
+        paint(group.displayName, "1;36") + " " + paint("(\(group.catalogID))", "2")
+          + ": \(count) tool\(count == 1 ? "" : "s"), "
+          + paint(enabled ? "enabled" : "disabled", enabled ? "32" : "31")
+          + " for agent \(session.profile.agentID)")
+      // The agent family is synthesized per run rather than registered, so
+      // its help comes from the definitions the model would see.
+      var tools = await runtime.availableTools()
+      if group.id == AgentRuntime.agentToolGroup.id {
+        tools += AgentProcessTools.definitions(
+          offering: [], delegating: true, planFirst: configuration?.use.plan ?? true)
+      }
+      let helpLines = ToolGroupHelp.lines(for: group, tools: tools) { text, style in
+        switch style {
+        case .group: return paint(text, "36")
+        case .tool: return paint(text, "1;36")
+        case .trait: return paint(text, "33")
+        case .description, .parameterDetail: return text
+        case .parameter: return paint(text, "32")
+        case .parameterType, .note: return paint(text, "2")
+        case .missing: return paint(text, "31")
+        }
+      }
+      for line in helpLines {
         await terminal.line(line)
       }
       guard !group.options.isEmpty else { return }
       let options = configuredOptions(for: group, configuration: configuration)
       await terminal.line("")
-      await terminal.line("Settings, changed with /tools set \(group.id) OPTION VALUE:")
+      await terminal.line(
+        paint("Settings", "1;36") + paint(", changed with /tools set \(group.id) OPTION VALUE:", "2"))
       for option in group.options {
         let value = options[option.id] ?? option.defaultValue
-        var line = "  \(option.id) = \(displayedOption(value, kind: option.kind))  \(option.label)."
+        var line =
+          "  " + paint(option.id, "32") + " = " + paint(displayedOption(value, kind: option.kind), "1")
+          + "  " + paint("\(option.label).", "2")
         if let help = option.help?.trimmingCharacters(in: .whitespacesAndNewlines), !help.isEmpty {
-          line += " \(help)"
+          line += " " + paint(help, "2")
         }
         await terminal.line(line)
       }

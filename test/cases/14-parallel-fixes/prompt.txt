@@ -1,0 +1,1 @@
+Each script in tools/ has one bug; fix all three and run each script's test once to confirm.

@@ -302,3 +302,172 @@ reuse (append only, never touch old messages).
 - [ ] Guard the harness against killed sweeps: launching several `run.py`
   in one shell and exiting killed the proxy runs twice; run them as separate
   jobs or wait on all of them.
+
+## 10. Parallel and recursive subagents: asynchronous tool calls
+
+The user's report: agents ran one at a time (the parent waited for each
+`agent_start` before the next one ran), a worker could not start workers, the
+`agent_*` descriptions did not push the model towards standalone tasks, and
+nothing asked for a plan before a multi-step request. The fix is one concept,
+not four special cases: an **asynchronous tool call**. Cases `14`–`16` (below)
+and `analyze.py`'s new columns (`agents`, `par`, `async`, `plan`, `depth`)
+measure it; `run.py --plan on|off` toggles `use.plan`.
+
+- [x] **`ToolAnnotations.concurrent`: a call the run starts and does not wait
+  for.** `AgentRuntime.runInternal` runs a reply's calls in order, but a call
+  to a concurrent tool is started in a task group and left running while the
+  next call starts; results join the transcript in call order once the last
+  is in. A `LaunchGate` holds the next concurrent call until the previous one
+  is under way (child registered, tool invoked), so pids and slots follow
+  call order. All four `agent_*` tools are concurrent; everything else stays
+  sequential unless a plugin says otherwise. Two `agent_start` calls in one
+  reply now overlap (test: a barrier both children must reach). The iOS tool
+  loop (`AssistantToolLoop.runToolCalls`) does the same.
+- [x] **`wait: false` is the async form, and the answer comes by itself.**
+  `AgentProcessTools.run` ends a background child with
+  `supervisor.finish/fail(..., deliver:)`, which posts the answer (or the
+  reason it ended) into the *parent's* inbox in the same actor step; the
+  parent's run reads it at its next model turn like a queued message, marks
+  the child collected and emits `childFinished`. `agent_result` still works
+  for taking the answer early and drops the pending delivery. Nothing polls.
+- [x] **A run does not end while it has live children.** When the model
+  answers with no calls and a child is still working, the run holds
+  (`awaitAnyChild`, 100 ms poll) and asks the model once more with the
+  delivery in the transcript. A one-shot `pmai "…"` no longer exits on top of
+  its own children, and a worker cannot answer its parent while its own
+  children run. The old "child running across orchestrator turns" test now
+  checks the new contract (later turns still own a child when a limit ended
+  the run first).
+- [x] **Workers are peers.** The derived worker inherits the parent's
+  delegation mode, subagents and tool groups, so it can hand work down in
+  turn; `limits.maxSubagentDepth` stops the recursion, and at the depth
+  limit the agent tools are not offered at all (`visibleDefinitions(for:depth:)`),
+  so leaf workers never pay the ~2.4k characters of `agent_*` schemas on
+  every call. iOS: `SubagentTool.childSettings` withholds `canSpawnSubagents`
+  only at the leaf depth.
+- [x] **Descriptions that steer.** `agent_start` now says the child is
+  self-contained (it cannot see the conversation, so `context` must carry
+  what it needs), one concrete task, "independent tasks: start them all in
+  the same reply, they run at once", "a child may start children of its own",
+  and that a `wait: false` answer arrives later as a message. `agent_result`
+  is described as the early-collection tool, not the way answers come back.
+  The `agents` group description (`/tools show agents`) says the same.
+- [x] **`/set use.plan` (`ConfiguredUse.plan`, default on).** Appends one
+  sentence to `agent_start`: for a request with several steps, write a short
+  numbered plan before the first `agent_start`, saying which steps go to
+  children and which run in parallel; a single question needs no plan. It is
+  a tool-description sentence, not a system block, so an agent that cannot
+  start children pays nothing. iOS: "Plan before delegating" in the Agents
+  screen (`AppSettings.plansBeforeDelegating`).
+- [x] **Harness.** Cases `14-parallel-fixes` (three independent script bugs),
+  `15-overview-fanout` (four packages, one paragraph each), `16-two-repos`
+  (a Python test and a JS check in unrelated trees); `run.py --plan`; the
+  analyzer's `agents`/`par`/`async`/`plan`/`depth` columns read the proxy
+  log (a child request is one whose brief says "running as agent '…'").
+
+### Measured
+
+Single runs on `gemma4:31b` unless noted (Ollama cloud); cases 11, 14, 15, 16
+unless noted; `plan` counts runs where the parent's first tool-calling reply
+had text before its calls. Wall time is left out: two single cloud calls
+stalled for ~199 s in this sweep (one in `inline`, one in `plan off`, one in
+a child of `17`), which swamps everything else. Run ids are
+`test/results/async-*`; the findings file with per-case detail is in the
+session scratchpad and summarized here.
+
+| configuration | solved | calls | prompt Σ | agents | par | async | plan | depth |
+|---|---|---|---|---|---|---|---|---|
+| inline | 3/4 | 40 | 113k | 0 | 0 | 0 | 0/4 | 0 |
+| subagent, plan on | 4/4 | 38 | 141k | 0 | 0 | 0 | 0/4 | 0 |
+| subagent, plan off | 3/4 | 43 | 151k | 0 | 0 | 0 | 0/4 | 0 |
+| subagent, plan on, system prompt asks to delegate independent parts | 4/4 | 35 | 121k | 1 | 1 | 0 | 0/4 | 1 |
+| subagent, system prompt asks to delegate *and* to plan first (cases 14–16) | 2/3, one 300 s stall | 29 | 116k | 1 | 1 | 0 | 0/3 | 1 |
+| gpt-oss:120b, subagent, plan on | 3/4 | 95 | 240k | 0 | 0 | 0 | 0/4 | 0 |
+| `17-fanout-directed` (three `wait:false` starts asked for) | 1/1 | 22 | 50k | 3 | 3 | 3 | – | 1 |
+| `17`, gpt-oss:120b | 0/1, four HTTP 500s | 27 | 48k | 2 | 2 | 1 | – | 1 |
+| `18-fanout-delivered`, before the hold-for-all fix | hung 600 s | 20+ | 32k+ | 3 | 3 | 3 | – | 1 |
+| `18-fanout-delivered`, after it | 1/1 | 22 | 36k | 3 | 3 | 3 | – | 1 |
+
+What the sweep showed, and what changed because of it (same day, after the
+first sweep; `18` re-run on the fixed binary):
+
+- **Neither model delegates or plans on its own.** With the agents group on
+  and the new descriptions, gemma4 started 0 children in 4/4 cases and
+  gpt-oss 0 in 4/4, `use.plan` on or off. A system-prompt nudge got one
+  child in one case (15), which took the *whole* task and waited. No run ever
+  put text before its first tool call: gemma4 answers tool calls with empty
+  content and gpt-oss keeps its reasoning in `reasoning`, so the plan
+  sentence — in the description *or* in the system prompt — had no
+  measurable effect on these two models. It costs 209 characters per call
+  (11,978 vs 11,769 of schema). The toggle stays, on by default as asked;
+  the measurement says it is worth checking on a model that does write
+  before calling before paying for it everywhere.
+- **The mechanics work when asked for.** Case 17: reply #1 carried three
+  `agent_start … wait:false`; stderr shows `↳ coder.worker started` for #2,
+  #3, #4 before the first `← Started` line, and the three children's first
+  model calls share a timestamp (+1.7 s). 22 calls, 13.7 s, solved.
+- [x] **The start result told the model to poll**, so gemma4 called
+  `agent_result` three times (concurrently — a blocking wait for all three)
+  and the delivery path was never exercised in 17. `startedResult` now says
+  the answer arrives as a message and that `agent_result` collects it sooner.
+- [x] **Resuming on the first delivery was wrong.** In 18 the parent's turn
+  restarted when #3 and #4 had delivered and #2 was a second away; gemma4
+  then streamed "Still waiting for Agent #2's result." 4,857 times in one
+  model call for ten minutes. `awaitChildren` now holds until every live
+  child has delivered (a person's message still breaks in), so one turn
+  takes all the answers: the re-run solves 18 in 10.6 s and 22 calls, and
+  the same rule saves a model turn per child everywhere.
+- [x] **The identical-call guard tripped on legitimate test re-runs** (plan
+  on, case 14): the model ran the same test command after each of three
+  fixes and the fourth was refused, tools withdrawn (5,504 → 2,877 prompt
+  tokens); the case passed only because the third fix was already in. A
+  successful call to a tool that is not read-only now restarts the count of
+  every *other* call, so `patch, test, patch, test…` never trips and
+  `test, test, test, test` still does.
+- [x] **`wait:false` never reached the iOS app.** `AgentTooling.normalizeValues`
+  dropped every optional `false` as "the default"; `wait` defaults to true.
+  Only a parameter whose description says "default: false" loses it now, and
+  the iOS end-to-end test for the delivery path is a plain test.
+- [x] **Every child paid for the agent family.** The one delegated child saw
+  `agent_*` besides its three narrowed tools (4,185 characters of schema,
+  ~1k tokens per child call) and no run went deeper than one level. A parent
+  that narrows `tools` and leaves the agent family out now gets a leaf; a
+  parent that does not narrow still gets a peer, as asked.
+
+### Still open
+
+- [ ] **Nothing bounds one runaway generation.** The 18 hang was a single
+  model call that never ended (never logged, so 19,657 lines of stdout and
+  nothing in the proxy log). `limits.maxSeconds` is per run and the bench
+  sets none; a per-call cap — apply `maxSeconds` to a single call, or a
+  maximum of output tokens — is cheap and would have cut it at once.
+- [ ] **gpt-oss empty-reply loop.** After one `The provider returned an
+  empty response.` (retried 2×) it answered 34 consecutive one-token replies
+  until `maxModelTurns` 40 (~60k prompt tokens); the tools were withdrawn at
+  the third but the run went on. Three empty replies in a row should end the
+  run, not just drop the tools.
+- [ ] **Retries are too short for the cloud.** Four HTTP 500s on the parent
+  in `17`/gpt-oss exhausted `retry.attempts` 2 × 5 s and failed the run while
+  a child had just finished (`↲ done · 12 turns · 7 tools · 16.9k tok`);
+  its work was discarded with the parent. gpt-oss also invented
+  `list_available_tools` and `files_tree`.
+- [ ] **The family costs +741 tokens on every call** of every process that
+  sees it (11,978 vs 9,015 characters of schema): 141k vs 113k prompt tokens
+  for the 4-case sweep with the same outcome. The depth limit and the
+  narrowed-leaf rule keep it off the leaves; the default `maxSubagentDepth`
+  of 2 still gives every first-level worker the four schemas.
+- [ ] **Children list the tree first.** Every child of 17/18 opened with
+  `run_sh "ls -R"` although the brief named the files. One sentence in the
+  brief template ("the paths above exist; do not list the tree to find
+  them") is cheap to measure.
+- [ ] Sequential calls after a concurrent one in the same reply do not wait
+  for it: a `files_write` after an `agent_start` runs while the child runs.
+  That is what fan-out wants; a model that expects the child's file before
+  its own next call would race. Nothing tripped on it yet; the description
+  says nothing about it.
+- [ ] A delivery shows on the terminal as the child's `↲ done` block, not as
+  text in the parent's stream; a `ui.subagents` level that prints the
+  delivered answer under the parent may read better.
+- [ ] `analyze.py`'s `prefix Δ` compares consecutive requests of *different*
+  processes once children run concurrently (16–19 in 17/18): group by
+  process before comparing.

@@ -128,9 +128,12 @@ pending delivery so nothing is read twice.
 
 **A run does not end with children still working.** When the model answers
 with no tool calls while one of its children is alive, the run holds
-(`AgentProcessTools.awaitAnyChild`) until a message lands in its inbox and then
-asks the model once more, so the final answer accounts for every child it
-started. This is what lets a one-shot `pmai "…"` fan out without exiting on
+(`AgentProcessTools.awaitChildren`) until every live child has delivered —
+one more model turn takes all the answers in, rather than one turn per child,
+which is what a model waiting for "the third one" needs — unless a person's
+message arrives first, and then asks the model once more, so the final answer
+accounts for every child it started. This is what lets a one-shot `pmai "…"`
+fan out without exiting on
 top of its own children, and what keeps a worker from answering its parent
 while its grandchildren are still running. A run out of turns ends anyway and
 leaves the delivery queued for the next turn on the same pid, which is how a
@@ -223,7 +226,9 @@ derives one: **`<parent>.worker`**, same provider and model, inheriting the
 parent's tool allow-list, its delegation mode and its subagents, and taking its
 instructions from the delegation prompt. A worker is a peer of its parent: it
 can hand part of its task down in turn, and `limits.maxSubagentDepth` is what
-stops the recursion. At the depth limit the agent tools are not offered at all
+stops the recursion; a parent that narrows the child's `tools` and leaves the
+agent family out gets a leaf, since it said what the child may use. At the
+depth limit the agent tools are not offered at all
 (the child could not start anything, so the four schemas would be paid on every
 call for nothing), which also keeps the leaves of a deep tree cheap.
 

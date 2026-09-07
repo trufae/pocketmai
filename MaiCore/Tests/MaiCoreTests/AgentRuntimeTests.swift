@@ -1799,7 +1799,9 @@ func toolDelegationRunsToolsInAChild() async throws {
       messages: [.user("what is in Parser.swift?")],
       toolNames: AgentRuntime.agentToolNames.union(["read_file"]),
       toolGroupNames: [AgentRuntime.agentToolGroup.id],
-      limits: AgentRunLimits(maxModelTurns: 4, maxToolCalls: 4, maxSubagents: 2),
+      // The parent spends one tool call to delegate and two model turns; the
+      // worker gets its own two model turns and one tool call.
+      limits: AgentRunLimits(maxModelTurns: 2, maxToolCalls: 1, maxSubagents: 2),
       toolDelegation: .subagent,
       sessionID: "chat-1"))
 

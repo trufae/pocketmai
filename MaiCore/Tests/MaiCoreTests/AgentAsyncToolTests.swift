@@ -330,3 +330,177 @@ private actor Barrier {
     return true
   }
 }
+
+@Test("Two background children are taken in with one resume, once both have delivered")
+func backgroundChildrenDeliverTogether() async throws {
+  let provider = FixtureProvider { request in
+    if let name = agentName(of: request) {
+      let task = request.messages.last { $0.role == .user }?.text ?? ""
+      try await Task.sleep(for: .milliseconds(task.contains("slow") ? 250 : 50))
+      return ProviderResponse(message: .assistant("\(name) answered"), stopReason: .stop)
+    }
+    let deliveries = request.messages.filter { AgentProcessTools.deliveredChildPID(of: $0) != nil }
+    if !deliveries.isEmpty {
+      return ProviderResponse(
+        message: .assistant("Got: \(deliveries.count) deliveries"), stopReason: .stop)
+    }
+    if request.messages.contains(where: { $0.role == .tool }) {
+      return ProviderResponse(message: .assistant("Waiting for both."), stopReason: .stop)
+    }
+    return ProviderResponse(
+      message: AgentMessage(
+        role: .assistant,
+        content: [
+          .toolCall(startCall(id: "start-fast", task: "A fast thing", wait: false)),
+          .toolCall(startCall(id: "start-slow", task: "A slow thing", wait: false)),
+        ]),
+      stopReason: .toolCall)
+  }
+  let runtime = AgentRuntime(approvalHandler: AllowAllApprovals())
+  try await runtime.register(provider)
+
+  let result = try await runtime.run(delegatingRequest(prompt: "fan out and wait")) { _ in }
+
+  // Start, "waiting", and one turn with both answers: never a turn per child.
+  #expect(result.response.text == "Got: 2 deliveries")
+  #expect(await provider.requests.filter { agentName(of: $0) == nil }.count == 3)
+  let children = await runtime.supervisor.processes().filter { $0.agentID == "main.worker" }
+  #expect(children.count == 2 && children.allSatisfy { $0.isCollected })
+}
+
+@Test("A call that changed something starts the identical-call count of the others over")
+func writesResetTheRepeatGuard() async throws {
+  let provider = FixtureProvider { request in
+    let results = request.messages.flatMap(\.toolResults)
+    // Four rounds of "run the tests" after "fix something": the fourth
+    // identical test run must not be refused as a repeat.
+    guard results.count < 8 else {
+      return ProviderResponse(message: .assistant("All green."), stopReason: .stop)
+    }
+    let round = results.count / 2
+    return ProviderResponse(
+      message: AgentMessage(
+        role: .assistant,
+        content: [
+          .toolCall(
+            ToolCall(
+              id: "fix-\(round)", name: "fix",
+              arguments: .object(["change": .string("edit \(round)")]))),
+          .toolCall(
+            ToolCall(
+              id: "test-\(round)", name: "test",
+              arguments: .object(["command": .string("make test")]))),
+        ]),
+      stopReason: .toolCall)
+  }
+  let runtime = AgentRuntime(approvalHandler: AllowAllApprovals())
+  try await runtime.register(provider)
+  try await runtime.register(
+    tool: ClosureTool(
+      definition: ToolDefinition(
+        name: "fix", description: "Edit a file",
+        inputSchema: .object(["type": .string("object")]),
+        annotations: ToolAnnotations(readOnly: false, approval: .automatic))
+    ) { _, _ in ToolOutput(text: "edited") })
+  try await runtime.register(
+    tool: ClosureTool(
+      definition: ToolDefinition(
+        name: "test", description: "Run the tests",
+        inputSchema: .object(["type": .string("object")]),
+        annotations: ToolAnnotations(readOnly: true, approval: .automatic))
+    ) { _, _ in ToolOutput(text: "1 failure") })
+
+  let result = try await runtime.run(
+    AgentRequest(
+      agentID: "main",
+      provider: "fixture",
+      model: "fixture",
+      messages: [.user("fix until green")],
+      toolNames: ["fix", "test"],
+      limits: AgentRunLimits(maxModelTurns: 8, maxToolCalls: 16))
+  ) { _ in }
+
+  #expect(result.response.text == "All green.")
+  let results = result.transcript.flatMap(\.toolResults)
+  #expect(results.count == 8)
+  #expect(!results.contains { $0.isError })
+}
+
+@Test("A parent that narrows the child's tools without the agent family gets a leaf")
+func narrowedWorkerIsALeaf() async throws {
+  let provider = FixtureProvider { request in
+    if agentName(of: request) != nil {
+      return ProviderResponse(message: .assistant("leaf"), stopReason: .stop)
+    }
+    if let first = request.messages.flatMap(\.toolResults).first {
+      return ProviderResponse(message: .assistant("root got \(first.text)"), stopReason: .stop)
+    }
+    return ProviderResponse(
+      message: AgentMessage(
+        role: .assistant,
+        content: [
+          .toolCall(
+            ToolCall(
+              id: "narrow", name: AgentRuntime.agentStartToolName,
+              arguments: .object([
+                "task": .string("Read the file"),
+                "output": .string("One line."),
+                "tools": .array([.string("read_file")]),
+              ])))
+        ]),
+      stopReason: .toolCall)
+  }
+  let runtime = AgentRuntime(approvalHandler: AllowAllApprovals())
+  try await runtime.register(provider)
+  try await runtime.register(
+    tool: ClosureTool(
+      definition: ToolDefinition(
+        name: "read_file", description: "Read a file",
+        inputSchema: .object(["type": .string("object")]),
+        annotations: ToolAnnotations(readOnly: true, approval: .automatic))
+    ) { _, _ in ToolOutput(text: "contents") })
+
+  var request = delegatingRequest(prompt: "narrow")
+  request.toolNames = AgentRuntime.agentToolNames.union(["read_file"])
+  let result = try await runtime.run(request) { _ in }
+
+  #expect(result.response.text == "root got leaf")
+  let worker = try #require(await provider.requests.first { agentName(of: $0) != nil })
+  #expect(worker.tools.map(\.name) == ["read_file"])
+}
+
+@Test("An optional false boolean survives normalization unless false is its documented default")
+func optionalFalseIsKeptUnlessItIsTheDefault() throws {
+  let definitions = AgentProcessTools.definitions(offering: [], delegating: true)
+  let start = ParsedToolCall(
+    name: AgentProcessTools.startToolName,
+    arguments: [:],
+    argumentValues: ["task": .string("t"), "output": .string("o"), "wait": .bool(false)],
+    rawBlock: "",
+    toolCallID: "1",
+    apiName: nil)
+  // `wait` defaults to true, so its false is the whole point of the call.
+  let normalizedStart = AgentTooling.normalized(call: start, tools: definitions)
+  #expect(normalizedStart.argumentValues["wait"] == .bool(false))
+
+  let quiet = ToolDefinition(
+    name: "echo",
+    description: "Echo",
+    inputSchema: .object([
+      "type": .string("object"),
+      "properties": .object([
+        "verbose": .object([
+          "type": .string("boolean"),
+          "description": .string("Print more. Default: false."),
+        ])
+      ]),
+    ]))
+  let echo = ParsedToolCall(
+    name: "echo",
+    arguments: [:],
+    argumentValues: ["verbose": .bool(false)],
+    rawBlock: "",
+    toolCallID: "2",
+    apiName: nil)
+  #expect(AgentTooling.normalized(call: echo, tools: [quiet]).argumentValues["verbose"] == nil)
+}

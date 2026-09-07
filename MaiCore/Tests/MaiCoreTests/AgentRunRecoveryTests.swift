@@ -178,9 +178,8 @@ func queuedChildrenStartWhenSlotFrees() async throws {
         ]),
       stopReason: .toolCall),
     textReply("Both handed out"),
-    // The run holds for its background children and asks again as each
-    // answer is delivered.
-    textReply("First delivered"),
+    // The run holds for both background children and asks once more with
+    // the two answers delivered.
     textReply("Both delivered"),
   ])
   let childProvider = SlowChildProvider()
