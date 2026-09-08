@@ -743,21 +743,31 @@ struct REPLSession {
 }
 
 private final class TerminalInterruptHandler: @unchecked Sendable {
-  private let source: DispatchSourceSignal
+  #if !os(Windows)
+    private let source: DispatchSourceSignal
+  #endif
   private let lock = NSLock()
   private var cancellation: (@Sendable () -> Void)?
   private var interrupted = false
 
   init() {
-    signal(SIGINT, SIG_IGN)
-    source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
-    source.setEventHandler { [weak self] in self?.interrupt() }
-    source.resume()
+    #if os(Windows)
+      WindowsConsole.watchInterrupts { [weak self] in self?.interrupt() }
+    #else
+      signal(SIGINT, SIG_IGN)
+      source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+      source.setEventHandler { [weak self] in self?.interrupt() }
+      source.resume()
+    #endif
   }
 
   deinit {
-    source.cancel()
-    signal(SIGINT, SIG_DFL)
+    #if os(Windows)
+      WindowsConsole.watchInterrupts(nil)
+    #else
+      source.cancel()
+      signal(SIGINT, SIG_DFL)
+    #endif
   }
 
   func activate(cancellation: @escaping @Sendable () -> Void) {
@@ -9233,10 +9243,16 @@ struct MaiCLI {
     let data = FileHandle.standardInput.readDataToEndOfFile()
     let attachment = try DocumentAttachmentImporter.attachment(data: data, filename: "stdin.txt")
     if reopeningTerminal {
-      let tty = open("/dev/tty", O_RDONLY)
-      guard tty >= 0 else { throw CLIError.stdinWithoutTerminal }
-      defer { close(tty) }
-      guard dup2(tty, STDIN_FILENO) >= 0 else { throw CLIError.stdinWithoutTerminal }
+      #if os(Windows)
+        guard WindowsConsole.reopenStandardInputOnConsole() else {
+          throw CLIError.stdinWithoutTerminal
+        }
+      #else
+        let tty = open("/dev/tty", O_RDONLY)
+        guard tty >= 0 else { throw CLIError.stdinWithoutTerminal }
+        defer { close(tty) }
+        guard dup2(tty, STDIN_FILENO) >= 0 else { throw CLIError.stdinWithoutTerminal }
+      #endif
     }
     return attachment.content
   }

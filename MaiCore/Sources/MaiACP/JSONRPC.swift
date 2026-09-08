@@ -213,9 +213,12 @@ public final class StdioJSONRPCTransport: JSONRPCTransport, @unchecked Sendable 
     if let process, process.isRunning {
       process.terminate()
       // Give a well-behaved agent a moment to exit before pulling the plug.
-      DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-      }
+      // On Windows terminate() already ends the process outright.
+      #if !os(Windows)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+          if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        }
+      #endif
     }
   }
 
