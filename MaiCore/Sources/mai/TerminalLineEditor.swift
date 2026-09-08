@@ -112,13 +112,16 @@ private final class ClassicEditorSurface: LineEditorSurface {
   func suspendProcess() {
     // ISIG is disabled while editing so Ctrl+Z arrives as a byte. Restore the
     // shell's terminal mode before stopping, then re-enter raw mode after `fg`.
-    write("\r" + up(caretRow) + "\u{1B}[J^Z\n" + TerminalInputModes.disable)
-    caretRow = 0
-    drawnRows = 0
-    _ = tcsetattr(STDIN_FILENO, TCSADRAIN, &cooked)
-    _ = kill(getpid(), SIGTSTP)
-    _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw)
-    write(TerminalInputModes.enable)
+    // The Windows console has no job control, so Ctrl+Z is simply ignored.
+    #if !os(Windows)
+      write("\r" + up(caretRow) + "\u{1B}[J^Z\n" + TerminalInputModes.disable)
+      caretRow = 0
+      drawnRows = 0
+      _ = tcsetattr(STDIN_FILENO, TCSADRAIN, &cooked)
+      _ = kill(getpid(), SIGTSTP)
+      _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw)
+      write(TerminalInputModes.enable)
+    #endif
   }
 
   private func up(_ rows: Int) -> String {

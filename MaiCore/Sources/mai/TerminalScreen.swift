@@ -49,7 +49,7 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
   private var caretColumn = 0
   private var outputEndedLine = true
   private var active = false
-  private var resizeSource: DispatchSourceSignal?
+  private var resizeSource: (any DispatchSourceProtocol)?
   /// Keystrokes that arrived while the terminal was asked for its cursor
   /// position, kept for the editor.
   private var typeahead: [UInt8] = []
@@ -264,9 +264,12 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
   }
 
   func suspendProcess() {
-    suspendTerminal {
-      _ = kill(getpid(), SIGTSTP)
-    }
+    // The Windows console has no job control, so Ctrl+Z is simply ignored.
+    #if !os(Windows)
+      suspendTerminal {
+        _ = kill(getpid(), SIGTSTP)
+      }
+    #endif
   }
 
   func pendingInput() -> [UInt8] {
@@ -368,12 +371,31 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
   }
 
   private func watchResizes() {
-    signal(SIGWINCH, SIG_IGN)
-    let source = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: .global())
-    source.setEventHandler { [weak self] in self?.resized() }
+    #if os(Windows)
+      // The console sends no resize signal, so a timer looks for size changes.
+      let source = DispatchSource.makeTimerSource(queue: .global())
+      source.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
+      source.setEventHandler { [weak self] in self?.resizedIfNeeded() }
+    #else
+      signal(SIGWINCH, SIG_IGN)
+      let source = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: .global())
+      source.setEventHandler { [weak self] in self?.resized() }
+    #endif
     source.resume()
     resizeSource = source
   }
+
+  #if os(Windows)
+    private func resizedIfNeeded() {
+      let changed: Bool = lock.withLock {
+        guard active else { return false }
+        var size = winsize()
+        guard ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size) == 0 else { return false }
+        return Int(size.ws_row) != rows || Int(size.ws_col) != columns
+      }
+      if changed { resized() }
+    }
+  #endif
 
   /// After a resize the saved cursor is anywhere; output continues from the
   /// bottom of the new region and the reserved rows are drawn again.

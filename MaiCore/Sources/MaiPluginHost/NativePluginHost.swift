@@ -3,7 +3,9 @@ import Foundation
 import MaiCore
 import MaiPluginSDK
 
-#if canImport(Android)
+#if os(Windows)
+  import WinSDK
+#elseif canImport(Android)
   import Android
 #elseif canImport(Musl)
   import Musl
@@ -51,24 +53,30 @@ private final class NativePluginLibrary: @unchecked Sendable {
   let url: URL
   let manifest: NativePluginManifest
 
+  #if os(Windows)
+    static let libraryExtension = "dll"
+  #else
+    static let libraryExtension = "dylib"
+  #endif
+
   private let handle: UnsafeMutableRawPointer
   private let api: mai_plugin_api_v1
 
   init(url: URL) throws {
     let resolvedURL = url.standardizedFileURL.resolvingSymlinksInPath()
-    guard resolvedURL.pathExtension.lowercased() == "dylib" else {
+    guard resolvedURL.pathExtension.lowercased() == Self.libraryExtension else {
       throw NativePluginHostError.invalidExtension(resolvedURL.path)
     }
     guard FileManager.default.fileExists(atPath: resolvedURL.path) else {
       throw NativePluginHostError.notFound(resolvedURL.path)
     }
-    guard let handle = dlopen(resolvedURL.path, RTLD_NOW | RTLD_LOCAL) else {
+    guard let handle = Self.open(resolvedURL.path) else {
       throw NativePluginHostError.openFailed(
         path: resolvedURL.path,
         message: Self.dynamicLoaderError())
     }
     do {
-      guard let symbol = dlsym(handle, MAI_PLUGIN_ENTRY_SYMBOL_V1) else {
+      guard let symbol = Self.symbol(MAI_PLUGIN_ENTRY_SYMBOL_V1, in: handle) else {
         throw NativePluginHostError.entryPointMissing(MAI_PLUGIN_ENTRY_SYMBOL_V1)
       }
       typealias EntryPoint = @convention(c) () -> UnsafePointer<mai_plugin_api_v1>?
@@ -99,14 +107,14 @@ private final class NativePluginLibrary: @unchecked Sendable {
       self.api = api
       self.manifest = manifest
     } catch {
-      dlclose(handle)
+      Self.close(handle)
       throw error
     }
   }
 
   deinit {
     api.destroy?(api.plugin_context)
-    dlclose(handle)
+    Self.close(handle)
   }
 
   func invoke(
@@ -154,9 +162,49 @@ private final class NativePluginLibrary: @unchecked Sendable {
     api.cancel?(api.plugin_context, operationID)
   }
 
-  private static func dynamicLoaderError() -> String {
-    dlerror().map { String(cString: $0) } ?? "Unknown dynamic loader error."
-  }
+  #if os(Windows)
+    private static func open(_ path: String) -> UnsafeMutableRawPointer? {
+      guard let module = path.withCString(encodedAs: UTF16.self, { LoadLibraryW($0) }) else {
+        return nil
+      }
+      return UnsafeMutableRawPointer(module)
+    }
+
+    private static func symbol(
+      _ name: String, in handle: UnsafeMutableRawPointer
+    ) -> UnsafeMutableRawPointer? {
+      guard let address = GetProcAddress(unsafeBitCast(handle, to: HMODULE.self), name) else {
+        return nil
+      }
+      return unsafeBitCast(address, to: UnsafeMutableRawPointer.self)
+    }
+
+    private static func close(_ handle: UnsafeMutableRawPointer) {
+      FreeLibrary(unsafeBitCast(handle, to: HMODULE.self))
+    }
+
+    private static func dynamicLoaderError() -> String {
+      "Windows error \(GetLastError())."
+    }
+  #else
+    private static func open(_ path: String) -> UnsafeMutableRawPointer? {
+      dlopen(path, RTLD_NOW | RTLD_LOCAL)
+    }
+
+    private static func symbol(
+      _ name: String, in handle: UnsafeMutableRawPointer
+    ) -> UnsafeMutableRawPointer? {
+      dlsym(handle, name)
+    }
+
+    private static func close(_ handle: UnsafeMutableRawPointer) {
+      dlclose(handle)
+    }
+
+    private static func dynamicLoaderError() -> String {
+      dlerror().map { String(cString: $0) } ?? "Unknown dynamic loader error."
+    }
+  #endif
 }
 
 private final class NativeInvocationState: @unchecked Sendable {
@@ -603,7 +651,8 @@ public enum NativePluginHostError: LocalizedError, Equatable, Sendable {
   public var errorDescription: String? {
     switch self {
     case .notFound(let path): "Native plugin not found at '\(path)'."
-    case .invalidExtension(let path): "Native plugins must be .dylib files: '\(path)'."
+    case .invalidExtension(let path):
+      "Native plugins must be .\(NativePluginLibrary.libraryExtension) files: '\(path)'."
     case .openFailed(let path, let message): "Could not load native plugin '\(path)': \(message)"
     case .entryPointMissing(let symbol): "Native plugin does not export '\(symbol)'."
     case .invalidEntryPoint: "Native plugin returned an invalid API entry point."
