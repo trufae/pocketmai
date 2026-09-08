@@ -130,6 +130,11 @@ instead of the clipboard: `/copy reply.md` saves the last reply and
 use the first of `wl-copy`, `xclip`, `xsel`, `pbcopy`, or `clip.exe` found in
 `PATH`.
 
+`/edit input` writes the next message in `$EDITOR` instead of at the prompt: an
+empty file opens and what it holds when the editor closes is sent as an
+ordinary message, so a long one is written with the editor's own keys. An empty
+file sends nothing.
+
 `/reply` answers the last assistant reply with it quoted above the answer. The
 reply is wrapped at 40 columns, every line prefixed with `> `, and opened in
 `$EDITOR` with a blank line under it; what the editor leaves is sent as if it

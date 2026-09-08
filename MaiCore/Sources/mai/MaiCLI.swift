@@ -2276,6 +2276,16 @@ struct MaiCLI {
             await releaseIfIdle(workspace: workspace)
             continue
           }
+          if name == "/edit", argument.lowercased() == "input" {
+            // The editor takes the terminal, as it does for /reply.
+            var message: String?
+            await withTurnInterruptSetAside {
+              message = await composeInput(terminal: terminal)
+            }
+            if let message { await deliver(message, to: loop.focus) }
+            await releaseIfIdle(workspace: workspace)
+            continue
+          }
           if name == "/reply" {
             // The editor takes the terminal, so a running turn keeps its
             // Ctrl+C rather than ending on the one meant for the editor.
@@ -4425,6 +4435,13 @@ struct MaiCLI {
         configurationPath: configurationPath,
         providerBaseURLs: providerBaseURLs,
         terminal: terminal)
+
+    case "input":
+      // The chat prompt intercepts this one, because the message it writes is
+      // sent from there; here it can only say where it works.
+      await terminal.line(
+        "Use /edit input at the chat prompt; it opens an empty file and sends what you write in it."
+      )
 
     case "compact":
       guard var draft = configuration, let configurationPath else {
@@ -7683,17 +7700,38 @@ struct MaiCLI {
       return nil
     }
     let quoted = MarkdownQuote.quote(reply, lineWidth: width)
-    guard
-      let edited = await editTemporaryText(
-        quoted + "\n\n", suffix: "reply.md", terminal: terminal)
+    return await composeMessage(
+      from: quoted + "\n\n",
+      suffix: "reply.md",
+      unchanged: "Reply cancelled: nothing was written under the quote.",
+      terminal: terminal)
+  }
+
+  /// `/edit input` writes the next message in the editor instead of at the
+  /// prompt, which is the room `/reply` gives without a quote to answer.
+  private static func composeInput(terminal: TerminalWriter) async -> String? {
+    await composeMessage(
+      from: "",
+      suffix: "input.md",
+      unchanged: "Nothing to send: the editor left the file empty.",
+      terminal: terminal)
+  }
+
+  /// Opens the editor on a draft message and returns what it left, for the
+  /// caller to send as if it had been typed at the prompt. A file that comes
+  /// back empty, or exactly as it went in, sends nothing.
+  private static func composeMessage(
+    from draft: String,
+    suffix: String,
+    unchanged note: String,
+    terminal: TerminalWriter
+  ) async -> String? {
+    guard let edited = await editTemporaryText(draft, suffix: suffix, terminal: terminal)
     else { return nil }
     let message = edited.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !message.isEmpty else {
-      await terminal.line("Reply cancelled: the editor left nothing to send.")
-      return nil
-    }
-    guard message != quoted.trimmingCharacters(in: .whitespacesAndNewlines) else {
-      await terminal.line("Reply cancelled: nothing was written under the quote.")
+    guard !message.isEmpty, message != draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    else {
+      await terminal.line(note)
       return nil
     }
     return message
@@ -9045,6 +9083,7 @@ struct MaiCLI {
       "/mcp list",
       "/mcp add ", "/mcp enable ", "/mcp disable ",
       "/edit prompt", "/edit compact", "/edit config", "/edit mcps", "/edit provider",
+      "/edit input",
       "/chat compact ",
       "/image tiny ", "/image small ", "/image medium ", "/image big ", "/image full ",
       "/image ocr ", "/attach ", "/attach clear", "/copy", "/help copy", "/reply", "/help reply",
@@ -9339,6 +9378,7 @@ struct MaiCLI {
     /chat               List, switch, archive, rename, or edit this project's chats
     /project            Show, list, rename, or tint the project (the start directory)
     /edit TARGET        Edit a prompt, agent, config, MCP list, or message in $EDITOR
+    /edit input         Write the next message in $EDITOR instead of at the prompt
     /agents             Manage agent definitions and running agents; /help agents lists commands
     /queue              List, push, pop, or drop messages waiting for an agent
     /agent              Select or edit this chat's agent; /help agent lists commands
@@ -9509,6 +9549,7 @@ struct MaiCLI {
     /edit config             Edit the active configuration file
     /edit mcps               Edit the configured MCP server list as JSON
     /edit N|MESSAGE_ID       Edit conversation message N or its full message ID
+    /edit input              Write the next message in the editor and send it
 
     The compact and memory templates must contain {{transcript}}; {{focus}} and
     {{memory}} are optional. The delegation template must contain {{task}};
