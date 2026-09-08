@@ -22,8 +22,10 @@ so syntax highlighting and JSON checking work without configuration.
 
 | Command | What opens | When it applies |
 | --- | --- | --- |
-| `/edit prompt [NAME]` | A named system prompt as Markdown; creates it when NAME is new. Current agent's prompt when omitted. | Immediately, in every agent that uses the prompt. |
-| `/edit NAME` | The same, for an existing prompt name. | Immediately. |
+| `/edit prompt [NAME]` | The prompt called NAME as Markdown, whether a system prompt or a user prompt; a new name is refused, since the two are different things. Current agent's system prompt when omitted. | Immediately. |
+| `/edit system [NAME]` | A named system prompt; creates it when NAME is new. Current agent's prompt when omitted. | Immediately, in every agent that uses the prompt. |
+| `/edit user NAME` | A user prompt — a message sent with `$NAME`; creates it when NAME is new, starting from the builtin prompt of that name if there is one. | Immediately. |
+| `/edit NAME` | The same, for an existing system or user prompt name. | Immediately. |
 | `/edit agent [ID]` | One saved agent as JSON: provider, model, tools, limits, prompt name, delegation, retry, autocompact. Current agent when omitted. | Immediately; the current chat picks up its own agent's changes. |
 | `/edit provider [ID]` | One configured provider as JSON: base URL, key source, headers, timeout, options. Current provider when omitted. | Immediately; the provider is rebuilt in the running session. |
 | `/edit compact` | The template `/chat compact` and autocompact render. | Immediately. |
@@ -41,11 +43,14 @@ changes one record, `/agent add` and `/edit config` create new ones.
 
 ### Prompts
 
-`/edit prompt` is the long form of `/prompt add NAME TEXT`. The prompt is
+`/edit system` is the long form of `/prompt add NAME TEXT`. The prompt is
 saved under `prompts.system` in the configuration and every agent whose
 `systemPrompt` names it starts using the new text at its next turn. Emptying
 the file does not delete the prompt; `/prompt rm NAME` does that, and only
-when no agent uses it. See `doc/prompts.md` for how prompts and agents fit.
+when no agent uses it. `/edit user` is the long form of
+`/prompts add NAME TEXT`: the text is saved under `prompts.user` and
+`$NAME [TEXT]` sends it; `/prompts rm NAME` drops it. See `doc/prompts.md`
+for how prompts and agents fit.
 
 ### Agents
 

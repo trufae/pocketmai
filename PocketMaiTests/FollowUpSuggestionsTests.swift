@@ -12,7 +12,7 @@ final class FollowUpSuggestionsTests: XCTestCase {
     XCTAssertEqual(settings.followUps.contextMessageCount, 3)
     XCTAssertTrue(
       settings.userPrompts.contains {
-        PromptSlashCommand.normalized($0.slashCommandName) == "followup"
+        PromptSlashCommand.normalized($0.commandName) == "followup"
       })
   }
 

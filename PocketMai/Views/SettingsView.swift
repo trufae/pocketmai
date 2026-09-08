@@ -1362,7 +1362,7 @@ struct SettingsView: View {
   @ViewBuilder
   private var userPromptContent: some View {
     Text(
-      "User prompts can be used when prefixing the message with '/'"
+      "User prompts can be used when prefixing the message with '/' or '$'"
     )
     ForEach(store.settings.userPrompts) { prompt in
       NavigationLink {
@@ -2180,7 +2180,7 @@ struct SettingsView: View {
         store.settings.followUps.prompt = text
         if let index = store.settings.userPrompts.firstIndex(where: {
           $0.id == AppSettings.followUpUserPrompt.id
-            || PromptSlashCommand.normalized($0.slashCommandName) == "followup"
+            || PromptSlashCommand.normalized($0.commandName) == "followup"
         }) {
           store.settings.userPrompts[index].text = text
         } else {
@@ -4091,13 +4091,13 @@ private enum PromptNameResolution {
     let normalized = normalizedName(PromptSlashCommand.commandName(for: name))
     if systemPrompts.contains(where: { prompt in
       guard prompt.id != excludingSystemPromptID else { return false }
-      return normalizedName(prompt.slashCommandName) == normalized
+      return normalizedName(prompt.commandName) == normalized
     }) {
       return true
     }
     return userPrompts.contains { prompt in
       guard prompt.id != excludingUserPromptID else { return false }
-      return normalizedName(prompt.slashCommandName) == normalized
+      return normalizedName(prompt.commandName) == normalized
     }
   }
 

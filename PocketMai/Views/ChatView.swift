@@ -2604,7 +2604,9 @@ private struct ChatComposer: View {
   }
 
   private var currentPromptCommandFragment: String? {
-    guard draftText.hasPrefix("/") else { return nil }
+    guard let first = draftText.first, PromptSlashCommand.prefixes.contains(first) else {
+      return nil
+    }
     return PromptSlashCommand.fragment(in: draftText)
   }
 
@@ -2622,7 +2624,7 @@ private struct ChatComposer: View {
     let systemOptions = store.settings.systemPrompts.map { prompt in
       PromptShortcutMenuOption(
         selection: PromptShortcutSelection(kind: .system, id: prompt.id),
-        commandName: prompt.slashCommandName,
+        commandName: prompt.commandName,
         displayName: prompt.displayName,
         detail: "System prompt",
         systemImage: "text.bubble")
@@ -2630,7 +2632,7 @@ private struct ChatComposer: View {
     let userOptions = store.settings.userPrompts.map { prompt in
       PromptShortcutMenuOption(
         selection: PromptShortcutSelection(kind: .user, id: prompt.id),
-        commandName: prompt.slashCommandName,
+        commandName: prompt.commandName,
         displayName: prompt.displayName,
         detail: "User prompt",
         systemImage: "text.quote")

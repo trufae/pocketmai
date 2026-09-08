@@ -31,6 +31,7 @@ func configurationSaveRoundTrip() throws {
       compact: "Summarize this conversation:\n\n{{transcript}}",
       system: ["concise": "Be concise."]),
     ui: ConfiguredTerminalUI(
+      title: "review parser",
       backgroundLine: "magenta",
       foreground: "bright-white",
       promptForeground: "cyan",
@@ -51,6 +52,7 @@ func configurationPromptDefaults() throws {
     from: Data(#"{"version":1}"#.utf8))
 
   #expect(configuration.prompts == nil)
+  #expect(configuration.ui.title.isEmpty)
 }
 
 @Test("Compact prompt templates require the transcript placeholder")
@@ -134,7 +136,8 @@ func catalogEditsStayConsistent() throws {
   let changed = configuration.upsertAgent(helper)
   #expect(changed == ["helper", "main"])
   #expect(configuration.prompts?.system["reviewer"] == "Review diffs briefly.")
-  #expect(configuration.agents.map(\.instructions) == ["Review diffs briefly.", "Review diffs briefly."])
+  #expect(
+    configuration.agents.map(\.instructions) == ["Review diffs briefly.", "Review diffs briefly."])
   #expect(configuration.defaultAgent == "helper")
   try configuration.validate()
 

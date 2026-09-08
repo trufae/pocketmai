@@ -2,7 +2,9 @@
 
 How system prompts are stored, how agents refer to them, and the one-line
 commands that register a prompt, register an agent around it, give it tools,
-and change any of that afterwards.
+and change any of that afterwards. Then the prompts that are messages rather
+than instructions — user prompts, the builtin ones, and skills — and `$NAME`,
+which sends any of them.
 
 ## Named system prompts
 
@@ -50,7 +52,7 @@ are moved.
 ## Commands
 
 ```
-/prompts                     list prompts and which agents use them
+/prompts                     list every prompt by kind, and which agents use each system prompt
 /prompt                      show the current agent's prompt
 /prompt show NAME            print one prompt
 /prompt add NAME TEXT        create a prompt from one line (/prompt set NAME TEXT replaces)
@@ -60,9 +62,65 @@ are moved.
 /agent prompt ID NAME        point another saved agent at a prompt
 ```
 
-`/edit prompt [NAME]` and `/edit NAME` are the older spellings of
-`/prompt edit` and still work. The name is what the commands take everywhere;
-matching is case-insensitive when that leaves exactly one candidate.
+`/edit system [NAME]` and `/edit NAME` are the same as `/prompt edit`, and
+`/edit prompt NAME` opens NAME whichever kind of prompt it is (a system
+prompt or a user prompt); without a name it opens the current agent's system
+prompt. The name is what the commands take everywhere; matching is
+case-insensitive when that leaves exactly one candidate.
+
+## User prompts, builtin prompts, and `$NAME`
+
+A **user prompt** is a message sent by name: text you send often, kept under
+`prompts.user` in the configuration, next to the system prompts. Typing
+`$NAME TEXT` at the chat prompt sends it with `TEXT` where its `$ARGUMENTS`
+placeholder stands, or after the text, separated by a blank line, when it has
+none — the way a skill takes its arguments. `$NAME` is short for
+`/prompts NAME`, and `$` alone lists everything.
+
+```
+pmai> /prompts add commit Write a commit message for the staged changes: $ARGUMENTS
+Created user prompt 'commit': $commit [TEXT] sends it.
+pmai> $commit one line, imperative mood
+```
+
+```json
+"prompts": {
+  "system": { "main": "You are a helpful, concise assistant." },
+  "user": { "commit": "Write a commit message for the staged changes: $ARGUMENTS" }
+}
+```
+
+MaiCore ships four **builtin prompts** — `goal`, `newapp`, `tldr`, and
+`followup` — that are available without configuration, in pmai and in the
+iOS app alike. A user prompt with the same name replaces the builtin one;
+`/edit user tldr` starts from the builtin text, which is how one is adjusted,
+and `/prompts rm tldr` brings the builtin back.
+
+`$NAME` looks the name up in this order: system prompts, user prompts,
+builtin prompts, then **skills** (`doc`: `/skills`), which are sent whether
+or not the current agent may call them as tools — the same as
+`/skills prompt NAME [TEXT]`. A **system prompt** is not a message, so
+`$reviewer` switches the current agent to that prompt (as `/prompt use`
+does) and any text after the name is sent as it is.
+
+```
+/prompts                     list every prompt and skill by kind
+$NAME [TEXT]                 send prompt or skill NAME with TEXT (/prompts NAME [TEXT])
+/prompts show NAME           print what NAME is or sends
+/prompts add NAME TEXT       create a user prompt from one line (set replaces it)
+/prompts edit NAME           edit or create one in $EDITOR (/edit user NAME is the same)
+/prompts rm NAME             drop a user prompt
+```
+
+The words `list`, `show`, `add`, `set`, `edit`, `rm`, and `help` are
+subcommands of `/prompts`, so a prompt with one of those names is sent with
+`/prompts show`-style commands only. A message that must start with `$` can
+be sent inside a `<<EOF` heredoc.
+
+The iOS app keeps the same prompts under Settings: its system prompts and
+user prompts are the same MaiCore types, `/name rest` (or `$name rest`) in
+the composer resolves through the same catalog, and the builtin prompts are
+seeded into its user prompts, where they can be edited or deleted.
 
 ## Registering an agent around a prompt
 

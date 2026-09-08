@@ -69,9 +69,18 @@ describing the information the summary should prioritize. Trimming keeps
 messages through the selected index and removes newer ones; linked tool-call
 transactions are kept structurally valid when removing or trimming messages.
 
-`/prompts` lists the named system prompts and which agents use them, plus the
-compact, delegation, worker, and memory templates. `/prompt` shows the active
-agent's system prompt and `/prompt NAME` points that agent at another one.
+`/prompts` lists every prompt that can be sent by name — the named system
+prompts and which agents use them, the user prompts, the builtin prompts, and
+the skills — plus the compact, delegation, worker, and memory templates.
+`$NAME [TEXT]` (short for `/prompts NAME [TEXT]`) sends prompt or skill `NAME`
+with `TEXT` where its `$ARGUMENTS` stands, or after it; for a system prompt it
+switches the agent to that prompt and then sends `TEXT`. User prompts are
+reusable messages kept under `prompts.user`: `/prompts add NAME TEXT`,
+`/prompts edit NAME` (or `/edit user NAME`), `/prompts show NAME`, and
+`/prompts rm NAME` manage them, and one named like a builtin prompt — `goal`,
+`newapp`, `tldr`, `followup`, shared with the iOS app — replaces it. `/prompt`
+shows the active agent's system prompt and `/prompt NAME` points that agent at
+another one.
 `/prompt add NAME TEXT` creates a prompt from one line, `/prompt edit [NAME]`
 edits or creates one in `$EDITOR`, `/prompt show NAME` prints one, and
 `/prompt rm NAME` drops an unused one. Agents store the association in
@@ -348,6 +357,8 @@ options; `ui.bgline` colors the status line (or the separator), `ui.fgprompt`,
 ANSI colors, `rgb:RGB`, or `none`, while `ui.bold` and `ui.markdown` accept `on`
 or `off`. `ui.toolResultLines` accepts `all` or a line count (the default is
 `all`; `0` restores the compact status-only display).
+`/set ui.title TEXT` adds `[TEXT]` to the prompt and sets the terminal/tab title
+with an ANSI escape sequence; `/set ui.title none` clears the configured label.
 Successful tool results are yellow by default, tool starts remain green, and
 failed results are red. Unified diff removals and additions, including output
 from `files_patch`, use dark red and dark green backgrounds. `/set limits.`
@@ -580,7 +591,8 @@ tools run without approval, and every call reads the file afresh, so editing
 a skill takes effect at once. A skill whose front matter says
 `disable-model-invocation: true` is never offered as a tool.
 
-`/skills prompt NAME [TEXT]` sends the skill's instructions, then `TEXT`, as
+`/skills prompt NAME [TEXT]` — or `$NAME [TEXT]`, which also reaches the
+user and builtin prompts — sends the skill's instructions, then `TEXT`, as
 the next message, whether or not the skill is enabled: a way to use one by
 hand without letting the model decide. Where the body says `$ARGUMENTS` the
 text goes there instead. The message carries the instructions inside a

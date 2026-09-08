@@ -2068,11 +2068,7 @@ final class AppStore: ObservableObject {
         displayText: normalizedDisplayText(shortcutDisplayText, prompt: modelPrompt),
         systemPromptID: target.selection.id)
     case .user:
-      let promptText = target.text.trimmingCharacters(in: .whitespacesAndNewlines)
-      let remainder = slashCommand.remainder.trimmingCharacters(in: .whitespacesAndNewlines)
-      let expanded =
-        promptText.isEmpty ? remainder
-        : (remainder.isEmpty ? promptText : "\(promptText)\n\n\(remainder)")
+      let expanded = UserPrompt.message(text: target.text, arguments: slashCommand.remainder)
       return ResolvedPromptSubmission(
         prompt: expanded,
         displayText: normalizedDisplayText(shortcutDisplayText, prompt: expanded),
@@ -2094,7 +2090,7 @@ final class AppStore: ObservableObject {
       }
       return PromptShortcutTarget(
         selection: selection,
-        commandName: prompt.slashCommandName,
+        commandName: prompt.commandName,
         text: prompt.text)
     case .user:
       guard let prompt = settings.userPrompts.first(where: { $0.id == selection.id }) else {
@@ -2102,29 +2098,22 @@ final class AppStore: ObservableObject {
       }
       return PromptShortcutTarget(
         selection: selection,
-        commandName: prompt.slashCommandName,
+        commandName: prompt.commandName,
         text: prompt.text)
     }
   }
 
+  /// The prompt a typed name means, resolved the way pmai resolves `$name`:
+  /// system prompts first, then user prompts. The builtin prompts are
+  /// already among the user prompts here, so they are not consulted apart.
   private func promptShortcutTarget(command: String) -> PromptShortcutTarget? {
-    let normalized = PromptSlashCommand.normalized(command)
-    guard !normalized.isEmpty else { return nil }
-    let systemTargets = settings.systemPrompts.map { prompt in
-      PromptShortcutTarget(
-        selection: PromptShortcutSelection(kind: .system, id: prompt.id),
-        commandName: prompt.slashCommandName,
-        text: prompt.text)
-    }
-    let userTargets = settings.userPrompts.map { prompt in
-      PromptShortcutTarget(
-        selection: PromptShortcutSelection(kind: .user, id: prompt.id),
-        commandName: prompt.slashCommandName,
-        text: prompt.text)
-    }
-    return (systemTargets + userTargets).first {
-      PromptSlashCommand.normalized($0.commandName) == normalized
-    }
+    let catalog = PromptCatalog(
+      system: settings.systemPrompts, user: settings.userPrompts, builtins: [])
+    guard let entry = catalog.entry(named: command), let id = entry.promptID else { return nil }
+    return PromptShortcutTarget(
+      selection: PromptShortcutSelection(kind: entry.kind == .system ? .system : .user, id: id),
+      commandName: entry.commandName,
+      text: entry.text)
   }
 
   var isOpenAPIServerRunning: Bool {

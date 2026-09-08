@@ -2355,47 +2355,7 @@ extension OpenAIEndpoint {
   }
 }
 
-struct SystemPrompt: Identifiable, Codable, Equatable, Sendable {
-  var id: UUID
-  var name: String
-  var text: String
-
-  init(id: UUID = UUID(), name: String, text: String) {
-    self.id = id
-    self.name = name
-    self.text = text
-  }
-
-  var displayName: String {
-    let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmedName.isEmpty ? "Untitled" : trimmedName
-  }
-
-  var slashCommandName: String {
-    PromptSlashCommand.commandName(for: displayName)
-  }
-}
-
-struct UserPrompt: Identifiable, Codable, Equatable, Sendable {
-  var id: UUID
-  var name: String
-  var text: String
-
-  init(id: UUID = UUID(), name: String, text: String) {
-    self.id = id
-    self.name = name
-    self.text = text
-  }
-
-  var displayName: String {
-    let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmedName.isEmpty ? "Untitled" : trimmedName
-  }
-
-  var slashCommandName: String {
-    PromptSlashCommand.commandName(for: displayName)
-  }
-}
+// SystemPrompt and UserPrompt live in MaiCore, shared with pmai.
 
 enum PromptShortcutKind: String, Sendable {
   case system
@@ -2407,50 +2367,8 @@ struct PromptShortcutSelection: Equatable, Sendable {
   var id: UUID
 }
 
-struct ParsedPromptSlashCommand: Equatable, Sendable {
-  var command: String
-  var remainder: String
-}
-
-enum PromptSlashCommand {
-  static func commandName(for displayName: String) -> String {
-    let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-    let collapsed = trimmed.split(whereSeparator: { $0.isWhitespace }).joined(separator: "-")
-    let sanitized = collapsed.replacingOccurrences(of: "/", with: "-")
-    let command = sanitized.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-    return command.isEmpty ? "prompt" : command
-  }
-
-  static func parse(_ input: String) -> ParsedPromptSlashCommand? {
-    let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard trimmed.hasPrefix("/") else { return nil }
-    let body = trimmed.dropFirst()
-    guard let separator = body.firstIndex(where: { $0.isWhitespace }) else {
-      return ParsedPromptSlashCommand(command: String(body), remainder: "")
-    }
-    let command = String(body[..<separator])
-    let remainder = body[separator...]
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-    return ParsedPromptSlashCommand(command: command, remainder: remainder)
-  }
-
-  static func fragment(in input: String) -> String? {
-    guard let parsed = parse(input) else { return nil }
-    return parsed.command
-  }
-
-  static func normalized(_ command: String) -> String {
-    command.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-  }
-
-  static func visualText(commandName: String, remainder: String) -> String {
-    let trimmedRemainder = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
-    if trimmedRemainder.isEmpty {
-      return "/\(commandName)"
-    }
-    return "/\(commandName) \(trimmedRemainder)"
-  }
-}
+// ParsedPromptSlashCommand and PromptSlashCommand live in MaiCore: a prompt
+// line is read the same way here and in pmai, `/name rest` or `$name rest`.
 
 /// The todo list is shared with pmai: the item, the tools, and the Markdown
 /// form live in MaiCore, and the stored keys are unchanged.
@@ -2950,11 +2868,7 @@ struct NativeToolSettings: Codable, Equatable, Sendable {
 struct FollowUpSettings: Codable, Equatable, Sendable {
   static let suggestionCountRange = 1...6
   static let contextMessageCountRange = 1...20
-  static let defaultPrompt = """
-    Suggest short, natural sentences the user could send next to continue this conversation.
-    Make every option meaningfully different and directly relevant to the assistant's latest response.
-    Write the options in the user's voice, not as advice about what the user should say.
-    """
+  static let defaultPrompt = UserPrompt.followUp.text
 
   var isEnabled: Bool = false
   /// When true, suggestions are generated automatically after each assistant
@@ -3048,47 +2962,12 @@ struct AppSettings: Codable, Equatable, Sendable {
     text:
       "You are a helpful, concise assistant for a private text-only chat app. Prefer clear answers and preserve useful formatting."
   )
-  static let goalUserPrompt = UserPrompt(
-    id: UUID(uuidString: "3E95C9C9-9E2D-4E3F-A7A8-4AD40A69D0B1")!,
-    name: "goal",
-    text: """
-      Treat the request below as a research goal.
-
-      Plan and carry out the research needed to satisfy it. Break the goal into concrete questions, use available tools to gather current evidence, prefer primary sources, corroborate important claims, and follow promising leads. Keep track of uncertainties and conflicting evidence instead of guessing. Continue until the evidence is sufficient or you are genuinely blocked.
-
-      Return a concise synthesis that directly answers the goal, cites or links the sources used, distinguishes facts from inference, and calls out remaining uncertainty. If no research goal follows these instructions, ask for one.
-      """
-  )
-  static let newAppUserPrompt = UserPrompt(
-    id: UUID(uuidString: "22F931EA-0A3F-4F56-A2CA-E385CF5B633E")!,
-    name: "newapp",
-    text: """
-      Build the webxdc app described below. Everything goes in one index.html (inline CSS/JS, no external resources, no network). Include <script src="webxdc.js"></script> in the head — the host provides it, never write that file. Use webxdc_list to check for an existing app to update, then webxdc_create (or reuse), then webxdc_write index.html. Keep the UI simple and mobile-friendly.
-
-      API contract — get this exactly right:
-      - Send: data MUST be wrapped in a payload key: webxdc.sendUpdate({ payload: { action: "roll" } }, "descr"). WRONG: sendUpdate({ action: "roll" }, ...) — the host receives null.
-      - Receive: data arrives under update.payload, already parsed. Top-level reads like update.result are always undefined.
-      - The listener also receives the app's OWN updates — check the payload shape before rendering.
-      - Register the listener at startup; queued updates are replayed then.
-
-      If the app talks to you (the LLM host): when it sends an update you are notified in chat with its payload; reply with the webxdc_send_update tool, payload as a JSON object matching what the listener expects. Design a tiny request/response protocol (e.g. app sends {payload:{action:"generate"}}, you reply {"result":"..."}) and state it in a comment at the top of the script so future turns follow it.
-      """
-  )
-  static let tldrUserPrompt = UserPrompt(
-    id: UUID(uuidString: "A0D22794-D497-4D31-828E-AD79B8B23F25")!,
-    name: "tldr",
-    text: """
-      Take the last message in this chat and respond with few emojis and 1-3 short sentences using bullet points if needed a summary of it. Focus on clarify and concise info for the reader.
-      """
-  )
-  static let followUpUserPrompt = UserPrompt(
-    id: UUID(uuidString: "A8C5AF58-B5D2-48EE-97AA-AC178EAED225")!,
-    name: "followup",
-    text: FollowUpSettings.defaultPrompt
-  )
-  static let defaultUserPrompts = [
-    goalUserPrompt, newAppUserPrompt, tldrUserPrompt, followUpUserPrompt,
-  ]
+  /// The builtin prompts MaiCore ships, seeded into the user prompts once.
+  static let goalUserPrompt = UserPrompt.goal
+  static let newAppUserPrompt = UserPrompt.newApp
+  static let tldrUserPrompt = UserPrompt.tldr
+  static let followUpUserPrompt = UserPrompt.followUp
+  static let defaultUserPrompts = UserPrompt.builtins
   static let defaultCompactPrompt = """
     Compact the transcript below into durable context for continuing the same chat.
 
@@ -3190,7 +3069,7 @@ struct AppSettings: Codable, Equatable, Sendable {
   var followUpPromptText: String {
     userPrompts.first(where: { $0.id == Self.followUpUserPrompt.id })?.text
       ?? userPrompts.first(where: {
-        PromptSlashCommand.normalized($0.slashCommandName) == "followup"
+        PromptSlashCommand.normalized($0.commandName) == "followup"
       })?.text
       ?? followUps.prompt
   }
@@ -3339,11 +3218,11 @@ struct AppSettings: Codable, Equatable, Sendable {
       (try? c.decode([UserPrompt].self, forKey: .userPrompts)) ?? []
     if storedStockPromptsVersion < Self.currentStockPromptsVersion {
       let existingCommands = Set(
-        (systemPrompts.map(\.slashCommandName) + userPrompts.map(\.slashCommandName))
+        (systemPrompts.map(\.commandName) + userPrompts.map(\.commandName))
           .map(PromptSlashCommand.normalized))
       userPrompts.append(
         contentsOf: Self.defaultUserPrompts.filter {
-          !existingCommands.contains(PromptSlashCommand.normalized($0.slashCommandName))
+          !existingCommands.contains(PromptSlashCommand.normalized($0.commandName))
         })
     }
     defaultSystemPromptID =

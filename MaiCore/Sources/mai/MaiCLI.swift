@@ -1652,6 +1652,7 @@ struct MaiCLI {
       await terminal.configureToolResultColor(ui.toolResultForeground)
       await terminal.configureSubagentOutput(ui.subagentOutput)
       await terminal.configurePromptColor(ui.promptForeground)
+      await terminal.configureTerminalTitle(ui.title)
       visual.memory.focus(project: project, chatID: session.id)
       visual.todo.focus(project: project)
       await runtime.configureMemory(visual.memory.promptSection)
@@ -1692,22 +1693,29 @@ struct MaiCLI {
         facts.append("approve? \(who)\(waiting.request.tool.name) [y/a/n/e/c]")
       }
       let detail = facts.isEmpty ? "" : " · " + facts.joined(separator: " · ")
-      // The title goes last so a narrow terminal truncates it, not the status.
+      // The chat title goes last so a narrow terminal truncates it, not the status.
       return
-        "\(activityMarker) \(FileManager.default.currentDirectoryPath) · \(project.displayName) \(promptIdentity(session))\(detail) · \(promptContextStatus(session)) · \(session.title)"
+        "\(activityMarker) \(currentDirectoryName()) · \(project.displayName) \(promptIdentity(session))\(detail) · \(session.title)"
     }
 
     func promptText() -> String {
-      if loop.editingApproval != nil { return "json> " }
-      if let waiting = loop.approvals.first {
+      let prompt: String
+      if loop.editingApproval != nil {
+        prompt = "json> "
+      } else if let waiting = loop.approvals.first {
         let who = waiting.request.run.pid.map { "#\($0.rawValue) " } ?? ""
-        return "approve \(who)\(waiting.request.tool.name)? [y/a/n/e/c] "
+        prompt = "approve \(who)\(waiting.request.tool.name)? [y/a/n/e/c] "
+      } else if case .agent(let pid) = loop.focus {
+        // The prompt names the process a line goes to: a focused child, or the
+        // chat's own once it has run, so its pid is at hand for /agents commands.
+        prompt = "pmai#\(pid.rawValue)> "
+      } else if let pid = chatProcessIDs[session.id] {
+        prompt = "pmai#\(pid.rawValue)> "
+      } else {
+        prompt = "pmai> "
       }
-      // The prompt names the process a line goes to: a focused child, or the
-      // chat's own once it has run, so its pid is at hand for /agents commands.
-      if case .agent(let pid) = loop.focus { return "pmai#\(pid.rawValue)> " }
-      if let pid = chatProcessIDs[session.id] { return "pmai#\(pid.rawValue)> " }
-      return "pmai> "
+      let title = visibleUITitle(configuration?.ui.title ?? "")
+      return title.isEmpty ? prompt : "[\(title)] \(prompt)"
     }
 
     func refreshStatus() async {
@@ -2128,7 +2136,12 @@ struct MaiCLI {
       switch event {
       case .line(let raw, let heredoc):
         loop.readerParked = true
-        let text = heredoc ? raw : raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let typed = heredoc ? raw : raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // `$NAME [TEXT]` is the short form of `/prompts NAME [TEXT]`.
+        let text =
+          !heredoc && typed.hasPrefix("$")
+          ? ("/prompts " + typed.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+          : typed
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
           await releaseIfIdle(workspace: workspace)
           continue
@@ -2215,6 +2228,38 @@ struct MaiCLI {
               await terminal.note("A turn is already running; Ctrl+C cancels it.")
             } else {
               await continueTurn()
+            }
+            await releaseIfIdle(workspace: workspace)
+            continue
+          }
+          if name == "/prompts" {
+            let before = REPLCommandSnapshot(session: session, configuration: configuration)
+            switch await handlePromptsCommand(
+              argument,
+              session: session,
+              configuration: &configuration,
+              configurationPath: visual.configurationPath,
+              skills: visual.skills.catalog,
+              terminal: terminal)
+            {
+            case .handled:
+              break
+            case .send(let message, let title):
+              session.refreshTitle(from: title)
+              await deliver(message, to: loop.focus)
+            case .selectSystemPrompt(let promptName, let message):
+              await selectSystemPrompt(
+                promptName,
+                session: &session,
+                runtime: runtime,
+                configuration: &configuration,
+                configurationPath: visual.configurationPath,
+                terminal: terminal)
+              session.touch()
+              workspace.upsert(session.chat, selecting: true)
+              await saveWorkspace(&workspace, store: store, terminal: terminal)
+              await noteTurnEffects(since: before)
+              if let message { await deliver(message, to: loop.focus) }
             }
             await releaseIfIdle(workspace: workspace)
             continue
@@ -2694,12 +2739,26 @@ struct MaiCLI {
     }
   }
 
-  /// The agent and model a chat runs on, as `[agent] model`. The provider
-  /// stands in while no model is selected.
+  /// The agent, estimated context, and model a chat runs on. The context is
+  /// deliberately immediately before the model so it stays easy to compare.
   private static func promptIdentity(_ session: REPLSession) -> String {
     let profile = session.profile
     let model = profile.model.isEmpty ? profile.provider.rawValue : profile.model
-    return "[\(profile.agentID)] \(model)"
+    return "[\(profile.agentID)] · \(promptContextStatus(session)) · \(model)"
+  }
+
+  /// The final component of the working directory, with a useful root label.
+  private static func currentDirectoryName() -> String {
+    let path = FileManager.default.currentDirectoryPath
+    if path == "/" { return path }
+    let name = URL(fileURLWithPath: path, isDirectory: true).lastPathComponent
+    return name.isEmpty ? path : name
+  }
+
+  /// Removes terminal controls from the configured label before showing it.
+  private static func visibleUITitle(_ title: String) -> String {
+    String(title.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) })
+      .trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
   /// One Unicode Braille pattern makes a compact, lively activity marker.
@@ -2881,7 +2940,21 @@ struct MaiCLI {
         configurationPath: visual.configurationPath,
         terminal: terminal)
     case "/prompts":
-      await showPrompts(session: session, configuration: configuration, terminal: terminal)
+      // The REPL loop answers /prompts before it gets here, so a prompt can
+      // be sent; from anywhere else the catalog is listed and kept.
+      switch await handlePromptsCommand(
+        argument,
+        session: session,
+        configuration: &configuration,
+        configurationPath: visual.configurationPath,
+        skills: visual.skills.catalog,
+        terminal: terminal)
+      {
+      case .handled:
+        break
+      case .send, .selectSystemPrompt:
+        await terminal.line("Use $NAME [TEXT] or /prompts NAME [TEXT] at the chat prompt.")
+      }
     case "/prompt":
       await handlePromptCommand(
         argument,
@@ -2889,6 +2962,7 @@ struct MaiCLI {
         runtime: runtime,
         configuration: &configuration,
         configurationPath: visual.configurationPath,
+        skills: visual.skills.catalog,
         terminal: terminal)
     case "/chat":
       await handleChatCommand(
@@ -3648,34 +3722,278 @@ struct MaiCLI {
     }
   }
 
+  /// `/prompts`: every prompt a name can run here, by kind, then the
+  /// templates that are not run by name.
   private static func showPrompts(
     session: REPLSession,
     configuration: MaiConfiguration?,
+    skills: AgentSkillCatalog,
     terminal: TerminalWriter
   ) async {
-    let compact = configuration?.prompts?.compact?.trimmingCharacters(
-      in: .whitespacesAndNewlines)
-    let delegation = configuration?.prompts?.delegation?.trimmingCharacters(
-      in: .whitespacesAndNewlines)
-    let worker = configuration?.prompts?.worker?.trimmingCharacters(in: .whitespacesAndNewlines)
-    let memoryPrompt = configuration?.prompts?.memory?.trimmingCharacters(
-      in: .whitespacesAndNewlines)
-    var lines = [
-      "Prompts:",
-      "  compact     compact     \(compact?.isEmpty == false ? "custom" : "built-in")",
-      "  delegation  delegation  \(delegation?.isEmpty == false ? "custom" : "built-in")",
-      "  worker      delegation  \(worker?.isEmpty == false ? "custom" : "built-in")",
-      "  memory      memory      \(memoryPrompt?.isEmpty == false ? "custom" : "built-in")",
-    ]
-    let prompts = configuration?.prompts?.system ?? [:]
-    for name in prompts.keys.sorted() {
-      let selected = session.profile.systemPrompt == name ? "*" : " "
-      let agents = configuration?.agents.filter { $0.systemPrompt == name }.map(\.id).sorted() ?? []
-      let usage = agents.isEmpty ? "unused" : "agents: \(agents.joined(separator: ", "))"
-      lines.append("\(selected) \(name)  system  \(usage)")
+    let catalog =
+      configuration?.promptCatalog(skills: skills.skills) ?? PromptCatalog(skills: skills.skills)
+    let width = max(10, catalog.entries.map { $0.commandName.count }.max() ?? 0)
+    func row(_ marker: String, _ name: String, _ detail: String) -> String {
+      "\(marker) \(name.padding(toLength: width, withPad: " ", startingAt: 0))  \(detail)"
     }
-    if prompts.isEmpty { lines.append("  No named system prompts.") }
+    var lines = [
+      "System prompts — an agent's instructions (/prompt manages them; $NAME switches this agent to one):"
+    ]
+    let system = catalog.entries(of: .system)
+    for entry in system {
+      let selected = session.profile.systemPrompt == entry.name ? "*" : " "
+      let agents = configuration?.agentsUsingSystemPrompt(entry.name) ?? []
+      lines.append(
+        row(
+          selected, entry.commandName,
+          agents.isEmpty ? "unused" : "agents: \(agents.joined(separator: ", "))"))
+    }
+    if system.isEmpty { lines.append("  None; /prompt add NAME TEXT creates one.") }
+    lines.append(
+      "User prompts — messages sent by name (prompts.user; /prompts add NAME TEXT, /edit user NAME):"
+    )
+    let user = catalog.entries(of: .user)
+    for entry in user { lines.append(row(" ", entry.commandName, entry.summary)) }
+    if user.isEmpty { lines.append("  None yet.") }
+    let userCommands = Set(user.map { PromptSlashCommand.normalized($0.commandName) })
+    lines.append("Builtin prompts — MaiCore's; a user prompt of the same name replaces one:")
+    for entry in catalog.entries(of: .builtin) {
+      let replaced = userCommands.contains(PromptSlashCommand.normalized(entry.commandName))
+      lines.append(
+        row(" ", entry.commandName, replaced ? "replaced by the user prompt above" : entry.summary))
+    }
+    lines.append("Skills — /skills; $NAME sends one whether or not this agent may call it:")
+    let skillEntries = catalog.entries(of: .skill)
+    for entry in skillEntries { lines.append(row(" ", entry.commandName, entry.summary)) }
+    if skillEntries.isEmpty { lines.append("  None found; /skills path lists the folders read.") }
+    let templates: [(String, String?)] = [
+      ("compact", configuration?.prompts?.compact),
+      ("delegation", configuration?.prompts?.delegation),
+      ("worker", configuration?.prompts?.worker),
+      ("memory", configuration?.prompts?.memory),
+    ]
+    lines.append(
+      "Templates — not sent by name; /edit compact, /edit delegation, /edit worker, /edit memory-prompt:"
+    )
+    for (name, text) in templates {
+      let custom = text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+      lines.append(row(" ", name, custom ? "custom" : "built-in"))
+    }
+    lines.append(
+      "$NAME [TEXT] sends a prompt with TEXT after it (/prompts NAME [TEXT] is the long form); /prompts show NAME prints one."
+    )
     await terminal.line(lines.joined(separator: "\n"))
+  }
+
+  /// What the REPL loop does after `/prompts`: nothing more, send a
+  /// message, or switch the agent to a system prompt and then send one.
+  private enum PromptsCommandOutcome {
+    case handled
+    case send(String, title: String)
+    case selectSystemPrompt(String, then: String?)
+  }
+
+  /// `/prompts` — and `$`, its short form — in full: the catalog listed, one
+  /// prompt shown, user prompts kept from one line, and a name with words
+  /// after it sent as a message. A system prompt is not a message: the agent
+  /// is switched to it, and the words after the name are sent as they are.
+  private static func handlePromptsCommand(
+    _ argument: String,
+    session: REPLSession,
+    configuration: inout MaiConfiguration?,
+    configurationPath: String?,
+    skills: AgentSkillCatalog,
+    terminal: TerminalWriter
+  ) async -> PromptsCommandOutcome {
+    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
+      String.init)
+    let action = fields.first ?? ""
+    let rest = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+    let catalog =
+      configuration?.promptCatalog(skills: skills.skills) ?? PromptCatalog(skills: skills.skills)
+
+    switch action.lowercased() {
+    case "", "list", "ls":
+      await showPrompts(
+        session: session, configuration: configuration, skills: skills, terminal: terminal)
+
+    case "help":
+      await terminal.line(promptHelp)
+
+    case "show", "cat":
+      guard !rest.isEmpty else {
+        await terminal.line("Usage: /prompts show NAME")
+        return .handled
+      }
+      guard let entry = catalog.entry(named: rest) else {
+        await terminal.line("Unknown prompt '\(rest)'. /prompts lists them.")
+        return .handled
+      }
+      let heading: String
+      let text: String
+      switch entry.kind {
+      case .system:
+        let users = configuration?.agentsUsingSystemPrompt(entry.name) ?? []
+        heading =
+          "System prompt '\(entry.name)' — \(users.isEmpty ? "unused" : "agents: \(users.joined(separator: ", "))"); $\(entry.commandName) [TEXT] switches this agent to it."
+        text = entry.text
+      case .skill:
+        heading = "Skill '\(entry.name)' — \(entry.summary); $\(entry.commandName) [TEXT] sends:"
+        text = entry.message(arguments: "") ?? entry.text
+      case .user, .builtin:
+        let label = entry.kind.label.prefix(1).uppercased() + entry.kind.label.dropFirst()
+        heading = "\(label) '\(entry.name)'; $\(entry.commandName) [TEXT] sends:"
+        text = entry.text
+      }
+      await terminal.line(heading)
+      await terminal.line(text.isEmpty ? "(empty)" : text)
+
+    case "add", "set", "new", "create":
+      let parts = rest.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(String.init)
+      guard parts.count == 2 else {
+        await terminal.line("Usage: /prompts \(action) NAME TEXT")
+        return .handled
+      }
+      await storeUserPrompt(
+        named: parts[0],
+        text: parts[1].trimmingCharacters(in: .whitespacesAndNewlines),
+        configuration: &configuration,
+        configurationPath: configurationPath,
+        terminal: terminal)
+
+    case "edit":
+      guard !rest.isEmpty else {
+        await terminal.line("Usage: /prompts edit NAME   (/edit user NAME is the same)")
+        return .handled
+      }
+      await editUserPrompt(
+        named: rest,
+        configuration: &configuration,
+        configurationPath: configurationPath,
+        terminal: terminal)
+
+    case "remove", "rm", "delete", "del":
+      guard !rest.isEmpty else {
+        await terminal.line("Usage: /prompts rm NAME")
+        return .handled
+      }
+      guard var draft = configuration, let configurationPath else {
+        await terminal.line("error: No writable configuration is active.", to: .standardError)
+        return .handled
+      }
+      guard let name = draft.userPromptName(matching: rest) else {
+        let hint =
+          catalog.entry(named: rest).map {
+            switch $0.kind {
+            case .system: " '\(rest)' is a system prompt: /prompt rm drops one."
+            case .builtin:
+              " '\(rest)' is a builtin prompt, which stays; a user prompt of that name replaces it."
+            case .skill: " '\(rest)' is a skill: remove its folder (/skills path)."
+            case .user: ""
+            }
+          } ?? ""
+        await terminal.line("Unknown user prompt '\(rest)'. /prompts lists them.\(hint)")
+        return .handled
+      }
+      draft.removeUserPrompt(name)
+      do {
+        try draft.save(to: URL(fileURLWithPath: configurationPath))
+        configuration = draft
+        let command = PromptSlashCommand.commandName(for: name)
+        let uncovered = UserPrompt.builtins.contains {
+          PromptSlashCommand.normalized($0.commandName) == PromptSlashCommand.normalized(command)
+        }
+        await terminal.line(
+          "Removed user prompt '\(name)'."
+            + (uncovered ? " The builtin prompt of that name is back." : ""))
+      } catch {
+        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
+      }
+
+    default:
+      guard let entry = catalog.entry(named: action) else {
+        await terminal.line(
+          "Unknown prompt '\(action)'. /prompts lists them; a message that starts with $ can be sent inside <<EOF."
+        )
+        return .handled
+      }
+      switch entry.kind {
+      case .system:
+        return .selectSystemPrompt(entry.name, then: rest.isEmpty ? nil : rest)
+      case .user, .builtin, .skill:
+        return .send(entry.message(arguments: rest) ?? rest, title: "\(entry.name) \(rest)")
+      }
+    }
+    return .handled
+  }
+
+  @discardableResult
+  private static func storeUserPrompt(
+    named name: String,
+    text: String,
+    configuration: inout MaiConfiguration?,
+    configurationPath: String?,
+    terminal: TerminalWriter
+  ) async -> Bool {
+    guard var draft = configuration, let configurationPath else {
+      await terminal.line("error: No writable configuration is active.", to: .standardError)
+      return false
+    }
+    let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedName.isEmpty else {
+      await terminal.line("A user prompt needs a name.")
+      return false
+    }
+    let created = draft.setUserPrompt(trimmedName, text: text)
+    do {
+      try draft.save(to: URL(fileURLWithPath: configurationPath))
+      configuration = draft
+      let command = PromptSlashCommand.commandName(for: trimmedName)
+      let replaces = UserPrompt.builtins.contains {
+        PromptSlashCommand.normalized($0.commandName) == PromptSlashCommand.normalized(command)
+      }
+      await terminal.line(
+        "\(created ? "Created" : "Saved") user prompt '\(trimmedName)': $\(command) [TEXT] sends it"
+          + (replaces ? " instead of the builtin prompt of that name." : "."))
+      return true
+    } catch {
+      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
+      return false
+    }
+  }
+
+  /// Opens a user prompt in the editor; a new one named like a builtin
+  /// prompt starts from the builtin's text, which is how one is adjusted.
+  private static func editUserPrompt(
+    named requested: String,
+    configuration: inout MaiConfiguration?,
+    configurationPath: String?,
+    terminal: TerminalWriter
+  ) async {
+    guard configuration != nil, configurationPath != nil else {
+      await terminal.line("error: No writable configuration is active.", to: .standardError)
+      return
+    }
+    let trimmed = requested.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      await terminal.line("Usage: /edit user NAME")
+      return
+    }
+    let name = configuration?.userPromptName(matching: trimmed) ?? trimmed
+    let command = PromptSlashCommand.normalized(PromptSlashCommand.commandName(for: name))
+    let previous =
+      configuration?.prompts?.user[name]
+      ?? UserPrompt.builtins.first { PromptSlashCommand.normalized($0.commandName) == command }?
+      .text ?? ""
+    guard
+      let edited = await editTemporaryText(previous, suffix: "user-prompt.md", terminal: terminal)
+    else { return }
+    await storeUserPrompt(
+      named: name,
+      text: edited.trimmingCharacters(in: .whitespacesAndNewlines),
+      configuration: &configuration,
+      configurationPath: configurationPath,
+      terminal: terminal)
   }
 
   /// `/prompt` in full: named system prompts are created, edited, dropped,
@@ -3687,6 +4005,7 @@ struct MaiCLI {
     runtime: AgentRuntime,
     configuration: inout MaiConfiguration?,
     configurationPath: String?,
+    skills: AgentSkillCatalog,
     terminal: TerminalWriter
   ) async {
     let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
@@ -3702,7 +4021,8 @@ struct MaiCLI {
         session.profile.instructions.isEmpty ? "(empty)" : session.profile.instructions)
 
     case "list", "ls":
-      await showPrompts(session: session, configuration: configuration, terminal: terminal)
+      await showPrompts(
+        session: session, configuration: configuration, skills: skills, terminal: terminal)
 
     case "show", "cat":
       let requested = rest.isEmpty ? session.profile.systemPrompt ?? "" : rest
@@ -4006,7 +4326,7 @@ struct MaiCLI {
     let actionArgument = fields.count == 2 ? fields[1] : ""
 
     switch action {
-    case "prompt", "system":
+    case "system":
       await editSystemPrompt(
         named: actionArgument.isEmpty
           ? session.profile.systemPrompt ?? session.profile.agentID : actionArgument,
@@ -4015,6 +4335,61 @@ struct MaiCLI {
         configuration: &configuration,
         configurationPath: configurationPath,
         terminal: terminal)
+
+    case "user", "userprompt":
+      guard !actionArgument.isEmpty else {
+        await terminal.line("Usage: /edit user NAME")
+        return
+      }
+      await editUserPrompt(
+        named: actionArgument,
+        configuration: &configuration,
+        configurationPath: configurationPath,
+        terminal: terminal)
+
+    case "prompt":
+      // Without a name, the current agent's system prompt. With one, the
+      // prompt of that name, whichever kind it is; a system prompt and a
+      // user prompt are different things, so a new one is created with
+      // /edit system NAME or /edit user NAME.
+      guard !actionArgument.isEmpty else {
+        await editSystemPrompt(
+          named: session.profile.systemPrompt ?? session.profile.agentID,
+          session: &session,
+          runtime: runtime,
+          configuration: &configuration,
+          configurationPath: configurationPath,
+          terminal: terminal)
+        return
+      }
+      let wanted = PromptSlashCommand.normalized(actionArgument)
+      if let name = resolvedSystemPromptName(actionArgument, configuration: configuration) {
+        await editSystemPrompt(
+          named: name,
+          session: &session,
+          runtime: runtime,
+          configuration: &configuration,
+          configurationPath: configurationPath,
+          terminal: terminal)
+      } else if let name = configuration?.userPromptName(matching: actionArgument) {
+        await editUserPrompt(
+          named: name,
+          configuration: &configuration,
+          configurationPath: configurationPath,
+          terminal: terminal)
+      } else if UserPrompt.builtins.contains(where: {
+        PromptSlashCommand.normalized($0.commandName) == wanted
+      }) {
+        await editUserPrompt(
+          named: actionArgument,
+          configuration: &configuration,
+          configurationPath: configurationPath,
+          terminal: terminal)
+      } else {
+        await terminal.line(
+          "No prompt named '\(actionArgument)'. /edit system NAME creates a system prompt, /edit user NAME a user prompt; /prompts lists both."
+        )
+      }
 
     case "agent":
       await editAgentDefinition(
@@ -4216,6 +4591,14 @@ struct MaiCLI {
           named: name,
           session: &session,
           runtime: runtime,
+          configuration: &configuration,
+          configurationPath: configurationPath,
+          terminal: terminal)
+        return
+      }
+      if let name = configuration?.userPromptName(matching: target) {
+        await editUserPrompt(
+          named: name,
           configuration: &configuration,
           configurationPath: configurationPath,
           terminal: terminal)
@@ -5667,11 +6050,13 @@ struct MaiCLI {
       let options = configuredOptions(for: group, configuration: configuration)
       await terminal.line("")
       await terminal.line(
-        paint("Settings", "1;36") + paint(", changed with /tools set \(group.id) OPTION VALUE:", "2"))
+        paint("Settings", "1;36")
+          + paint(", changed with /tools set \(group.id) OPTION VALUE:", "2"))
       for option in group.options {
         let value = options[option.id] ?? option.defaultValue
         var line =
-          "  " + paint(option.id, "32") + " = " + paint(displayedOption(value, kind: option.kind), "1")
+          "  " + paint(option.id, "32") + " = "
+          + paint(displayedOption(value, kind: option.kind), "1")
           + "  " + paint("\(option.label).", "2")
         if let help = option.help?.trimmingCharacters(in: .whitespacesAndNewlines), !help.isEmpty {
           line += " " + paint(help, "2")
@@ -6272,12 +6657,13 @@ struct MaiCLI {
     let booleanKeys = ["ui.bold", "ui.markdown"]
     let countKeys = ["ui.toolresultlines"]
     let levelKeys = ["ui.subagents"]
+    let textKeys = ["ui.title"]
     guard
       colorKeys.contains(key) || booleanKeys.contains(key) || countKeys.contains(key)
-        || levelKeys.contains(key)
+        || levelKeys.contains(key) || textKeys.contains(key)
     else {
       await terminal.line(
-        "Unknown setting '\(parts[0])'. Available settings: effort, yolo, delegation, tool.calling, tool.proxy, limits.maxToolCalls, limits.maxModelTurns, limits.maxSubagents, limits.maxSubagentDepth, limits.maxTotalTokens, limits.maxSeconds, retry.attempts, retry.delay, ctx.compact, ctx.strategy, ui.bgline, ui.fgcolor, ui.bgcolor, ui.fgprompt, ui.bgprompt, ui.fgtoolresult, ui.bold, ui.markdown, ui.toolResultLines, ui.subagents, use.agentsmd, use.plan"
+        "Unknown setting '\(parts[0])'. Available settings: effort, yolo, delegation, tool.calling, tool.proxy, limits.maxToolCalls, limits.maxModelTurns, limits.maxSubagents, limits.maxSubagentDepth, limits.maxTotalTokens, limits.maxSeconds, retry.attempts, retry.delay, ctx.compact, ctx.strategy, ui.title, ui.bgline, ui.fgcolor, ui.bgcolor, ui.fgprompt, ui.bgprompt, ui.fgtoolresult, ui.bold, ui.markdown, ui.toolResultLines, ui.subagents, use.agentsmd, use.plan"
       )
       return
     }
@@ -6286,11 +6672,14 @@ struct MaiCLI {
       await terminal.line("\(displayedKey) = \(uiSetting(key, in: ui))")
       return
     }
-    guard parts.count == 2 else {
+    guard parts.count == 2 || textKeys.contains(key) else {
       await terminal.line("Usage: /set \(key) VALUE")
       return
     }
-    if countKeys.contains(key) {
+    if textKeys.contains(key) {
+      let title = parts.dropFirst().joined(separator: " ")
+      ui.title = ["none", "off"].contains(title.lowercased()) ? "" : title
+    } else if countKeys.contains(key) {
       let value: Int
       if parts[1].lowercased() == "all" {
         value = -1
@@ -6350,6 +6739,7 @@ struct MaiCLI {
     do {
       try draft.save(to: URL(fileURLWithPath: configurationPath))
       configuration = draft
+      if textKeys.contains(key) { await terminal.configureTerminalTitle(ui.title) }
       await terminal.line("Set \(displayedKey) = \(uiSetting(key, in: ui)).")
     } catch {
       await terminal.line("error: \(error.localizedDescription)", to: .standardError)
@@ -6518,7 +6908,8 @@ struct MaiCLI {
       runtime: runtime,
       terminal: terminal)
     {
-      await terminal.line("Set ctx.strategy = \(mode.rawValue) for agent '\(session.profile.agentID)'.")
+      await terminal.line(
+        "Set ctx.strategy = \(mode.rawValue) for agent '\(session.profile.agentID)'.")
     }
   }
 
@@ -6982,7 +7373,7 @@ struct MaiCLI {
 
   private static func listUISettings(_ ui: ConfiguredTerminalUI, terminal: TerminalWriter) async {
     for key in [
-      "ui.bgline", "ui.fgcolor", "ui.bgcolor", "ui.fgprompt", "ui.bgprompt", "ui.bold",
+      "ui.title", "ui.bgline", "ui.fgcolor", "ui.bgcolor", "ui.fgprompt", "ui.bgprompt", "ui.bold",
       "ui.fgtoolresult", "ui.markdown", "ui.toolResultLines", "ui.subagents",
     ] {
       await terminal.line("\(key) = \(uiSetting(key, in: ui))")
@@ -6992,6 +7383,7 @@ struct MaiCLI {
   private static func uiSetting(_ key: String, in ui: ConfiguredTerminalUI) -> String {
     let value: String
     switch key.lowercased() {
+    case "ui.title": value = ui.title
     case "ui.bgline": value = ui.backgroundLine
     case "ui.fgcolor": value = ui.foreground
     case "ui.bgcolor": value = ui.background
@@ -8551,7 +8943,8 @@ struct MaiCLI {
       "/set tool.", "/set tool.calling automatic", "/set tool.calling native",
       "/set tool.calling text", "/set tool.calling xml", "/set tool.calling json",
       "/set tool.proxy on", "/set tool.proxy off",
-      "/set ui.bgline rgb:024", "/set ui.bgline none", "/set ui.fgprompt yellow",
+      "/set ui.title ", "/set ui.title none", "/set ui.bgline rgb:024", "/set ui.bgline none",
+      "/set ui.fgprompt yellow",
       "/set ui.fgcolor none", "/set ui.bgcolor none", "/set ui.bgprompt none",
       "/set ui.fgtoolresult yellow", "/set use.", "/set use.agentsmd on", "/set use.agentsmd off",
       "/set use.plan on", "/set use.plan off",
@@ -8560,11 +8953,13 @@ struct MaiCLI {
       "/cwd", "/pwd", "/cd ", "/plugins",
       "/providers", "/models ", "/provider ", "/baseurl ", "/model ", "/prompts", "/prompt",
       "/prompt list", "/prompt show ", "/prompt add ", "/prompt set ", "/prompt edit ",
-      "/prompt rm ", "/prompt use ", "/help prompts",
+      "/prompt rm ", "/prompt use ", "/help prompts", "/prompts list", "/prompts show ",
+      "/prompts add ", "/prompts edit ", "/prompts rm ", "/edit user ", "/edit system ",
       "/agents", "/agents tree", "/agents clear", "/agents log ", "/agents kill ", "/agents focus ",
       "/agents focus main", "/queue", "/queue push ", "/queue pop", "/queue drop",
       "/help queue", "/help export", "/export markdown ", "/export json ", "/export debug ",
-      "/stats", "/stats ranking", "/stats speed", "/stats time", "/stats efficiency", "/stats show ",
+      "/stats", "/stats ranking", "/stats speed", "/stats time", "/stats efficiency",
+      "/stats show ",
       "/stats reset", "/stats rm ", "/stats path", "/help stats",
       "/export epub ", "/export docx ", "/set ui.subagents all", "/set ui.subagents tools",
       "/set ui.subagents stats", "/set ui.subagents none",
@@ -8623,6 +9018,17 @@ struct MaiCLI {
         values.append("/skills enable \(skill.name)")
         values.append("/skills disable \(skill.name)")
       }
+    }
+    let catalog = configuration?.promptCatalog(skills: skills) ?? PromptCatalog(skills: skills)
+    for entry in catalog.entries {
+      values.append("$\(entry.commandName) ")
+      values.append("/prompts \(entry.commandName) ")
+      values.append("/prompts show \(entry.commandName)")
+    }
+    for name in (configuration?.prompts?.user ?? [:]).keys.sorted() {
+      values.append("/prompts edit \(name)")
+      values.append("/prompts rm \(name)")
+      values.append("/edit user \(name)")
     }
     var groupNames = Set(workspace.chats.flatMap(\.primaryAgent.toolGroupNames))
     if skills.contains(where: \.isModelInvocable) { groupNames.insert(MaiSkillTools.groupID) }
@@ -8854,7 +9260,8 @@ struct MaiCLI {
     /continue           Pick a paused or interrupted task up where it stopped (/retry is the same)
     /memory             Show, edit, learn, or scope this project's durable memory
     /todo               Show, add to, tick off, or edit this project's todo list
-    /prompt[s]          Manage named system prompts; /help prompt lists commands
+    /prompts            List every prompt and skill; $NAME [TEXT] sends one (/help prompt)
+    /prompt             Manage named system prompts; /help prompt lists commands
     /chat               List, switch, archive, rename, or edit this project's chats
     /project            Show, list, rename, or tint the project (the start directory)
     /edit TARGET        Edit a prompt, agent, config, MCP list, or message in $EDITOR
@@ -8876,6 +9283,7 @@ struct MaiCLI {
     Input: Shift+Enter adds a line (Alt+Enter or Ctrl+J where the terminal sends Enter for it)
            A paste keeps its lines · Enter sends the whole text
            <<WORD starts a multiline message ending at WORD alone
+           $NAME [TEXT] sends a prompt or skill by name; /prompts lists them
            !COMMAND runs a line in the system shell (interactive programs work)
            Up/Down or Ctrl+P/N move between lines, then history · Ctrl+R reverse search
            Ctrl+A/E or Home/End beginning/end of the line
@@ -8923,6 +9331,7 @@ struct MaiCLI {
       /set ctx.compact <off|N|Nk>  Summarize older exchanges once the chat holds ~N tokens
       /set ctx.strategy <cache|size>  Keep prompt-cache history intact, or compact old file reads
       /set ui.                     List terminal UI settings
+      /set ui.title TEXT           Set the prompt label and terminal/tab title (`none` clears it)
       /set ui.bgline COLOR         Set the input-line background
       /set ui.fgcolor COLOR        Set the input foreground
       /set ui.bgcolor COLOR        Set the input background
@@ -9011,8 +9420,10 @@ struct MaiCLI {
     """
 
   private static let editHelp = """
-    /edit prompt [NAME]      Edit/create a named system prompt (current when omitted)
-    /edit NAME               Edit an existing named system prompt
+    /edit prompt [NAME]      Edit the prompt called NAME, system or user (current agent's when omitted)
+    /edit system [NAME]      Edit/create a named system prompt (current when omitted)
+    /edit user NAME          Edit/create a user prompt; a builtin's name starts from its text
+    /edit NAME               Edit an existing system or user prompt
     /edit agent [ID]         Edit a saved agent as JSON (current when omitted)
     /edit provider [ID]      Edit a configured provider as JSON (current when omitted)
     /edit compact            Edit the global chat-compaction prompt template
@@ -9101,23 +9512,41 @@ struct MaiCLI {
     """
 
   private static let promptHelp = """
-    Named system prompts. Every agent takes its instructions from one prompt
-    in the catalog (prompts.system in the configuration), referenced by name
-    in its systemPrompt field; several agents may share one, and editing the
-    prompt updates all of them.
+    Prompts. A system prompt is an agent's instructions: every agent takes
+    them from one prompt in the catalog (prompts.system in the configuration),
+    referenced by name in its systemPrompt field; several agents may share
+    one, and editing the prompt updates all of them. A user prompt is a
+    message sent by name (prompts.user), and MaiCore ships builtin ones —
+    goal, newapp, tldr, followup — that a user prompt of the same name
+    replaces. Skills (/skills) are sent by name the same way, whether or not
+    the agent may call them as tools.
 
-      /prompts                   List prompts and which agents use them
-      /prompt                    Show the current agent's prompt
-      /prompt show NAME          Print one prompt
-      /prompt add NAME TEXT      Create a prompt from one line (set replaces it)
-      /prompt edit [NAME]        Edit or create one in $EDITOR (current when omitted)
-      /prompt rm NAME            Drop an unused prompt
-      /prompt use NAME           Point the current agent at a prompt (/prompt NAME too)
-      /agent prompt ID NAME      Point another saved agent at a prompt
+      /prompts                   List every prompt and skill by kind
+      $NAME [TEXT]               Send prompt or skill NAME with TEXT after it: TEXT goes
+                                 where $ARGUMENTS stands, or after the text. For a
+                                 system prompt, switch this agent to it, then send TEXT.
+                                 /prompts NAME [TEXT] is the long form.
+      /prompts show NAME         Print what NAME is or sends
+      /prompts add NAME TEXT     Create a user prompt from one line (set replaces it)
+      /prompts edit NAME         Edit or create a user prompt in $EDITOR (/edit user NAME too)
+      /prompts rm NAME           Drop a user prompt (a builtin it replaced shows again)
+
+      /prompt                    Show the current agent's system prompt
+      /prompt show NAME          Print one system prompt
+      /prompt add NAME TEXT      Create a system prompt from one line (set replaces it)
+      /prompt edit [NAME]        Edit or create one in $EDITOR (current when omitted; /edit system NAME too)
+      /prompt rm NAME            Drop an unused system prompt
+      /prompt use NAME           Point the current agent at a system prompt (/prompt NAME too)
+      /agent prompt ID NAME      Point another saved agent at a system prompt
+      /edit prompt NAME          Edit NAME, whichever kind of prompt it is
 
     Register an agent around a prompt in two lines:
       /prompt add reviewer You review diffs and list only real defects.
       /agent add reviewer - files,run reviewer
+
+    Keep a message you send often as a user prompt:
+      /prompts add commit Write a commit message for the staged changes: $ARGUMENTS
+      $commit one line, imperative mood
 
     The other templates — compact, delegation, worker, memory — are edited
     with /edit compact, /edit delegation, /edit worker, and /edit memory-prompt.

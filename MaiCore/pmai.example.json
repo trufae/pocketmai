@@ -221,6 +221,7 @@
     }
   ],
   "ui": {
+    "title": "",
     "bgline": "rgb:024",
     "fgprompt": "yellow",
     "fgcolor": "",

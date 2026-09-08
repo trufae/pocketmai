@@ -438,6 +438,8 @@ public enum SubagentOutputLevel: String, Codable, CaseIterable, Sendable {
 }
 
 public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
+  /// Optional label shown in the REPL prompt and used as the terminal window title.
+  public var title: String
   public var backgroundLine: String
   public var foreground: String
   public var background: String
@@ -454,6 +456,7 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
   public var subagentOutput: SubagentOutputLevel
 
   public init(
+    title: String = "",
     backgroundLine: String = "rgb:024",
     foreground: String = "",
     background: String = "",
@@ -465,6 +468,7 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
     toolResultLines: Int = -1,
     subagentOutput: SubagentOutputLevel = .all
   ) {
+    self.title = title
     self.backgroundLine = backgroundLine
     self.foreground = foreground
     self.background = background
@@ -478,6 +482,7 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
   }
 
   private enum CodingKeys: String, CodingKey {
+    case title
     case backgroundLine = "bgline"
     case foreground = "fgcolor"
     case background = "bgcolor"
@@ -493,6 +498,7 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
   public init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     self.init(
+      title: try container.decodeIfPresent(String.self, forKey: .title) ?? "",
       backgroundLine: try container.decodeIfPresent(String.self, forKey: .backgroundLine)
         ?? "rgb:024",
       foreground: try container.decodeIfPresent(String.self, forKey: .foreground) ?? "",
@@ -528,23 +534,27 @@ public struct ConfiguredPrompts: Codable, Equatable, Sendable {
   public var memory: String?
   /// Reusable system prompts referenced by `AgentDefinition.systemPrompt`.
   public var system: [String: String]
+  /// Reusable messages sent by name with `$NAME [TEXT]`; see `UserPrompt`.
+  public var user: [String: String]
 
   public init(
     compact: String? = nil,
     delegation: String? = nil,
     worker: String? = nil,
     memory: String? = nil,
-    system: [String: String] = [:]
+    system: [String: String] = [:],
+    user: [String: String] = [:]
   ) {
     self.compact = compact
     self.delegation = delegation
     self.worker = worker
     self.memory = memory
     self.system = system
+    self.user = user
   }
 
   private enum CodingKeys: String, CodingKey {
-    case compact, delegation, worker, memory, system
+    case compact, delegation, worker, memory, system, user
   }
 
   public init(from decoder: Decoder) throws {
@@ -554,7 +564,8 @@ public struct ConfiguredPrompts: Codable, Equatable, Sendable {
       delegation: try container.decodeIfPresent(String.self, forKey: .delegation),
       worker: try container.decodeIfPresent(String.self, forKey: .worker),
       memory: try container.decodeIfPresent(String.self, forKey: .memory),
-      system: try container.decodeIfPresent([String: String].self, forKey: .system) ?? [:])
+      system: try container.decodeIfPresent([String: String].self, forKey: .system) ?? [:],
+      user: try container.decodeIfPresent([String: String].self, forKey: .user) ?? [:])
   }
 }
 
@@ -732,6 +743,11 @@ public struct MaiConfiguration: Codable, Equatable, Sendable {
     for name in prompts?.system.keys ?? [String: String]().keys {
       guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
         throw MaiConfigurationError.emptyIdentifier("system prompt")
+      }
+    }
+    for name in prompts?.user.keys ?? [String: String]().keys {
+      guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw MaiConfigurationError.emptyIdentifier("user prompt")
       }
     }
     try Self.requireUnique(providers.map(\.id), kind: "provider")

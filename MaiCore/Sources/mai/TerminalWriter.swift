@@ -34,9 +34,13 @@ actor TerminalWriter {
   private var toolResultColor = ConfiguredTerminalUI().toolResultForeground
   private var subagentOutput = ConfiguredTerminalUI().subagentOutput
   private var promptColor = ConfiguredTerminalUI().promptForeground
+  /// Last requested title. A first empty value leaves the shell's title alone.
+  private var terminalTitle: String?
   private let colorsStatus: Bool
   /// Whether stdout is a color terminal, for command output painted inline.
   private let colorsOutput: Bool
+  /// ANSI control sequences are useful on a tty even when colors are disabled.
+  private let terminalOutput: Bool
   /// The persistent screen, when the REPL runs on a terminal. Output written
   /// through it lands above the prompt instead of on top of it.
   private var screen: TerminalScreen?
@@ -57,7 +61,8 @@ actor TerminalWriter {
     self.capturesOutput = capturesOutput
     let noColor = ProcessInfo.processInfo.environment["NO_COLOR"] != nil
     colorsStatus = !capturesOutput && isatty(STDERR_FILENO) != 0 && !noColor
-    colorsOutput = !capturesOutput && isatty(STDOUT_FILENO) != 0 && !noColor
+    terminalOutput = !capturesOutput && isatty(STDOUT_FILENO) != 0
+    colorsOutput = terminalOutput && !noColor
   }
 
   /// True when `paint` will add color: output goes to a color terminal rather
@@ -102,6 +107,23 @@ actor TerminalWriter {
 
   func configurePromptColor(_ color: String) {
     promptColor = color
+  }
+
+  /// Sets the terminal/tab title with OSC 0. Control characters are removed
+  /// so a value loaded from configuration cannot inject another ANSI command.
+  func configureTerminalTitle(_ title: String) {
+    let safe = String(title.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) })
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard safe != terminalTitle else { return }
+    let previous = terminalTitle
+    terminalTitle = safe
+    guard terminalOutput, !safe.isEmpty || previous?.isEmpty == false else { return }
+    let sequence = "\u{1B}]0;\(safe)\u{7}"
+    if let screen {
+      screen.emitControlSequence(sequence)
+    } else {
+      FileHandle.standardOutput.write(Data(sequence.utf8))
+    }
   }
 
   var markdownRenderer: MarkdownTerminalRenderer? { markdown }
@@ -342,8 +364,12 @@ actor TerminalWriter {
     guard let text = childText.removeValue(forKey: pid) else { return }
     let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
     var trimmed = lines
-    while trimmed.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { trimmed.removeLast() }
-    while trimmed.first?.trimmingCharacters(in: .whitespaces).isEmpty == true { trimmed.removeFirst() }
+    while trimmed.last?.trimmingCharacters(in: .whitespaces).isEmpty == true {
+      trimmed.removeLast()
+    }
+    while trimmed.first?.trimmingCharacters(in: .whitespaces).isEmpty == true {
+      trimmed.removeFirst()
+    }
     guard !trimmed.isEmpty else { return }
     childBlock(pid, trimmed.map { "│ " + $0 }.joined(separator: "\n"))
   }

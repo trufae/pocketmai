@@ -194,6 +194,11 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
     }
   }
 
+  /// Emits an ANSI command without treating it as scrolling output.
+  func emitControlSequence(_ sequence: String) {
+    lock.withLock { write(sequence) }
+  }
+
   // MARK: - LineEditorSurface
 
   /// Up to half the screen, so the output keeps room of its own.
