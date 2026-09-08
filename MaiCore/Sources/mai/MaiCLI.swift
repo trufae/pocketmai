@@ -7446,7 +7446,7 @@ struct MaiCLI {
   private static func uiSetting(_ key: String, in ui: ConfiguredTerminalUI) -> String {
     let value: String
     switch key.lowercased() {
-    case "ui.title": value = ui.title
+    case "ui.title": value = visibleUITitle(ui.title)
     // Unset is worth showing as what it resolves to, since that is the editor
     // that actually opens.
     case "ui.editor":
