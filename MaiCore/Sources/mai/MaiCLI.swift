@@ -1636,7 +1636,7 @@ struct MaiCLI {
     // event loop free to animate the activity marker while a run is active.
     let activityPulse = Task {
       while !Task.isCancelled {
-        try? await Task.sleep(nanoseconds: 500_000_000)
+        try? await Task.sleep(nanoseconds: 200_000_000)
         guard !Task.isCancelled else { return }
         continuation.yield(.activityPulse)
       }
