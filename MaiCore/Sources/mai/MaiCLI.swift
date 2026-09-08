@@ -2276,6 +2276,17 @@ struct MaiCLI {
             await releaseIfIdle(workspace: workspace)
             continue
           }
+          if name == "/reply" {
+            // The editor takes the terminal, so a running turn keeps its
+            // Ctrl+C rather than ending on the one meant for the editor.
+            var message: String?
+            await withTurnInterruptSetAside {
+              message = await composeReply(argument, session: session, terminal: terminal)
+            }
+            if let message { await deliver(message, to: loop.focus) }
+            await releaseIfIdle(workspace: workspace)
+            continue
+          }
           if name == "/btw" {
             if loop.activeTurn != nil {
               await terminal.note(
@@ -2857,6 +2868,8 @@ struct MaiCLI {
         await terminal.line(queueHelp)
       case "export", "/export":
         await terminal.line(exportHelp)
+      case "reply", "/reply":
+        await terminal.line(replyHelp)
       case "copy", "/copy":
         await terminal.line(copyHelp)
       case "stats", "/stats":
@@ -3122,6 +3135,9 @@ struct MaiCLI {
       await terminal.line("Conversation cleared.")
     case "/queue":
       await terminal.line("The message queue lives at the terminal prompt.\n" + queueHelp)
+    case "/reply":
+      await terminal.line(
+        "Use /reply at the chat prompt; it opens the last reply quoted in $EDITOR.")
     case "/continue", "/retry":
       await terminal.line(
         "Use /continue at the chat prompt; in visual mode, send \"continue\" as a message.")
@@ -7612,6 +7628,17 @@ struct MaiCLI {
     chat title and written to the current directory.
     """
 
+  private static let replyHelp = """
+    Answer the last assistant reply with it quoted above the answer:
+
+      /reply                 Quote the last reply and open $EDITOR on it
+      /reply WIDTH           Wrap the quote at WIDTH columns instead of \(MarkdownQuote.defaultLineWidth)
+
+    Every quoted line is wrapped and prefixed with "> ", with a blank line left
+    under it for the answer. Saving and leaving the editor sends the whole text
+    as an ordinary message; leaving the quote untouched sends nothing.
+    """
+
   private static let copyHelp = """
     Copy conversation text to the clipboard, or into a file:
 
@@ -7625,6 +7652,52 @@ struct MaiCLI {
     ~ and is resolved from the current directory; an existing file is replaced,
     and a folder is refused.
     """
+
+  /// `/reply` answers the last assistant message the way the reply action in
+  /// the iOS app does: its text is quoted at a narrow width, `$EDITOR` opens on
+  /// the quote with room underneath, and what the editor leaves is sent as if
+  /// it had been typed at the prompt. An optional argument widens the quote.
+  private static func composeReply(
+    _ argument: String,
+    session: REPLSession,
+    terminal: TerminalWriter
+  ) async -> String? {
+    let trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
+    var width = MarkdownQuote.defaultLineWidth
+    if !trimmed.isEmpty {
+      guard let columns = Int(trimmed), columns > 2 else {
+        await terminal.line(
+          "Usage: /reply [WIDTH]   (the quote wraps at \(MarkdownQuote.defaultLineWidth) columns by default)"
+        )
+        return nil
+      }
+      width = columns
+    }
+    let reply: String
+    do {
+      reply = try TranscriptCopy.text(
+        for: .lastAssistantReply, in: session.history.messages
+      ).text
+    } catch {
+      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
+      return nil
+    }
+    let quoted = MarkdownQuote.quote(reply, lineWidth: width)
+    guard
+      let edited = await editTemporaryText(
+        quoted + "\n\n", suffix: "reply.md", terminal: terminal)
+    else { return nil }
+    let message = edited.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !message.isEmpty else {
+      await terminal.line("Reply cancelled: the editor left nothing to send.")
+      return nil
+    }
+    guard message != quoted.trimmingCharacters(in: .whitespacesAndNewlines) else {
+      await terminal.line("Reply cancelled: nothing was written under the quote.")
+      return nil
+    }
+    return message
+  }
 
   /// `/copy [N] [PATH]`: the last reply or the last N messages, on the system
   /// clipboard or, when PATH is given, in that file.
@@ -8974,7 +9047,8 @@ struct MaiCLI {
       "/edit prompt", "/edit compact", "/edit config", "/edit mcps", "/edit provider",
       "/chat compact ",
       "/image tiny ", "/image small ", "/image medium ", "/image big ", "/image full ",
-      "/image ocr ", "/attach ", "/attach clear", "/copy", "/help copy", "/clear", "/chat list",
+      "/image ocr ", "/attach ", "/attach clear", "/copy", "/help copy", "/reply", "/help reply",
+      "/clear", "/chat list",
       "/chat list active", "/chat list archived", "/chat list all", "/chat new ",
       "/chat use ", "/chat next", "/chat previous", "/chat info", "/chat session",
       "/chat session new", "/chat rename ",
@@ -9275,6 +9349,7 @@ struct MaiCLI {
     /attach PATH        Attach a Word, PDF, JSON, or text file as Markdown/plain text
     /attach clear       Drop the attachments queued for the next message
     /copy [N] [PATH]    Copy the last reply, or N messages, to the clipboard or a file
+    /reply [WIDTH]      Answer the last reply in $EDITOR with it quoted above (/help reply)
     /export FORMAT [PATH]  Save this chat as markdown, json, debug, epub, or docx
     /stats              Combined ranking, tokens/s, time in use, and efficiency per provider:model, as bars
     \(visualHelp)/clear              Clear conversation history

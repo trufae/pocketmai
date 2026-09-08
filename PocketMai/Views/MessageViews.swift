@@ -1,3 +1,4 @@
+import MaiCore
 import Photos
 import ImageIO
 import SwiftUI

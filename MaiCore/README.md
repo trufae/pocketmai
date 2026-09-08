@@ -130,6 +130,13 @@ instead of the clipboard: `/copy reply.md` saves the last reply and
 use the first of `wl-copy`, `xclip`, `xsel`, `pbcopy`, or `clip.exe` found in
 `PATH`.
 
+`/reply` answers the last assistant reply with it quoted above the answer. The
+reply is wrapped at 40 columns, every line prefixed with `> `, and opened in
+`$EDITOR` with a blank line under it; what the editor leaves is sent as if it
+had been typed at the prompt. `/reply WIDTH` wraps the quote at another column
+instead, and leaving the quote untouched sends nothing. It is the same quoting
+the reply action in the iOS app uses.
+
 `/visual` hands the terminal to a [SwiftTUI](https://swifttui.sh/) workspace
 built by the `MaiVisual` module and returns to the prompt on `Ctrl+C`, `/exit`,
 or the REPL button. The Chats tab keeps several conversations in a sidebar and
