@@ -257,6 +257,44 @@ jobs:
           path: ${{ runner.temp }}/pmai-android-arm64
           if-no-files-found: error
 
+  windows-cli:
+    name: CLI (Windows x64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      # swift-tui only builds against Darwin and Glibc, so like the musl and
+      # Android builds the Windows CLI leaves out the /visual workspace.
+      PMAI_NO_VISUAL: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Swift 6.3.3
+        uses: swift-actions/setup-swift@v3
+        with:
+          swift-version: "6.3.3"
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Build release CLI
+        run: |
+          swift build --package-path MaiCore -c release --product pmai -Xswiftc -Osize
+
+      - name: Verify the binary runs
+        run: |
+          set -eu
+          MaiCore/.build/release/pmai.exe --help
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pmai-windows-x64
+          path: MaiCore/.build/release/pmai.exe
+          if-no-files-found: error
+
   build:
     name: Build (Xcode latest on macOS latest)
     runs-on: macos-latest
