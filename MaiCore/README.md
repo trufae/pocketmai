@@ -371,6 +371,11 @@ or `off`. `ui.toolResultLines` accepts `all` or a line count (the default is
 `all`; `0` restores the compact status-only display).
 `/set ui.title TEXT` adds `[TEXT]` to the prompt and sets the terminal/tab title
 with an ANSI escape sequence; `/set ui.title none` clears the configured label.
+`/set ui.editor COMMAND` picks the editor `/edit`, `/reply`, and the other
+editor commands hand the terminal to; it is saved in the configuration and used
+before `$EDITOR`, `$VISUAL`, and vim, which are what an unset (or
+`/set ui.editor none`) value falls back to. The command may carry arguments,
+as in `/set ui.editor code -w`, and the file path is appended to it.
 Successful tool results are yellow by default, tool starts remain green, and
 failed results are red. Unified diff removals and additions, including output
 from `files_patch`, use dark red and dark green backgrounds. `/set limits.`

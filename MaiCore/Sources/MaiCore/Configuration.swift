@@ -454,6 +454,9 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
   public var toolResultLines: Int
   /// What the text REPL prints while child agents run.
   public var subagentOutput: SubagentOutputLevel
+  /// Command the REPL hands the terminal to for `/edit` and the rest. Empty
+  /// falls back to `$EDITOR`, then `$VISUAL`, then vim.
+  public var editor: String
 
   public init(
     title: String = "",
@@ -466,7 +469,8 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
     bold: Bool = false,
     markdown: Bool = true,
     toolResultLines: Int = -1,
-    subagentOutput: SubagentOutputLevel = .all
+    subagentOutput: SubagentOutputLevel = .all,
+    editor: String = ""
   ) {
     self.title = title
     self.backgroundLine = backgroundLine
@@ -479,6 +483,7 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
     self.markdown = markdown
     self.toolResultLines = max(-1, toolResultLines)
     self.subagentOutput = subagentOutput
+    self.editor = editor
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -493,6 +498,7 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
     case markdown
     case toolResultLines
     case subagentOutput = "subagents"
+    case editor
   }
 
   public init(from decoder: Decoder) throws {
@@ -512,7 +518,8 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
       markdown: try container.decodeIfPresent(Bool.self, forKey: .markdown) ?? true,
       toolResultLines: try container.decodeIfPresent(Int.self, forKey: .toolResultLines) ?? -1,
       subagentOutput: try container.decodeIfPresent(
-        SubagentOutputLevel.self, forKey: .subagentOutput) ?? .all)
+        SubagentOutputLevel.self, forKey: .subagentOutput) ?? .all,
+      editor: try container.decodeIfPresent(String.self, forKey: .editor) ?? "")
   }
 }
 

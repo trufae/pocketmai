@@ -55,6 +55,19 @@ func configurationPromptDefaults() throws {
   #expect(configuration.ui.title.isEmpty)
 }
 
+@Test("The terminal editor setting is optional and round-trips")
+func terminalEditorSetting() throws {
+  let unset = try JSONDecoder().decode(ConfiguredTerminalUI.self, from: Data(#"{}"#.utf8))
+  #expect(unset.editor.isEmpty)
+
+  let configured = try JSONDecoder().decode(
+    ConfiguredTerminalUI.self, from: Data(#"{"editor":"code -w"}"#.utf8))
+  #expect(configured.editor == "code -w")
+
+  let saved = try JSONEncoder().encode(configured)
+  #expect(try JSONDecoder().decode(ConfiguredTerminalUI.self, from: saved) == configured)
+}
+
 @Test("Compact prompt templates require the transcript placeholder")
 func compactPromptRequiresTranscript() {
   let configuration = MaiConfiguration(

@@ -8,7 +8,11 @@ current chat. `/help edit` prints the short form of this page.
 
 ## Which editor
 
-The editor is `$EDITOR`, then `$VISUAL`, then `vim`. The terminal is handed
+The editor is `/set ui.editor` when it is set, then `$EDITOR`, then `$VISUAL`,
+then `vim`. `ui.editor` is saved in the configuration, so it survives restarts
+and does not depend on the environment the terminal happens to have; it may
+carry arguments (`/set ui.editor code -w`), the file path is appended to it,
+and `/set ui.editor none` goes back to the environment. The terminal is handed
 to it whole (the persistent prompt and status rows are suspended) and taken
 back when it exits. An editor that exits with a non-zero status, or a file
 saved as anything but UTF-8, cancels the edit and nothing changes. Saving the
