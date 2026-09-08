@@ -3,14 +3,15 @@ import Foundation
 /// Builds the quoted block a reply starts from, in the shape mail clients use:
 /// every line is prefixed with `"> "` so Markdown renders it as a block quote,
 /// and long paragraphs are hard-wrapped so the quote stays narrow enough to
-/// read as quoted material next to the reply typed under it.
-enum MarkdownQuote {
+/// read as quoted material next to the reply typed under it. The iOS reply
+/// action and the CLI's `/reply` command both start from this text.
+public enum MarkdownQuote {
   /// Total width of a quoted line, quote marker included.
-  static let defaultLineWidth = 40
+  public static let defaultLineWidth = 40
 
   private static let marker = "> "
 
-  static func quote(_ text: String, lineWidth: Int = defaultLineWidth) -> String {
+  public static func quote(_ text: String, lineWidth: Int = defaultLineWidth) -> String {
     let budget = max(1, lineWidth - marker.count)
     let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
     var lines: [String] = []

@@ -1,7 +1,7 @@
 import Foundation
 import XCTest
 
-@testable import PocketMai
+@testable import MaiCore
 
 final class MarkdownQuoteTests: XCTestCase {
   // Pins the wrapping itself, at a width of its own, so that tuning
