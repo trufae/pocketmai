@@ -46,4 +46,8 @@ Ready to use from the [AppStore](https://apps.apple.com/es/app/pocketmai/id67642
 
 But you may find the ipa and source zips in the [Release](https://github.com/trufae/pocketmai/releases) page.
 
+The `pmai` CLI ships there for macOS, Linux, and Android. Linux comes as a
+glibc build and as a fully static `-musl` build that runs on Alpine and other
+musl distributions; `www/install.sh` picks the right one automatically.
+
 —pancake

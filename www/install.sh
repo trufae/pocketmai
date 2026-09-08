@@ -54,6 +54,23 @@ detect_platform() {
   if [ "$platform" = android ] && [ "$architecture" != arm64 ]; then
     die "Android releases currently support arm64 devices"
   fi
+
+  # The regular Linux build links against glibc. Musl distributions such as
+  # Alpine get the fully static build, which also runs on glibc systems too
+  # old for the regular one; PMAI_LIBC=musl or PMAI_LIBC=glibc forces either.
+  libc=""
+  if [ "$platform" = linux ]; then
+    case "${PMAI_LIBC:-}" in
+      musl) libc=musl ;;
+      glibc | gnu) ;;
+      "")
+        if [ -e "/lib/ld-musl-$machine.so.1" ] || ldd --version 2>&1 | grep -qi musl; then
+          libc=musl
+        fi
+        ;;
+      *) die "PMAI_LIBC must be musl or glibc" ;;
+    esac
+  fi
 }
 
 choose_install_dir() {
@@ -135,7 +152,7 @@ case "$version" in
 esac
 release_base="${PMAI_RELEASE_BASE:-$release_base}"
 
-asset="pmai-$platform-$architecture.zip"
+asset="pmai-$platform-$architecture${libc:+-$libc}.zip"
 if [ "$platform" = macos ]; then
   asset_fallback="pmai-macos-universal.zip"
 else
@@ -208,7 +225,7 @@ else
 fi
 
 "$target" --help >/dev/null 2>&1 || die "pmai was installed but failed its startup check"
-say "installed $platform/$architecture to $target"
+say "installed $platform/$architecture${libc:+ ($libc)} to $target"
 
 if path_contains "$install_dir"; then
   say "ready — run: pmai"

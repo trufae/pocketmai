@@ -70,6 +70,62 @@ jobs:
           path: pmai-${{ matrix.target }}.zip
           if-no-files-found: error
 
+  musl-cli:
+    name: CLI (Linux musl ${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: x64
+            arch: x86_64
+            target: linux-x64-musl
+          - os: ubuntu-24.04-arm
+            name: arm64
+            arch: aarch64
+            target: linux-arm64-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The Static Linux SDK must exactly match the host Swift toolchain.
+      - name: Set up Swift 6.3.3
+        uses: swift-actions/setup-swift@v3
+        with:
+          swift-version: "6.3.3"
+
+      - name: Install Swift Static Linux SDK
+        run: |
+          swift sdk install \
+            https://download.swift.org/swift-6.3.3-release/static-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz \
+            --checksum 87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
+
+      # Fully static: runs on Alpine and other musl distributions as well as
+      # on glibc systems too old for the regular Linux build.
+      - name: Build fully static release CLI
+        run: |
+          set -eu
+          bin=$(MaiCore/scripts/build-musl.sh ${{ matrix.arch }})
+          strip -s "$bin"
+          cp "$bin" pmai
+          file pmai
+          file pmai | grep -q 'statically linked'
+          ./pmai --help >/dev/null
+
+      - name: Package CLI
+        run: |
+          asset="pmai-${{ matrix.target }}.zip"
+          zip -j "$asset" pmai
+          unzip -l "$asset"
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pmai-${{ matrix.target }}
+          path: pmai-${{ matrix.target }}.zip
+          if-no-files-found: error
+
   android-cli:
     name: CLI (Android arm64)
     runs-on: ubuntu-24.04
@@ -180,7 +236,7 @@ jobs:
 
   release:
     name: Publish GitHub release
-    needs: [cli, android-cli, ipa]
+    needs: [cli, musl-cli, android-cli, ipa]
     runs-on: ubuntu-latest
     steps:
       - name: Download release artifacts

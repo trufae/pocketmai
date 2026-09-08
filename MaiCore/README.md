@@ -29,6 +29,21 @@ to explicitly send no API key and suppress configured or legacy API-key
 fallbacks; merely unsetting it allows those fallbacks to be used.
 Keep `env.sh` local because it can contain credentials.
 
+Install a release build system-wide with `make repl-install`. The Linux
+release archives come in two flavours: `pmai-linux-<arch>.zip` links against
+glibc, libstdc++, libcurl, and libxml2, while `pmai-linux-<arch>-musl.zip` is
+fully static and runs on musl distributions such as Alpine and on glibc systems
+too old for the regular build. `www/install.sh` picks the static build on musl
+systems automatically; set `PMAI_LIBC=musl` to force it elsewhere. Build the
+static flavour locally with `make repl-musl` once the Swift Static Linux SDK
+matching the toolchain is installed; `MaiCore/scripts/build-musl.sh` applies
+`MaiCore/patches/swift-tui-musl.patch` to swift-tui through SwiftPM edit mode
+because upstream swift-tui only knows Glibc on Linux, and `swift package
+--package-path MaiCore unedit --force swift-tui` restores the pristine
+dependency.
+Native `--plugin` libraries cannot be loaded by the static build because static
+musl executables cannot `dlopen`.
+
 Print a complete configuration template:
 
 ```sh
