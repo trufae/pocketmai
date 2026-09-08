@@ -36,13 +36,11 @@ fully static and runs on musl distributions such as Alpine and on glibc systems
 too old for the regular build. `www/install.sh` picks the static build on musl
 systems automatically; set `PMAI_LIBC=musl` to force it elsewhere. Build the
 static flavour locally with `make repl-musl` once the Swift Static Linux SDK
-matching the toolchain is installed; `MaiCore/scripts/build-musl.sh` applies
-`MaiCore/patches/swift-tui-musl.patch` to swift-tui through SwiftPM edit mode
-because upstream swift-tui only knows Glibc on Linux, and `swift package
---package-path MaiCore unedit --force swift-tui` restores the pristine
-dependency.
-Native `--plugin` libraries cannot be loaded by the static build because static
-musl executables cannot `dlopen`.
+matching the toolchain is installed. Like the Android build, the static build
+leaves out the `/visual` workspace because swift-tui does not build against
+musl; `PMAI_NO_VISUAL=1` in the environment of `swift build` selects that
+configuration. Native `--plugin` libraries cannot be loaded by the static build
+either, because static musl executables cannot `dlopen`.
 
 Print a complete configuration template:
 

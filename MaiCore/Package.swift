@@ -1,6 +1,21 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
+// The `/visual` workspace needs swift-tui, which only builds against Darwin
+// and Glibc. Android already leaves it out through the platform condition;
+// PMAI_NO_VISUAL=1 does the same for builds SwiftPM still calls Linux, such
+// as the fully static musl release made with the Swift Static Linux SDK.
+let visualEnabled = Context.environment["PMAI_NO_VISUAL"] == nil
+var cliDependencies: [Target.Dependency] = [
+  "MaiCore", "MaiMCP", "MaiOpenAI", "MaiPluginHost", "MaiStandardTools", "MaiVisionOCR",
+  "MaiDocuments", "MaiMarkdown", "MaiACP",
+]
+var cliSwiftSettings: [SwiftSetting] = []
+if visualEnabled {
+  cliDependencies.append(.target(name: "MaiVisual", condition: .when(platforms: [.macOS, .linux])))
+  cliSwiftSettings.append(.define("PMAI_HAS_VISUAL", .when(platforms: [.macOS, .linux])))
+}
+
 let package = Package(
   name: "MaiCore",
   platforms: [
@@ -55,15 +70,9 @@ let package = Package(
       ]),
     .executableTarget(
       name: "MaiCLI",
-      dependencies: [
-        "MaiCore", "MaiMCP", "MaiOpenAI", "MaiPluginHost", "MaiStandardTools", "MaiVisionOCR",
-        "MaiDocuments", "MaiMarkdown", "MaiACP",
-        .target(name: "MaiVisual", condition: .when(platforms: [.macOS, .linux])),
-      ],
+      dependencies: cliDependencies,
       path: "Sources/mai",
-      swiftSettings: [
-        .define("PMAI_HAS_VISUAL", .when(platforms: [.macOS, .linux]))
-      ],
+      swiftSettings: cliSwiftSettings,
       linkerSettings: [
         .linkedLibrary("ssl", .when(platforms: [.android])),
         .linkedLibrary("crypto", .when(platforms: [.android])),

@@ -88,9 +88,12 @@ repl-install:
 	$(SUDO) $(STRIP) $(BINDIR)/pmai
 
 # Fully static Linux build that also runs on musl distributions such as
-# Alpine. Needs the Swift Static Linux SDK; see MaiCore/scripts/build-musl.sh.
+# Alpine. Needs the Swift Static Linux SDK matching the toolchain. swift-tui
+# does not build against musl, so the /visual workspace is left out.
+MUSL_ARCH ?= $(shell uname -m)
 repl-musl:
-	MaiCore/scripts/build-musl.sh $(MUSL_ARCH)
+	PMAI_NO_VISUAL=1 swift build --package-path MaiCore -c release --product pmai \
+		--swift-sdk $(MUSL_ARCH)-swift-linux-musl -Xswiftc -Osize
 
 plugin-fixture:
 	swift build --package-path MaiCore --product MaiFixturePlugin

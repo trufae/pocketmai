@@ -135,9 +135,13 @@ jobs:
 
       # Fully static: no glibc, libstdc++, libcurl or libxml2 dependency, so
       # the same binary runs on Alpine and on every glibc distribution.
+      # swift-tui does not build against musl, so like the Android build this
+      # one leaves out the /visual workspace (PMAI_NO_VISUAL).
       - name: Build fully static release CLI
         run: |
-          bin=$(MaiCore/scripts/build-musl.sh ${{ matrix.arch }})
+          PMAI_NO_VISUAL=1 swift build --package-path MaiCore -c release --product pmai \
+            --swift-sdk ${{ matrix.arch }}-swift-linux-musl -Xswiftc -Osize
+          bin=MaiCore/.build/${{ matrix.arch }}-swift-linux-musl/release/pmai
           strip -s "$bin"
           cp "$bin" pmai
 
