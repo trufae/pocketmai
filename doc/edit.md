@@ -139,11 +139,11 @@ visual mode, type the message into the pane.
 ## Related one-line commands
 
 `/reply [WIDTH]` opens the editor on the last assistant reply, quoted: every
-line wrapped at 40 columns and prefixed with `> `, with a blank line under it
-to write the answer in. Leaving the editor sends the whole file as an ordinary
-message, so the model reads the answer next to the text it answers, the way
-the reply action in the iOS app does. `WIDTH` wraps the quote at another
-column instead. Leaving the quote untouched sends nothing.
+line wrapped to fit the screen and prefixed with `> `, with a blank line under
+it to write the answer in. Leaving the editor sends the whole file as an
+ordinary message, so the model reads the answer next to the text it answers,
+the way the reply action in the iOS app does. `WIDTH` wraps the quote at an
+explicit column instead. Leaving the quote untouched sends nothing.
 
 `/memory edit`, `/todo edit`, and `/prompt edit [NAME]` open the same editor
 on the project's memory notes, its todo list, and a named prompt. `/set

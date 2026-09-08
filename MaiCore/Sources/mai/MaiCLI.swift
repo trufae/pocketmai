@@ -7683,7 +7683,7 @@ struct MaiCLI {
     Answer the last assistant reply with it quoted above the answer:
 
       /reply                 Quote the last reply and open $EDITOR on it
-      /reply WIDTH           Wrap the quote at WIDTH columns instead of \(MarkdownQuote.defaultLineWidth)
+      /reply WIDTH           Wrap the quote at WIDTH columns instead of the screen width
 
     Every quoted line is wrapped and prefixed with "> ", with a blank line left
     under it for the answer. Saving and leaving the editor sends the whole text
@@ -7705,20 +7705,23 @@ struct MaiCLI {
     """
 
   /// `/reply` answers the last assistant message the way the reply action in
-  /// the iOS app does: its text is quoted at a narrow width, `$EDITOR` opens on
+  /// the iOS app does: its text is quoted at the terminal width, `$EDITOR` opens on
   /// the quote with room underneath, and what the editor leaves is sent as if
-  /// it had been typed at the prompt. An optional argument widens the quote.
+  /// it had been typed at the prompt. An optional argument overrides the width.
   private static func composeReply(
     _ argument: String,
     session: REPLSession,
     terminal: TerminalWriter
   ) async -> String? {
     let trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
-    var width = MarkdownQuote.defaultLineWidth
+    // Leave the terminal's final column unused to avoid an automatic wrap.
+    // MarkdownQuote reserves two more columns for the `> ` marker, leaving
+    // the quoted text itself the requested screen-width-minus-three columns.
+    var width = max(3, TerminalLineEditor.terminalColumns() - 1)
     if !trimmed.isEmpty {
       guard let columns = Int(trimmed), columns > 2 else {
         await terminal.line(
-          "Usage: /reply [WIDTH]   (the quote wraps at \(MarkdownQuote.defaultLineWidth) columns by default)"
+          "Usage: /reply [WIDTH]   (the quote wraps to the screen width by default)"
         )
         return nil
       }
