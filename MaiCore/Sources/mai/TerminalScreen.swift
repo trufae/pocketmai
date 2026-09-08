@@ -13,20 +13,17 @@ import MaiCore
 
 /// Keeps the prompt on screen while agents print.
 ///
-/// The terminal is split into a scroll region — every row but the last two —
-/// where replies, tool lines, and child-agent blocks land, and two rows below
-/// it that never scroll: a status line and the input line. Output is written
-/// at the region's saved cursor and the caret goes back to the input row, so
-/// a person keeps typing while a run streams and nothing lands in their line.
-/// The region starts at the top row, which is what terminals require to keep
-/// scrolled-out lines in the scrollback.
+/// The terminal is split into a scroll region — every row but the last few —
+/// where replies, tool lines, and child-agent blocks land, and rows below it
+/// that never scroll: a status line and the input, one row per line being
+/// typed. Output is written at the region's saved cursor and the caret goes
+/// back to the input, so a person keeps typing while a run streams and nothing
+/// lands in their text. The region starts at the top row, which is what
+/// terminals require to keep scrolled-out lines in the scrollback.
 ///
 /// One lock serialises everything that touches the tty: a block from a child
 /// agent, a streamed delta, and a keystroke's redraw are each written whole.
 final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
-  /// Rows kept below the scroll region: the status line and the input line.
-  static let reservedRows = 2
-
   private static let currentLock = NSLock()
   nonisolated(unsafe) private static var installed: TerminalScreen?
 
@@ -46,12 +43,16 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
   private var columns = 80
   private var ui = ConfiguredTerminalUI()
   private var statusText = ""
-  private var inputStyled = ""
-  private var inputWidth = 0
-  private var caretBack = 0
+  /// The input as drawn, one styled string per row below the status line.
+  private var inputRows = [""]
+  private var caretRow = 0
+  private var caretColumn = 0
   private var outputEndedLine = true
   private var active = false
   private var resizeSource: DispatchSourceSignal?
+  /// Keystrokes that arrived while the terminal was asked for its cursor
+  /// position, kept for the editor.
+  private var typeahead: [UInt8] = []
 
   private static let saveCursor = "\u{1B}7"
   private static let restoreCursor = "\u{1B}8"
@@ -109,18 +110,20 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
     raw.c_iflag &= ~tcflag_t(IXON | ICRNL)
     guard tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0 else { return }
     active = true
-    // Two newlines scroll exactly as much as it takes for the current row to
-    // end up inside the region, whatever row it was on.
+    clampInputRows()
+    // One newline per reserved row scrolls exactly as much as it takes for
+    // the current row to end up inside the region, whatever row it was on.
     let row = currentCursorRow() ?? rows
     let bottom = regionBottom
-    var out = "\n\n"
+    var out = TerminalInputModes.enable
+    out += String(repeating: "\n", count: reservedRows)
     out += "\u{1B}[1;\(bottom)r"
     out += move(row: min(row, bottom), column: 1)
     out += Self.saveCursor
     write(out)
     outputEndedLine = true
     drawStatusRow()
-    drawInputRow()
+    drawInputRows()
     placeCaret()
     watchResizes()
   }
@@ -151,7 +154,9 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
     // up first (the input thread is parked, so stdin is free to answer) and
     // the shell continues right under it, with the reserved rows wiped.
     let row = currentCursorRow() ?? regionBottom
-    write("\u{1B}[r" + move(row: max(1, row), column: 1) + "\n" + Self.clearBelow)
+    write(
+      "\u{1B}[r" + move(row: max(1, row), column: 1) + "\n" + Self.clearBelow
+        + TerminalInputModes.disable)
     _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &cooked)
     active = false
   }
@@ -191,29 +196,48 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
 
   // MARK: - LineEditorSurface
 
-  func drawInput(styled: String, width: Int, caretBack: Int) {
+  /// Up to half the screen, so the output keeps room of its own.
+  func maximumInputRows() -> Int {
+    lock.withLock { maximumInputRowsLocked }
+  }
+
+  private var maximumInputRowsLocked: Int {
+    max(1, min(rows / 2, rows - 5))
+  }
+
+  func drawInput(rows: [String], caretRow: Int, caretColumn: Int) {
     lock.withLock {
-      inputStyled = styled
-      inputWidth = width
-      self.caretBack = caretBack
+      let previousCount = inputRows.count
+      inputRows = rows.isEmpty ? [""] : rows
+      self.caretRow = caretRow
+      self.caretColumn = caretColumn
       guard active else { return }
-      drawInputRow()
+      if inputRows.count != previousCount {
+        resizeRegion(inputRows: previousCount, to: inputRows.count)
+        drawStatusRow()
+      }
+      drawInputRows()
       placeCaret()
     }
   }
 
   func acceptInput(styled: String) {
     lock.withLock {
-      inputStyled = ""
-      inputWidth = 0
-      caretBack = 0
+      let previousCount = inputRows.count
+      inputRows = [""]
+      caretRow = 0
+      caretColumn = 0
       guard active else { return }
       var out = Self.restoreCursor
       if !outputEndedLine { out += "\n" }
       out += styled + "\n" + Self.saveCursor
       write(out)
       outputEndedLine = true
-      drawInputRow()
+      if previousCount != 1 {
+        resizeRegion(inputRows: previousCount, to: 1)
+        drawStatusRow()
+      }
+      drawInputRows()
       placeCaret()
     }
   }
@@ -240,15 +264,60 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
     }
   }
 
+  func pendingInput() -> [UInt8] {
+    lock.withLock {
+      let pending = typeahead
+      typeahead = []
+      return pending
+    }
+  }
+
   // MARK: - Drawing
 
-  private var regionBottom: Int { max(1, rows - Self.reservedRows) }
+  /// The status row and the input rows.
+  private var reservedRows: Int { 1 + inputRows.count }
+
+  private var regionBottom: Int { max(1, rows - reservedRows) }
+
+  private var firstInputRow: Int { rows - inputRows.count + 1 }
+
+  /// Moves the region's bottom edge for an input area of another height.
+  ///
+  /// When the input grows, the region loses rows: its content scrolls up only
+  /// as far as the last output needs to stay inside, and the saved output
+  /// cursor follows it. When the input shrinks, the region takes the freed
+  /// rows back as blank ones below the output, where the next output lands.
+  private func resizeRegion(inputRows previousCount: Int, to count: Int) {
+    let previousBottom = max(1, rows - 1 - previousCount)
+    let bottom = max(1, rows - 1 - count)
+    var out = ""
+    // Every restore is followed by a save: the saved position must survive
+    // being restored more than once, and not every terminal keeps it.
+    if bottom < previousBottom {
+      write(Self.restoreCursor)
+      let outputRow = currentCursorRow() ?? previousBottom
+      out += Self.saveCursor
+      let scroll = max(0, min(outputRow, previousBottom) - bottom)
+      if scroll > 0 {
+        out += move(row: previousBottom, column: 1) + String(repeating: "\n", count: scroll)
+        out += Self.restoreCursor + "\u{1B}[\(scroll)A" + Self.saveCursor
+      }
+      out += "\u{1B}[1;\(bottom)r" + Self.restoreCursor + Self.saveCursor
+    } else if bottom > previousBottom {
+      out += "\u{1B}[1;\(bottom)r"
+      for row in (previousBottom + 1)...bottom {
+        out += move(row: row, column: 1) + Self.clearLine
+      }
+      out += Self.restoreCursor + Self.saveCursor
+    }
+    write(out)
+  }
 
   private func drawStatusRow() {
     let width = max(1, columns - 1)
     let content = Self.truncated(" \(statusText) ", width: width)
     let padding = String(repeating: " ", count: max(0, width - Self.displayWidth(content)))
-    var out = move(row: rows - 1, column: 1) + Self.clearLine
+    var out = move(row: regionBottom + 1, column: 1) + Self.clearLine
     if let background = TerminalLineEditor.backgroundColorCode(ui.backgroundLine) {
       out += "\u{1B}[\(background)m" + content + padding + Self.reset
     } else {
@@ -257,12 +326,16 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
     write(out)
   }
 
-  private func drawInputRow() {
-    write(move(row: rows, column: 1) + Self.clearLine + inputStyled)
+  private func drawInputRows() {
+    var out = ""
+    for (index, row) in inputRows.enumerated() {
+      out += move(row: firstInputRow + index, column: 1) + Self.clearLine + row
+    }
+    write(out)
   }
 
   private func placeCaret() {
-    write(move(row: rows, column: max(1, 1 + inputWidth - caretBack)))
+    write(move(row: firstInputRow + caretRow, column: max(1, 1 + caretColumn)))
   }
 
   private func move(row: Int, column: Int) -> String {
@@ -276,8 +349,17 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
   private func measure() {
     var size = winsize()
     guard ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size) == 0 else { return }
-    if size.ws_row > Int32(Self.reservedRows) { rows = Int(size.ws_row) }
+    if size.ws_row >= 3 { rows = Int(size.ws_row) }
     if size.ws_col > 0 { columns = Int(size.ws_col) }
+  }
+
+  /// Keeps the input area within what the screen allows; the editor draws
+  /// it again in full at its next keystroke.
+  private func clampInputRows() {
+    let maximum = maximumInputRowsLocked
+    guard inputRows.count > maximum else { return }
+    inputRows = Array(inputRows.suffix(maximum))
+    caretRow = min(caretRow, maximum - 1)
   }
 
   private func watchResizes() {
@@ -294,23 +376,26 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
     lock.withLock {
       guard active else { return }
       measure()
+      clampInputRows()
       let bottom = regionBottom
       var out = "\u{1B}[1;\(bottom)r"
       out += move(row: bottom, column: 1) + Self.saveCursor
       write(out)
       outputEndedLine = true
       drawStatusRow()
-      drawInputRow()
+      drawInputRows()
       placeCaret()
     }
   }
 
-  /// Asks the terminal where the cursor is. Only valid before the input
-  /// thread owns stdin; answers nil when the terminal stays quiet.
+  /// Asks the terminal where the cursor is; nil when it stays quiet. Bytes
+  /// that turn out to be keystrokes are kept for the editor, so this is safe
+  /// on the input thread as well as while it is parked.
   private func currentCursorRow() -> Int? {
     write("\u{1B}[6n")
     var buffer: [UInt8] = []
     let deadline = Date().addingTimeInterval(0.25)
+    defer { typeahead += buffer }
     while Date() < deadline {
       var descriptor = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
       let remaining = Int32(max(1, deadline.timeIntervalSinceNow * 1000))
@@ -318,15 +403,16 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
       var byte: UInt8 = 0
       guard read(STDIN_FILENO, &byte, 1) == 1 else { return nil }
       buffer.append(byte)
-      if byte == UInt8(ascii: "R") { break }
+      guard byte == UInt8(ascii: "R"), let start = buffer.lastIndex(of: 0x1B),
+        start + 1 < buffer.count, buffer[start + 1] == UInt8(ascii: "[")
+      else { continue }
+      let body = String(decoding: buffer[(start + 2)..<(buffer.count - 1)], as: UTF8.self)
+      let fields = body.split(separator: ";")
+      guard fields.count == 2, let row = Int(fields[0]), Int(fields[1]) != nil else { continue }
+      buffer.removeSubrange(start...)
+      return row
     }
-    guard let start = buffer.lastIndex(of: 0x1B), buffer.last == UInt8(ascii: "R") else {
-      return nil
-    }
-    let body = String(decoding: buffer[(start + 1)...].dropLast(), as: UTF8.self)
-    guard body.hasPrefix("["), let row = Int(body.dropFirst().split(separator: ";").first ?? "")
-    else { return nil }
-    return row
+    return nil
   }
 
   private static func truncated(_ text: String, width: Int) -> String {

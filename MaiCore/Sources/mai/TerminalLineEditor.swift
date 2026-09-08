@@ -11,16 +11,19 @@ import MaiCore
   import Darwin
 #endif
 
-/// Where a line editor draws. The classic surface owns the current row of a
-/// scrolling terminal, the way a shell prompt does; `TerminalScreen` owns a
-/// row that stays below the output while agents print.
+/// Where a line editor draws. The classic surface owns the rows at the end of
+/// a scrolling terminal, the way a shell prompt does; `TerminalScreen` owns
+/// rows that stay below the output while agents print.
 protocol LineEditorSurface: AnyObject {
-  /// Draws the whole input row: `styled` after clearing it, `width` columns
-  /// wide, with the caret `caretBack` columns left of its end.
-  func drawInput(styled: String, width: Int, caretBack: Int)
-  /// The line was accepted: it stays on screen as a record and the row is free.
+  /// Rows the input may take before it scrolls inside its own area.
+  func maximumInputRows() -> Int
+  /// Draws the whole input area: one styled string per row, cleared first,
+  /// with the caret on `caretRow` after `caretColumn` cells.
+  func drawInput(rows: [String], caretRow: Int, caretColumn: Int)
+  /// The input was accepted: `styled`, which may span lines, stays on screen
+  /// as a record and the area is free again.
   func acceptInput(styled: String)
-  /// Ctrl+C threw the line away.
+  /// Ctrl+C threw the input away.
   func cancelInput()
   /// Text that belongs with the output, such as completion candidates.
   func emit(_ text: String)
@@ -29,34 +32,72 @@ protocol LineEditorSurface: AnyObject {
   func bell()
   /// Hands the terminal back to the shell for Ctrl+Z and takes it again.
   func suspendProcess()
+  /// Keystrokes the surface read from the terminal while it asked it
+  /// something, in the order they were typed; the editor consumes them first.
+  func pendingInput() -> [UInt8]
 }
 
-/// The surface of a plain scrolling terminal: everything happens on the row
-/// the cursor is on, and the editor owns the tty mode while it reads.
+extension LineEditorSurface {
+  func pendingInput() -> [UInt8] { [] }
+}
+
+/// Terminal modes the editor turns on while it reads: bracketed paste, so a
+/// pasted text arrives whole with its newlines instead of as typed lines, and
+/// the kitty keyboard protocol's disambiguation, so Shift+Enter is told apart
+/// from Enter on terminals that need asking. Terminals without either ignore
+/// the sequences.
+enum TerminalInputModes {
+  static let enable = "\u{1B}[?2004h\u{1B}[>1u"
+  static let disable = "\u{1B}[<u\u{1B}[?2004l"
+}
+
+/// The surface of a plain scrolling terminal: the input starts on the row the
+/// cursor is on and grows downwards, and the editor owns the tty mode while
+/// it reads.
 private final class ClassicEditorSurface: LineEditorSurface {
   private var cooked: termios
   private var raw: termios
+  /// The row of the input area the caret was left on, which is how far up
+  /// the area starts at the next draw.
+  private var caretRow = 0
+  private var drawnRows = 0
 
   init(cooked: termios, raw: termios) {
     self.cooked = cooked
     self.raw = raw
   }
 
-  func drawInput(styled: String, width: Int, caretBack: Int) {
-    write("\r\u{1B}[2K" + styled)
-    if caretBack > 0 { write("\u{1B}[\(caretBack)D") }
+  func maximumInputRows() -> Int {
+    max(1, TerminalLineEditor.terminalRows() - 1)
+  }
+
+  func drawInput(rows: [String], caretRow: Int, caretColumn: Int) {
+    var out = "\r" + up(self.caretRow)
+    for (index, row) in rows.enumerated() {
+      out += "\u{1B}[2K" + row
+      if index < rows.count - 1 { out += "\n" }
+    }
+    out += "\u{1B}[J"
+    out += up(rows.count - 1 - caretRow) + "\r\u{1B}[\(caretColumn + 1)G"
+    write(out)
+    self.caretRow = caretRow
+    drawnRows = rows.count
   }
 
   func acceptInput(styled: String) {
-    write("\r\u{1B}[2K" + styled + "\n")
+    write("\r" + up(caretRow) + "\u{1B}[J" + styled + "\n")
+    caretRow = 0
+    drawnRows = 0
   }
 
   func cancelInput() {
-    write("\r\u{1B}[2K^C\n")
+    acceptInput(styled: "^C")
   }
 
   func emit(_ text: String) {
-    write("\n" + text)
+    write("\r" + down(max(0, drawnRows - 1 - caretRow)) + "\n" + text)
+    caretRow = 0
+    drawnRows = 0
   }
 
   func drawSeparator(styled: String?) {
@@ -71,10 +112,21 @@ private final class ClassicEditorSurface: LineEditorSurface {
   func suspendProcess() {
     // ISIG is disabled while editing so Ctrl+Z arrives as a byte. Restore the
     // shell's terminal mode before stopping, then re-enter raw mode after `fg`.
-    write("\r\u{1B}[2K^Z\n")
+    write("\r" + up(caretRow) + "\u{1B}[J^Z\n" + TerminalInputModes.disable)
+    caretRow = 0
+    drawnRows = 0
     _ = tcsetattr(STDIN_FILENO, TCSADRAIN, &cooked)
     _ = kill(getpid(), SIGTSTP)
     _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw)
+    write(TerminalInputModes.enable)
+  }
+
+  private func up(_ rows: Int) -> String {
+    rows > 0 ? "\u{1B}[\(rows)A" : ""
+  }
+
+  private func down(_ rows: Int) -> String {
+    rows > 0 ? "\u{1B}[\(rows)B" : ""
   }
 
   private func write(_ value: String) {
@@ -83,7 +135,10 @@ private final class ClassicEditorSurface: LineEditorSurface {
 }
 
 /// Small dependency-free line editor for the REPL. Non-interactive input keeps
-/// normal `readLine` behaviour, while terminals gain history and completion.
+/// normal `readLine` behaviour, while terminals gain history, completion, and
+/// input spanning several lines: Shift+Enter (Alt+Enter or Ctrl+J where the
+/// terminal cannot tell Shift+Enter apart) breaks the line, a paste keeps its
+/// newlines, and Enter submits the whole text.
 final class TerminalLineEditor {
   private struct ReverseSearchState {
     var query: [UInt8] = []
@@ -99,6 +154,21 @@ final class TerminalLineEditor {
     case endOfFile
   }
 
+  /// One keystroke, or a pasted block, decoded from the terminal's bytes.
+  private enum Key {
+    /// A plain byte: a control character or the first byte of a character.
+    case byte(UInt8)
+    /// A whole character the terminal reported through an escape sequence.
+    case text([UInt8])
+    case up, down, left, right, home, end, delete
+    /// Shift+Enter or Alt+Enter: a line break inside the input.
+    case newline
+    /// A bracketed paste, as sent.
+    case paste([UInt8])
+    /// A lone Escape, or a sequence the editor has no use for.
+    case ignored
+  }
+
   private let historyURL: URL?
   private var history: [String]
   private let maximumHistory = 500
@@ -110,6 +180,10 @@ final class TerminalLineEditor {
   private var persistentSurface: LineEditorSurface?
   /// Where the current `readLine` draws.
   private var surface: LineEditorSurface?
+  /// The first of the input's lines shown when there are more than fit.
+  private var viewTop = 0
+  /// Bytes read ahead of the editor, consumed before the terminal is read.
+  private var typeahead: [UInt8] = []
 
   init(historyURL: URL? = nil) {
     self.historyURL = historyURL
@@ -156,6 +230,8 @@ final class TerminalLineEditor {
     raw.c_iflag &= ~tcflag_t(IXON | ICRNL)
     guard tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0 else { return nil }
     defer { _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &original) }
+    FileHandle.standardOutput.write(Data(TerminalInputModes.enable.utf8))
+    defer { FileHandle.standardOutput.write(Data(TerminalInputModes.disable.utf8)) }
     surface = ClassicEditorSurface(cooked: original, raw: raw)
     defer { surface = nil }
     return readInteractive(
@@ -172,162 +248,321 @@ final class TerminalLineEditor {
     var cursor = 0
     var historyIndex: Int?
     var draft: [UInt8] = []
+    viewTop = 0
     drawSeparator(separator)
     redraw(prompt: prompt, bytes: bytes, cursor: cursor)
 
-    while let byte = readByte() {
-      switch byte {
-      case 1:  // Ctrl+A
-        cursor = 0
+    func insert(_ text: [UInt8]) {
+      guard !text.isEmpty else { return }
+      bytes.insert(contentsOf: text, at: cursor)
+      cursor += text.count
+      historyIndex = nil
+      redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+    }
+
+    /// Up and Down walk the input's lines first and the history at its edges.
+    func moveToPreviousLine() {
+      if moveUp(in: bytes, cursor: &cursor) {
         redraw(prompt: prompt, bytes: bytes, cursor: cursor)
-      case 2:  // Ctrl+B, like Left
-        cursor = previousCharacterStart(in: bytes, before: cursor)
+        return
+      }
+      guard
+        recallPreviousHistoryEntry(
+          bytes: &bytes, cursor: &cursor, historyIndex: &historyIndex, draft: &draft)
+      else { return }
+      redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+    }
+
+    func moveToNextLine() {
+      if moveDown(in: bytes, cursor: &cursor) {
         redraw(prompt: prompt, bytes: bytes, cursor: cursor)
-      case 3:  // Ctrl+C
-        wasInterrupted = true
-        surface?.cancelInput()
-        return ""
-      case 4:  // Ctrl+D
-        if bytes.isEmpty {
-          surface?.acceptInput(styled: "")
-          return nil
-        }
-      case 5:  // Ctrl+E
-        cursor = bytes.count
-        redraw(prompt: prompt, bytes: bytes, cursor: cursor)
-      case 6:  // Ctrl+F, like Right
-        cursor = nextCharacterEnd(in: bytes, after: cursor)
-        redraw(prompt: prompt, bytes: bytes, cursor: cursor)
-      case 9:  // Tab
-        complete(
-          prompt: prompt,
-          bytes: &bytes,
-          cursor: &cursor,
-          candidates: completions)
-      case 14:  // Ctrl+N
-        guard
-          recallNextHistoryEntry(
-            bytes: &bytes,
-            cursor: &cursor,
-            historyIndex: &historyIndex,
-            draft: &draft)
-        else { continue }
-        redraw(prompt: prompt, bytes: bytes, cursor: cursor)
-      case 16:  // Ctrl+P
-        guard
-          recallPreviousHistoryEntry(
-            bytes: &bytes,
-            cursor: &cursor,
-            historyIndex: &historyIndex,
-            draft: &draft)
-        else { continue }
-        redraw(prompt: prompt, bytes: bytes, cursor: cursor)
-      case 18:  // Ctrl+R
-        switch reverseSearch(original: bytes, startingAt: historyIndex) {
-        case .accepted(let line, let index, let acceptedCursor):
-          if historyIndex == nil, index != nil { draft = bytes }
-          bytes = line
-          cursor = acceptedCursor
-          historyIndex = index
+        return
+      }
+      guard
+        recallNextHistoryEntry(
+          bytes: &bytes, cursor: &cursor, historyIndex: &historyIndex, draft: &draft)
+      else { return }
+      redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+    }
+
+    while let key = readKey() {
+      switch key {
+      case .byte(let byte):
+        switch byte {
+        case 1:  // Ctrl+A: start of the line
+          cursor = lineStart(in: bytes, at: cursor)
           redraw(prompt: prompt, bytes: bytes, cursor: cursor)
-        case .cancelled:
+        case 2:  // Ctrl+B, like Left
+          cursor = previousCharacterStart(in: bytes, before: cursor)
           redraw(prompt: prompt, bytes: bytes, cursor: cursor)
-        case .interrupted:
+        case 3:  // Ctrl+C
           wasInterrupted = true
           surface?.cancelInput()
           return ""
-        case .submitted(let line):
-          renderSubmittedLine(prompt: prompt, bytes: line)
-          let submitted = String(decoding: line, as: UTF8.self)
-          if rememberInput { remember(submitted) }
-          return submitted
-        case .endOfFile:
-          surface?.acceptInput(styled: "")
-          return nil
+        case 4:  // Ctrl+D
+          if bytes.isEmpty {
+            surface?.acceptInput(styled: "")
+            return nil
+          }
+        case 5:  // Ctrl+E: end of the line
+          cursor = lineEnd(in: bytes, at: cursor)
+          redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+        case 6:  // Ctrl+F, like Right
+          cursor = nextCharacterEnd(in: bytes, after: cursor)
+          redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+        case 9:  // Tab
+          complete(
+            prompt: prompt,
+            bytes: &bytes,
+            cursor: &cursor,
+            candidates: completions)
+        case 10:  // Ctrl+J: a line break, for terminals that send Enter for Shift+Enter
+          insert([10])
+        case 14:  // Ctrl+N
+          moveToNextLine()
+        case 16:  // Ctrl+P
+          moveToPreviousLine()
+        case 18:  // Ctrl+R
+          switch reverseSearch(original: bytes, startingAt: historyIndex) {
+          case .accepted(let line, let index, let acceptedCursor):
+            if historyIndex == nil, index != nil { draft = bytes }
+            bytes = line
+            cursor = acceptedCursor
+            historyIndex = index
+            redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+          case .cancelled:
+            redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+          case .interrupted:
+            wasInterrupted = true
+            surface?.cancelInput()
+            return ""
+          case .submitted(let line):
+            renderSubmittedLine(prompt: prompt, bytes: line)
+            let submitted = String(decoding: line, as: UTF8.self)
+            if rememberInput { remember(submitted) }
+            return submitted
+          case .endOfFile:
+            surface?.acceptInput(styled: "")
+            return nil
+          }
+        case 23:  // Ctrl+W
+          guard cursor > 0 else { continue }
+          let start = previousWordStart(in: bytes, before: cursor)
+          bytes.removeSubrange(start..<cursor)
+          cursor = start
+          historyIndex = nil
+          redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+        case 26:  // Ctrl+Z
+          surface?.suspendProcess()
+          drawSeparator(separator)
+          redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+        case 13:  // Enter submits the whole input
+          renderSubmittedLine(prompt: prompt, bytes: bytes)
+          let line = String(decoding: bytes, as: UTF8.self)
+          if rememberInput { remember(line) }
+          return line
+        case 127, 8:
+          guard cursor > 0 else { continue }
+          let previous = previousCharacterStart(in: bytes, before: cursor)
+          bytes.removeSubrange(previous..<cursor)
+          cursor = previous
+          redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+        default:
+          guard byte >= 32 else { continue }
+          insert(readCharacter(startingWith: byte))
         }
-      case 23:  // Ctrl+W
-        guard cursor > 0 else { continue }
-        let start = previousWordStart(in: bytes, before: cursor)
-        bytes.removeSubrange(start..<cursor)
-        cursor = start
-        historyIndex = nil
+      case .text(let character):
+        insert(character)
+      case .newline:
+        insert([10])
+      case .paste(let pasted):
+        insert(normalizedPaste(pasted))
+      case .up:
+        moveToPreviousLine()
+      case .down:
+        moveToNextLine()
+      case .left:
+        cursor = previousCharacterStart(in: bytes, before: cursor)
         redraw(prompt: prompt, bytes: bytes, cursor: cursor)
-      case 26:  // Ctrl+Z
-        surface?.suspendProcess()
-        drawSeparator(separator)
+      case .right:
+        cursor = nextCharacterEnd(in: bytes, after: cursor)
         redraw(prompt: prompt, bytes: bytes, cursor: cursor)
-      case 10, 13:
-        renderSubmittedLine(prompt: prompt, bytes: bytes)
-        let line = String(decoding: bytes, as: UTF8.self)
-        if rememberInput { remember(line) }
-        return line
-      case 27:
-        handleEscape(
-          prompt: prompt,
-          bytes: &bytes,
-          cursor: &cursor,
-          historyIndex: &historyIndex,
-          draft: &draft)
-      case 127, 8:
-        guard cursor > 0 else { continue }
-        let previous = previousCharacterStart(in: bytes, before: cursor)
-        bytes.removeSubrange(previous..<cursor)
-        cursor = previous
+      case .home:
+        cursor = lineStart(in: bytes, at: cursor)
         redraw(prompt: prompt, bytes: bytes, cursor: cursor)
-      default:
-        guard byte >= 32 else { continue }
-        let character = readCharacter(startingWith: byte)
-        bytes.insert(contentsOf: character, at: cursor)
-        cursor += character.count
-        historyIndex = nil
+      case .end:
+        cursor = lineEnd(in: bytes, at: cursor)
         redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+      case .delete:
+        guard cursor < bytes.count else { continue }
+        let end = nextCharacterEnd(in: bytes, after: cursor)
+        bytes.removeSubrange(cursor..<end)
+        redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+      case .ignored:
+        continue
       }
     }
     surface?.acceptInput(styled: "")
     return nil
   }
 
-  private func handleEscape(
-    prompt: String,
-    bytes: inout [UInt8],
-    cursor: inout Int,
-    historyIndex: inout Int?,
-    draft: inout [UInt8]
-  ) {
-    guard readByte() == 91, let code = readByte() else { return }
-    switch code {
-    case 65:  // Up
-      guard
-        recallPreviousHistoryEntry(
-          bytes: &bytes,
-          cursor: &cursor,
-          historyIndex: &historyIndex,
-          draft: &draft)
-      else { return }
-    case 66:  // Down
-      guard
-        recallNextHistoryEntry(
-          bytes: &bytes,
-          cursor: &cursor,
-          historyIndex: &historyIndex,
-          draft: &draft)
-      else { return }
-    case 67:  // Right
-      cursor = nextCharacterEnd(in: bytes, after: cursor)
-    case 68:  // Left
-      cursor = previousCharacterStart(in: bytes, before: cursor)
-    case 72:  // Home
-      cursor = 0
-    case 70:  // End
-      cursor = bytes.count
-    case 51:  // Delete: ESC [ 3 ~
-      guard readByte() == 126, cursor < bytes.count else { return }
-      let end = nextCharacterEnd(in: bytes, after: cursor)
-      bytes.removeSubrange(cursor..<end)
+  // MARK: - Keys
+
+  private func readKey() -> Key? {
+    guard let byte = readByte() else { return nil }
+    guard byte == 27 else { return .byte(byte) }
+    return readEscapeSequence()
+  }
+
+  /// What follows an Escape byte: a CSI or SS3 sequence, Alt+Enter, or
+  /// nothing within a moment, which is the Escape key on its own.
+  private func readEscapeSequence() -> Key {
+    guard let next = readByte(timeoutMilliseconds: 50) else { return .ignored }
+    switch next {
+    case 10, 13:
+      return .newline
+    case UInt8(ascii: "["):
+      return readControlSequence()
+    case UInt8(ascii: "O"):
+      guard let final = readByte() else { return .ignored }
+      return cursorKey(final: final) ?? .ignored
     default:
-      return
+      return .ignored
     }
-    redraw(prompt: prompt, bytes: bytes, cursor: cursor)
+  }
+
+  /// The parameters and final byte of a CSI sequence, `ESC [` already read.
+  private func readControlSequence() -> Key {
+    var parameters: [UInt8] = []
+    while let byte = readByte() {
+      if (0x40...0x7E).contains(byte) {
+        return decodeControlSequence(
+          parameters: String(decoding: parameters, as: UTF8.self), final: byte)
+      }
+      guard parameters.count < 64 else { return .ignored }
+      parameters.append(byte)
+    }
+    return .ignored
+  }
+
+  private func decodeControlSequence(parameters: String, final: UInt8) -> Key {
+    let fields = parameters.split(separator: ";", omittingEmptySubsequences: false)
+      .map(String.init)
+    if let key = cursorKey(final: final) { return key }
+    switch final {
+    case UInt8(ascii: "~"):
+      switch fields.first.flatMap({ Int($0) }) {
+      case 1, 7: return .home
+      case 4, 8: return .end
+      case 3: return .delete
+      case 200: return .paste(readPastedBytes())
+      case 27:
+        // xterm's modifyOtherKeys form: CSI 27 ; modifiers ; key ~
+        guard fields.count >= 3, let modifiers = Int(fields[1]), let code = Int(fields[2])
+        else { return .ignored }
+        return decodeKeyCode(code, shifted: nil, modifiers: modifiers, event: 1)
+      default: return .ignored
+      }
+    case UInt8(ascii: "u"):
+      // The kitty keyboard protocol: CSI key[:shifted[:base]] ; modifiers[:event] u
+      let keyFields = fields[0].split(separator: ":", omittingEmptySubsequences: false)
+      guard let code = keyFields.first.flatMap({ Int($0) }) else { return .ignored }
+      let shifted = keyFields.count > 1 ? Int(keyFields[1]) : nil
+      let modifierFields =
+        fields.count > 1 ? fields[1].split(separator: ":", omittingEmptySubsequences: false) : []
+      let modifiers = modifierFields.first.flatMap { Int($0) } ?? 1
+      let event = modifierFields.count > 1 ? Int(modifierFields[1]) ?? 1 : 1
+      return decodeKeyCode(code, shifted: shifted, modifiers: modifiers, event: event)
+    default:
+      return .ignored
+    }
+  }
+
+  private func cursorKey(final: UInt8) -> Key? {
+    switch final {
+    case UInt8(ascii: "A"): .up
+    case UInt8(ascii: "B"): .down
+    case UInt8(ascii: "C"): .right
+    case UInt8(ascii: "D"): .left
+    case UInt8(ascii: "H"): .home
+    case UInt8(ascii: "F"): .end
+    default: nil
+    }
+  }
+
+  /// A key reported with its modifiers, the way the kitty protocol and
+  /// xterm's modifyOtherKeys do, mapped to what the editor knows: modified
+  /// Enter breaks the line, Ctrl+letter is its control byte, and a plain
+  /// character is text.
+  private func decodeKeyCode(_ code: Int, shifted: Int?, modifiers: Int, event: Int) -> Key {
+    guard event != 3 else { return .ignored }  // a key release
+    // Shift 1, Alt 2, Ctrl 4, Super 8, Hyper 16, Meta 32; lock keys are ignored.
+    let held = max(0, modifiers - 1) & 0x3F
+    let shift = held & 1 != 0
+    let ctrl = held & 4 != 0
+    let others = held & ~5 != 0
+    switch code {
+    case 13, 57414:  // Enter, keypad Enter
+      return held == 0 ? .byte(13) : .newline
+    case 27: return .ignored
+    case 9: return held == 0 ? .byte(9) : .ignored
+    case 127, 8: return .byte(127)
+    case 57349: return .delete
+    case 57350: return .left
+    case 57351: return .right
+    case 57352: return .up
+    case 57353: return .down
+    case 57356: return .home
+    case 57357: return .end
+    default:
+      if ctrl, !others {
+        guard (97...122).contains(code) || (65...90).contains(code) else { return .ignored }
+        return .byte(UInt8(code & 0x1F))
+      }
+      guard !ctrl, !others, code >= 32, let scalar = Unicode.Scalar(shift ? shifted ?? code : code)
+      else { return .ignored }
+      return .text(Array(String(Character(scalar)).utf8))
+    }
+  }
+
+  /// Everything up to the paste's closing `ESC [ 201 ~`.
+  private func readPastedBytes() -> [UInt8] {
+    let terminator: [UInt8] = [27, 91, 50, 48, 49, 126]
+    var result: [UInt8] = []
+    while let byte = readByte() {
+      result.append(byte)
+      if byte == 126, result.count >= terminator.count,
+        result.suffix(terminator.count).elementsEqual(terminator)
+      {
+        result.removeLast(terminator.count)
+        return result
+      }
+    }
+    return result
+  }
+
+  /// Pasted text with its line ends as newlines and other control characters
+  /// dropped; tabs stay.
+  private func normalizedPaste(_ pasted: [UInt8]) -> [UInt8] {
+    var result: [UInt8] = []
+    result.reserveCapacity(pasted.count)
+    var index = 0
+    while index < pasted.count {
+      let byte = pasted[index]
+      index += 1
+      switch byte {
+      case 13:
+        result.append(10)
+        if index < pasted.count, pasted[index] == 10 { index += 1 }
+      case 9, 10:
+        result.append(byte)
+      case 0..<32, 127:
+        continue
+      default:
+        result.append(byte)
+      }
+    }
+    return result
   }
 
   private func recallPreviousHistoryEntry(
@@ -376,86 +611,84 @@ final class TerminalLineEditor {
     var undoStack: [ReverseSearchState] = []
     redrawReverseSearch(state, original: original)
 
-    while let byte = readByte() {
-      switch byte {
-      case 1:  // Ctrl+A accepts the match and moves to its beginning.
-        let selection = reverseSearchSelection(state, original: original)
-        return .accepted(line: selection, historyIndex: state.matchIndex, cursor: 0)
-      case 2:  // Ctrl+B accepts the match one character from its end, like Left.
-        let selection = reverseSearchSelection(state, original: original)
-        return .accepted(
-          line: selection,
-          historyIndex: state.matchIndex,
-          cursor: previousCharacterStart(in: selection, before: selection.count))
-      case 3:  // Ctrl+C cancels the whole input.
-        return .interrupted
-      case 5, 6:  // Ctrl+E and Ctrl+F accept the match and move to its end.
-        let selection = reverseSearchSelection(state, original: original)
-        return .accepted(
-          line: selection,
-          historyIndex: state.matchIndex,
-          cursor: selection.count)
-      case 7:  // Ctrl+G restores the line from before the search.
-        return .cancelled
-      case 9:  // Tab accepts the match for editing.
-        let selection = reverseSearchSelection(state, original: original)
-        return .accepted(
-          line: selection,
-          historyIndex: state.matchIndex,
-          cursor: selection.count)
-      case 10, 13:
-        return .submitted(reverseSearchSelection(state, original: original))
-      case 18:  // Ctrl+R repeats the search before the current match.
-        if let index = state.matchIndex,
-          let match = matchingHistoryIndex(for: state.query, atOrBefore: index - 1)
-        {
-          state.matchIndex = match
-          state.failed = false
-        } else {
-          state.failed = true
-          surface?.bell()
-        }
-      case 27:  // An escape sequence accepts the match for editing.
-        let selection = reverseSearchSelection(state, original: original)
-        guard readByte() == 91, let code = readByte() else {
+    func extendQuery(_ character: [UInt8]) {
+      undoStack.append(state)
+      state.query.append(contentsOf: character)
+      if let match = matchingHistoryIndex(
+        for: state.query,
+        atOrBefore: state.matchIndex ?? history.count - 1)
+      {
+        state.matchIndex = match
+        state.failed = false
+      } else {
+        state.failed = true
+        surface?.bell()
+      }
+    }
+
+    while let key = readKey() {
+      let selection = reverseSearchSelection(state, original: original)
+      switch key {
+      case .byte(let byte):
+        switch byte {
+        case 1:  // Ctrl+A accepts the match and moves to its beginning.
+          return .accepted(line: selection, historyIndex: state.matchIndex, cursor: 0)
+        case 2:  // Ctrl+B accepts the match one character from its end, like Left.
+          return .accepted(
+            line: selection,
+            historyIndex: state.matchIndex,
+            cursor: previousCharacterStart(in: selection, before: selection.count))
+        case 3:  // Ctrl+C cancels the whole input.
+          return .interrupted
+        case 5, 6:  // Ctrl+E and Ctrl+F accept the match and move to its end.
           return .accepted(
             line: selection,
             historyIndex: state.matchIndex,
             cursor: selection.count)
+        case 7:  // Ctrl+G restores the line from before the search.
+          return .cancelled
+        case 9, 10:  // Tab and Ctrl+J accept the match for editing.
+          return .accepted(
+            line: selection,
+            historyIndex: state.matchIndex,
+            cursor: selection.count)
+        case 13:
+          return .submitted(selection)
+        case 18:  // Ctrl+R repeats the search before the current match.
+          if let index = state.matchIndex,
+            let match = matchingHistoryIndex(for: state.query, atOrBefore: index - 1)
+          {
+            state.matchIndex = match
+            state.failed = false
+          } else {
+            state.failed = true
+            surface?.bell()
+          }
+        case 127, 8:
+          guard let previous = undoStack.popLast() else {
+            surface?.bell()
+            continue
+          }
+          state = previous
+        default:
+          guard byte >= 32 else {
+            surface?.bell()
+            continue
+          }
+          extendQuery(readCharacter(startingWith: byte))
         }
-        if code == 51 { _ = readByte() }
-        let acceptedCursor =
-          code == 68
-          ? previousCharacterStart(in: selection, before: selection.count)
-          : selection.count
+      case .text(let character):
+        extendQuery(character)
+      case .left:  // Any other key accepts the match for editing.
         return .accepted(
           line: selection,
           historyIndex: state.matchIndex,
-          cursor: acceptedCursor)
-      case 127, 8:
-        guard let previous = undoStack.popLast() else {
-          surface?.bell()
-          continue
-        }
-        state = previous
-      default:
-        guard byte >= 32 else {
-          surface?.bell()
-          continue
-        }
-        let character = readCharacter(startingWith: byte)
-        undoStack.append(state)
-        state.query.append(contentsOf: character)
-        if let match = matchingHistoryIndex(
-          for: state.query,
-          atOrBefore: state.matchIndex ?? history.count - 1)
-        {
-          state.matchIndex = match
-          state.failed = false
-        } else {
-          state.failed = true
-          surface?.bell()
-        }
+          cursor: previousCharacterStart(in: selection, before: selection.count))
+      case .right, .up, .down, .home, .end, .delete, .newline, .paste, .ignored:
+        return .accepted(
+          line: selection,
+          historyIndex: state.matchIndex,
+          cursor: selection.count)
       }
       redrawReverseSearch(state, original: original)
     }
@@ -493,7 +726,7 @@ final class TerminalLineEditor {
     cursor: inout Int,
     candidates: [String]
   ) {
-    guard cursor == bytes.count else { return }
+    guard cursor == bytes.count, !bytes.contains(10) else { return }
     let line = String(decoding: bytes, as: UTF8.self)
     let matches = candidates.filter { $0.hasPrefix(line) }.sorted()
     guard !matches.isEmpty else {
@@ -514,32 +747,59 @@ final class TerminalLineEditor {
     redraw(prompt: prompt, bytes: bytes, cursor: cursor)
   }
 
+  // MARK: - Drawing
+
+  /// Draws the input, one row per line: the prompt heads the first visible
+  /// row, the others are indented to it, and each row scrolls sideways on
+  /// its own so the caret's line stays in view.
   private func redraw(prompt: String, bytes: [UInt8], cursor: Int) {
     // Leave the terminal's final column unused: printing into it can trigger an
     // automatic wrap, after which clearing one row no longer erases the input.
     let lineWidth = max(1, Self.terminalColumns() - 1)
     let minimumInputWidth = min(12, max(1, lineWidth / 2))
     let visiblePrompt = truncatedPrompt(prompt, maximumWidth: lineWidth - minimumInputWidth)
-    let inputWidth = max(1, lineWidth - displayWidth(visiblePrompt))
-    let visibleRange = visibleInputRange(in: bytes, cursor: cursor, maximumWidth: inputWidth)
-    let visibleInput = String(decoding: bytes[visibleRange], as: UTF8.self)
+    let promptWidth = displayWidth(visiblePrompt)
+    let inputWidth = max(1, lineWidth - promptWidth)
+    let lines = lineRanges(in: bytes)
+    let cursorLine = lines.firstIndex { cursor <= $0.upperBound } ?? lines.count - 1
+    let maximumRows = max(1, surface?.maximumInputRows() ?? 1)
+    if cursorLine < viewTop { viewTop = cursorLine }
+    if cursorLine >= viewTop + maximumRows { viewTop = cursorLine - maximumRows + 1 }
+    viewTop = max(0, min(viewTop, lines.count - maximumRows))
     let promptStyle = style(foreground: ui.promptForeground, background: ui.promptBackground)
     let inputStyle = style(foreground: ui.foreground, background: ui.background, bold: ui.bold)
     let hasInputBackground = Self.colorCode(ui.background, background: true) != nil
-    let paddingWidth = hasInputBackground ? max(0, inputWidth - displayWidth(visibleInput)) : 0
-    let padding = String(repeating: " ", count: paddingWidth)
-    let styled =
-      promptStyle + visiblePrompt + resetStyle + inputStyle + visibleInput + padding + resetStyle
-    let width = displayWidth(visiblePrompt) + displayWidth(visibleInput) + paddingWidth
-    let suffixWidth = displayWidth(bytes[cursor..<visibleRange.upperBound])
-    surface?.drawInput(styled: styled, width: width, caretBack: suffixWidth + paddingWidth)
+    let indent = String(repeating: " ", count: promptWidth)
+    var rows: [String] = []
+    var caretColumn = promptWidth
+    for (offset, line) in lines[viewTop..<min(lines.count, viewTop + maximumRows)].enumerated() {
+      let isCursorLine = viewTop + offset == cursorLine
+      let visibleRange = visibleInputRange(
+        in: bytes, line: line, cursor: isCursorLine ? cursor : line.lowerBound,
+        maximumWidth: inputWidth)
+      let visibleInput = renderable(bytes[visibleRange])
+      let paddingWidth =
+        hasInputBackground ? max(0, inputWidth - displayWidth(visibleInput)) : 0
+      let padding = String(repeating: " ", count: paddingWidth)
+      let head = offset == 0 ? promptStyle + visiblePrompt + resetStyle : indent
+      rows.append(head + inputStyle + visibleInput + padding + resetStyle)
+      if isCursorLine {
+        caretColumn = promptWidth + displayWidth(bytes[visibleRange.lowerBound..<cursor])
+      }
+    }
+    surface?.drawInput(rows: rows, caretRow: cursorLine - viewTop, caretColumn: caretColumn)
   }
 
-  /// The prompt and line as they appear once accepted, for the surface to keep.
+  /// The prompt and text as they appear once accepted, for the surface to
+  /// keep; further lines are indented to the prompt.
   func styledLine(prompt: String, text: String) -> String {
     let promptStyle = style(foreground: ui.promptForeground, background: ui.promptBackground)
     let inputStyle = style(foreground: ui.foreground, background: ui.background, bold: ui.bold)
-    return promptStyle + prompt + resetStyle + inputStyle + text + resetStyle
+    let indent = String(repeating: " ", count: displayWidth(prompt))
+    let body = text.split(separator: "\n", omittingEmptySubsequences: false)
+      .map { inputStyle + $0 + resetStyle }
+      .joined(separator: "\n" + indent)
+    return promptStyle + prompt + resetStyle + body
   }
 
   private func renderSubmittedLine(prompt: String, bytes: [UInt8]) {
@@ -628,6 +888,12 @@ final class TerminalLineEditor {
     return Int(size.ws_col)
   }
 
+  static func terminalRows() -> Int {
+    var size = winsize()
+    guard ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size) == 0, size.ws_row > 0 else { return 24 }
+    return Int(size.ws_row)
+  }
+
   private func truncatedPrompt(_ prompt: String, maximumWidth: Int) -> String {
     guard maximumWidth > 0 else { return "" }
     guard displayWidth(prompt) > maximumWidth else { return prompt }
@@ -644,30 +910,37 @@ final class TerminalLineEditor {
     return result + "… "
   }
 
+  /// The part of one line that fits `maximumWidth` cells around the cursor:
+  /// as much before it as possible, then as much after it as still fits.
   private func visibleInputRange(
     in bytes: [UInt8],
+    line: Range<Int>,
     cursor: Int,
     maximumWidth: Int
   ) -> Range<Int> {
-    var start = cursor
+    let boundaries = characterBoundaries(in: bytes[line])
+    let cursorIndex = boundaries.firstIndex { $0 >= cursor } ?? boundaries.count - 1
+    var start = cursorIndex
+    var end = cursorIndex
     var width = 0
     while start > 0 {
-      let previous = previousCharacterStart(in: bytes, before: start)
-      let characterWidth = displayWidth(bytes[previous..<start])
+      let characterWidth = displayWidth(bytes[boundaries[start - 1]..<boundaries[start]])
       guard width + characterWidth <= maximumWidth else { break }
-      start = previous
+      start -= 1
       width += characterWidth
     }
+    while end < boundaries.count - 1 {
+      let characterWidth = displayWidth(bytes[boundaries[end]..<boundaries[end + 1]])
+      guard width + characterWidth <= maximumWidth else { break }
+      end += 1
+      width += characterWidth
+    }
+    return boundaries[start]..<boundaries[end]
+  }
 
-    var end = cursor
-    while end < bytes.count {
-      let next = nextCharacterEnd(in: bytes, after: end)
-      let characterWidth = displayWidth(bytes[end..<next])
-      guard width + characterWidth <= maximumWidth else { break }
-      end = next
-      width += characterWidth
-    }
-    return start..<end
+  /// Input bytes as drawn: a tab takes one cell, shown as a space.
+  private func renderable(_ bytes: ArraySlice<UInt8>) -> String {
+    String(decoding: bytes.map { $0 == 9 ? 32 : $0 }, as: UTF8.self)
   }
 
   private func displayWidth(_ bytes: ArraySlice<UInt8>) -> Int {
@@ -709,6 +982,8 @@ final class TerminalLineEditor {
     }
   }
 
+  // MARK: - Bytes
+
   private func readCharacter(startingWith first: UInt8) -> [UInt8] {
     let count: Int
     switch first {
@@ -722,29 +997,102 @@ final class TerminalLineEditor {
     return result
   }
 
-  private func readByte() -> UInt8? {
+  /// The next byte of input, from what the surface read ahead first; with a
+  /// timeout, nil when nothing arrives in time.
+  private func readByte(timeoutMilliseconds: Int32? = nil) -> UInt8? {
+    if typeahead.isEmpty, let surface { typeahead = surface.pendingInput() }
+    if !typeahead.isEmpty { return typeahead.removeFirst() }
+    if let timeoutMilliseconds {
+      var descriptor = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+      guard poll(&descriptor, 1, timeoutMilliseconds) > 0 else { return nil }
+    }
     var byte: UInt8 = 0
     return read(STDIN_FILENO, &byte, 1) == 1 ? byte : nil
   }
 
+  // MARK: - Lines
+
+  /// The lines of the input, split at newlines, as ranges of its bytes.
+  private func lineRanges(in bytes: [UInt8]) -> [Range<Int>] {
+    var ranges: [Range<Int>] = []
+    var start = 0
+    for (index, byte) in bytes.enumerated() where byte == 10 {
+      ranges.append(start..<index)
+      start = index + 1
+    }
+    ranges.append(start..<bytes.count)
+    return ranges
+  }
+
+  /// Where the line holding `position` starts: just after the previous newline.
+  private func lineStart(in bytes: [UInt8], at position: Int) -> Int {
+    var index = position
+    while index > 0, bytes[index - 1] != 10 { index -= 1 }
+    return index
+  }
+
+  /// Where the line holding `position` ends: at the next newline or the end.
+  private func lineEnd(in bytes: [UInt8], at position: Int) -> Int {
+    var index = position
+    while index < bytes.count, bytes[index] != 10 { index += 1 }
+    return index
+  }
+
+  /// The position `column` cells into the line starting at `start`, or where
+  /// that line ends when it is shorter.
+  private func position(in bytes: [UInt8], lineStart start: Int, column: Int) -> Int {
+    let boundaries = characterBoundaries(in: bytes[start..<lineEnd(in: bytes, at: start)])
+    var index = 0
+    var width = 0
+    while index < boundaries.count - 1 {
+      let characterWidth = displayWidth(bytes[boundaries[index]..<boundaries[index + 1]])
+      guard width + characterWidth <= column else { break }
+      index += 1
+      width += characterWidth
+    }
+    return boundaries[index]
+  }
+
+  /// Moves the cursor to the same column one line up; false on the first line.
+  private func moveUp(in bytes: [UInt8], cursor: inout Int) -> Bool {
+    let start = lineStart(in: bytes, at: cursor)
+    guard start > 0 else { return false }
+    let column = displayWidth(bytes[start..<cursor])
+    cursor = position(in: bytes, lineStart: lineStart(in: bytes, at: start - 1), column: column)
+    return true
+  }
+
+  /// Moves the cursor to the same column one line down; false on the last line.
+  private func moveDown(in bytes: [UInt8], cursor: inout Int) -> Bool {
+    let end = lineEnd(in: bytes, at: cursor)
+    guard end < bytes.count else { return false }
+    let column = displayWidth(bytes[lineStart(in: bytes, at: cursor)..<cursor])
+    cursor = position(in: bytes, lineStart: end + 1, column: column)
+    return true
+  }
+
+  // MARK: - Characters
+
   private func previousCharacterStart(in bytes: [UInt8], before position: Int) -> Int {
     guard position > 0 else { return 0 }
-    return characterBoundaries(in: bytes).last(where: { $0 < position }) ?? 0
+    return characterBoundaries(in: bytes[...]).last(where: { $0 < position }) ?? 0
   }
 
   private func nextCharacterEnd(in bytes: [UInt8], after position: Int) -> Int {
     guard position < bytes.count else { return bytes.count }
-    return characterBoundaries(in: bytes).first(where: { $0 > position }) ?? bytes.count
+    return characterBoundaries(in: bytes[...]).first(where: { $0 > position }) ?? bytes.count
   }
 
-  private func characterBoundaries(in bytes: [UInt8]) -> [Int] {
-    var boundaries = [0]
-    var offset = 0
+  /// Where the characters of a slice start and end, as indices of the array
+  /// it comes from, first and last included.
+  private func characterBoundaries(in bytes: ArraySlice<UInt8>) -> [Int] {
+    var boundaries = [bytes.startIndex]
+    var offset = bytes.startIndex
     for character in String(decoding: bytes, as: UTF8.self) {
       offset += character.utf8.count
-      boundaries.append(min(offset, bytes.count))
+      boundaries.append(min(offset, bytes.endIndex))
     }
-    if boundaries.last != bytes.count { boundaries.append(bytes.count) }
+    if boundaries.last != bytes.endIndex { boundaries.append(bytes.endIndex) }
     return boundaries
   }
 
@@ -774,6 +1122,8 @@ final class TerminalLineEditor {
     }
     return prefix
   }
+
+  // MARK: - History
 
   private func remember(_ line: String) {
     guard !line.isEmpty else { return }

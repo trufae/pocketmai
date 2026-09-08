@@ -8873,9 +8873,12 @@ struct MaiCLI {
     \(visualHelp)/clear              Clear conversation history
     /exit               Exit the REPL
 
-    Input: <<WORD starts a multiline message ending at WORD alone
+    Input: Shift+Enter adds a line (Alt+Enter or Ctrl+J where the terminal sends Enter for it)
+           A paste keeps its lines · Enter sends the whole text
+           <<WORD starts a multiline message ending at WORD alone
            !COMMAND runs a line in the system shell (interactive programs work)
-           Up/Down or Ctrl+P/N history · Ctrl+R reverse search · Ctrl+A/E beginning/end
+           Up/Down or Ctrl+P/N move between lines, then history · Ctrl+R reverse search
+           Ctrl+A/E or Home/End beginning/end of the line
            Ctrl+B/F move left/right like the arrow keys
            Ctrl+W delete word · Ctrl+C cancel run · Ctrl+Z suspend
            The prompt stays open while a turn runs: a message typed then is queued and
