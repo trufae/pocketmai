@@ -271,10 +271,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # swift-actions/setup-swift has no Windows support, so this job uses the
+      # installer-based action that the Swift project itself runs on Windows.
       - name: Set up Swift 6.3.3
-        uses: swift-actions/setup-swift@v3
+        uses: compnerd/gha-setup-swift@v0.4.1
         with:
-          swift-version: "6.3.3"
+          swift-version: swift-6.3.3-release
+          swift-build: 6.3.3-RELEASE
 
       - name: Show Swift version
         run: swift --version
