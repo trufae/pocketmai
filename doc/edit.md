@@ -35,6 +35,7 @@ so syntax highlighting and JSON checking work without configuration.
 | `/edit worker` | The instructions of the derived worker agent. | Immediately. |
 | `/edit config` | The whole configuration file. | Agent limits and tool-calling strategy immediately; providers, plugins, tools, and MCP servers after a restart. |
 | `/edit mcps` | The configured MCP server list as JSON. | After a restart. |
+| `/edit input` | An empty file for the next message, so a long one is written with the editor's keys instead of at the prompt. | Sent as an ordinary message when the editor closes; an empty file sends nothing. |
 | `/edit N` | Message N of this chat as Markdown. | Immediately; attachments are kept. |
 | `/edit MESSAGE_ID` | The same, by the message's full id. | Immediately. |
 
@@ -122,6 +123,14 @@ comes back as the message body and any attachments stay. `/chat edit INDEX
 TEXT` does the same in one line, `/chat messages` shows the indexes, and
 `/chat remove`, `/chat undo`, and `/chat trim` cover deleting rather than
 editing.
+
+### Writing a message
+
+`/edit input` is the odd one out: it changes nothing pmai owns. An empty file
+opens, and what it holds when the editor closes is sent to the chat as if it
+had been typed at the prompt, so a long message is written with the editor's
+keys. Leaving the file empty sends nothing. It works at the chat prompt; in
+visual mode, type the message into the pane.
 
 ## Related one-line commands
 
