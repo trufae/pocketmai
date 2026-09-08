@@ -1,4 +1,5 @@
 import Foundation
+import MaiCore
 import XCTest
 
 @testable import PocketMai
