@@ -1060,6 +1060,7 @@ struct MaiCLI {
         configuration?.ui.subagentOutput ?? ConfiguredTerminalUI().subagentOutput)
       await terminal.configurePromptColor(
         configuration?.ui.promptForeground ?? ConfiguredTerminalUI().promptForeground)
+      configureEditor(configuration?.ui.editor ?? "")
 
       if let mode = options.serve {
         await runServer(
@@ -1653,6 +1654,7 @@ struct MaiCLI {
       await terminal.configureSubagentOutput(ui.subagentOutput)
       await terminal.configurePromptColor(ui.promptForeground)
       await terminal.configureTerminalTitle(ui.title)
+      configureEditor(ui.editor)
       visual.memory.focus(project: project, chatID: session.id)
       visual.todo.focus(project: project)
       await runtime.configureMemory(visual.memory.promptSection)
@@ -4689,11 +4691,30 @@ struct MaiCLI {
     }
   }
 
+  /// The editor every `/edit` hands the terminal to: `/set ui.editor` when it
+  /// is set, then `$EDITOR`, `$VISUAL`, and vim as the last resort.
+  private static let editorLock = NSLock()
+  nonisolated(unsafe) private static var configuredEditor = ""
+
+  static func configureEditor(_ command: String) {
+    editorLock.withLock {
+      configuredEditor = command.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+  }
+
+  static func resolvedEditor(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+  ) -> String {
+    let configured = editorLock.withLock { configuredEditor }
+    for candidate in [configured, environment["EDITOR"] ?? "", environment["VISUAL"] ?? ""] {
+      let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty { return trimmed }
+    }
+    return "vim"
+  }
+
   private static func launchEditor(at url: URL, terminal: TerminalWriter) async -> Bool {
-    let environment = ProcessInfo.processInfo.environment
-    let preferredEditor = environment["EDITOR"] ?? environment["VISUAL"] ?? "vim"
-    let editor = preferredEditor.trimmingCharacters(in: .whitespacesAndNewlines)
-    let command = editor.isEmpty ? "vim" : editor
+    let command = resolvedEditor()
     let shellCommand = "\(command) \(shellQuote(url.path))"
     var waitStatus: CInt = -1
     let launch = { waitStatus = shellCommand.withCString(posixSystem) }
@@ -6690,13 +6711,13 @@ struct MaiCLI {
     let booleanKeys = ["ui.bold", "ui.markdown"]
     let countKeys = ["ui.toolresultlines"]
     let levelKeys = ["ui.subagents"]
-    let textKeys = ["ui.title"]
+    let textKeys = ["ui.title", "ui.editor"]
     guard
       colorKeys.contains(key) || booleanKeys.contains(key) || countKeys.contains(key)
         || levelKeys.contains(key) || textKeys.contains(key)
     else {
       await terminal.line(
-        "Unknown setting '\(parts[0])'. Available settings: effort, yolo, delegation, tool.calling, tool.proxy, limits.maxToolCalls, limits.maxModelTurns, limits.maxSubagents, limits.maxSubagentDepth, limits.maxTotalTokens, limits.maxSeconds, retry.attempts, retry.delay, ctx.compact, ctx.strategy, ui.title, ui.bgline, ui.fgcolor, ui.bgcolor, ui.fgprompt, ui.bgprompt, ui.fgtoolresult, ui.bold, ui.markdown, ui.toolResultLines, ui.subagents, use.agentsmd, use.plan"
+        "Unknown setting '\(parts[0])'. Available settings: effort, yolo, delegation, tool.calling, tool.proxy, limits.maxToolCalls, limits.maxModelTurns, limits.maxSubagents, limits.maxSubagentDepth, limits.maxTotalTokens, limits.maxSeconds, retry.attempts, retry.delay, ctx.compact, ctx.strategy, ui.title, ui.editor, ui.bgline, ui.fgcolor, ui.bgcolor, ui.fgprompt, ui.bgprompt, ui.fgtoolresult, ui.bold, ui.markdown, ui.toolResultLines, ui.subagents, use.agentsmd, use.plan"
       )
       return
     }
@@ -6710,8 +6731,15 @@ struct MaiCLI {
       return
     }
     if textKeys.contains(key) {
-      let title = parts.dropFirst().joined(separator: " ")
-      ui.title = ["none", "off"].contains(title.lowercased()) ? "" : title
+      let text = parts.dropFirst().joined(separator: " ")
+      // "none" empties the setting: the title goes away, and the editor falls
+      // back to $EDITOR again.
+      let value = ["none", "off"].contains(text.lowercased()) ? "" : text
+      if key == "ui.editor" {
+        ui.editor = value
+      } else {
+        ui.title = value
+      }
     } else if countKeys.contains(key) {
       let value: Int
       if parts[1].lowercased() == "all" {
@@ -6772,7 +6800,8 @@ struct MaiCLI {
     do {
       try draft.save(to: URL(fileURLWithPath: configurationPath))
       configuration = draft
-      if textKeys.contains(key) { await terminal.configureTerminalTitle(ui.title) }
+      if key == "ui.title" { await terminal.configureTerminalTitle(ui.title) }
+      if key == "ui.editor" { configureEditor(ui.editor) }
       await terminal.line("Set \(displayedKey) = \(uiSetting(key, in: ui)).")
     } catch {
       await terminal.line("error: \(error.localizedDescription)", to: .standardError)
@@ -7406,7 +7435,8 @@ struct MaiCLI {
 
   private static func listUISettings(_ ui: ConfiguredTerminalUI, terminal: TerminalWriter) async {
     for key in [
-      "ui.title", "ui.bgline", "ui.fgcolor", "ui.bgcolor", "ui.fgprompt", "ui.bgprompt", "ui.bold",
+      "ui.title", "ui.editor", "ui.bgline", "ui.fgcolor", "ui.bgcolor", "ui.fgprompt",
+      "ui.bgprompt", "ui.bold",
       "ui.fgtoolresult", "ui.markdown", "ui.toolResultLines", "ui.subagents",
     ] {
       await terminal.line("\(key) = \(uiSetting(key, in: ui))")
@@ -7417,6 +7447,10 @@ struct MaiCLI {
     let value: String
     switch key.lowercased() {
     case "ui.title": value = ui.title
+    // Unset is worth showing as what it resolves to, since that is the editor
+    // that actually opens.
+    case "ui.editor":
+      return ui.editor.isEmpty ? "\(resolvedEditor()) (from the environment)" : ui.editor
     case "ui.bgline": value = ui.backgroundLine
     case "ui.fgcolor": value = ui.foreground
     case "ui.bgcolor": value = ui.background
@@ -9054,7 +9088,8 @@ struct MaiCLI {
       "/set tool.", "/set tool.calling automatic", "/set tool.calling native",
       "/set tool.calling text", "/set tool.calling xml", "/set tool.calling json",
       "/set tool.proxy on", "/set tool.proxy off",
-      "/set ui.title ", "/set ui.title none", "/set ui.bgline rgb:024", "/set ui.bgline none",
+      "/set ui.title ", "/set ui.title none", "/set ui.editor ", "/set ui.editor none",
+      "/set ui.bgline rgb:024", "/set ui.bgline none",
       "/set ui.fgprompt yellow",
       "/set ui.fgcolor none", "/set ui.bgcolor none", "/set ui.bgprompt none",
       "/set ui.fgtoolresult yellow", "/set use.", "/set use.agentsmd on", "/set use.agentsmd off",
@@ -9447,6 +9482,7 @@ struct MaiCLI {
       /set ctx.strategy <cache|size>  Keep prompt-cache history intact, or compact old file reads
       /set ui.                     List terminal UI settings
       /set ui.title TEXT           Set the prompt label and terminal/tab title (`none` clears it)
+      /set ui.editor COMMAND       Editor /edit opens (`none` falls back to $EDITOR, $VISUAL, vim)
       /set ui.bgline COLOR         Set the input-line background
       /set ui.fgcolor COLOR        Set the input foreground
       /set ui.bgcolor COLOR        Set the input background
@@ -9554,10 +9590,11 @@ struct MaiCLI {
     The compact and memory templates must contain {{transcript}}; {{focus}} and
     {{memory}} are optional. The delegation template must contain {{task}};
     {{context}}, {{output}}, {{agent}}, and {{cwd}} are optional.
-    Clearing it restores the built-in default. Uses $EDITOR, then $VISUAL, then
-    vim. Agent limits and tool-calling strategy apply immediately, and an edited
-    provider is rebuilt in place; other provider, plugin, tool, and MCP changes
-    made through /edit config require a restart.
+    Clearing it restores the built-in default. Uses /set ui.editor when it is
+    set, then $EDITOR, then $VISUAL, then vim. Agent limits and tool-calling
+    strategy apply immediately, and an edited provider is rebuilt in place;
+    other provider, plugin, tool, and MCP changes made through /edit config
+    require a restart.
 
     A provider's "headers" is an object of names to values or an array of
     "Name: value" strings, sent with every request. A value may contain

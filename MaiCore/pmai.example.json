@@ -222,6 +222,7 @@
   ],
   "ui": {
     "title": "",
+    "editor": "",
     "bgline": "rgb:024",
     "fgprompt": "yellow",
     "fgcolor": "",
