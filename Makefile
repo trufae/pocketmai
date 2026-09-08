@@ -16,7 +16,7 @@ BUNDLE_ID = io.github.trufae.mai
 APP_BUNDLE ?=
 BINDIR ?= /usr/local/bin
 
-.PHONY: all build test list run repl repl-install plugin-fixture fmt clean check-shared-tooling aitest-build
+.PHONY: all build test list run repl repl-install repl-musl plugin-fixture fmt clean check-shared-tooling aitest-build
 
 all: build
 
@@ -86,6 +86,11 @@ repl-install:
 	swift build --package-path MaiCore -c release --product pmai
 	$(SUDO) cp -f MaiCore/.build/release/pmai $(BINDIR)/pmai
 	$(SUDO) $(STRIP) $(BINDIR)/pmai
+
+# Fully static Linux build that also runs on musl distributions such as
+# Alpine. Needs the Swift Static Linux SDK; see MaiCore/scripts/build-musl.sh.
+repl-musl:
+	MaiCore/scripts/build-musl.sh $(MUSL_ARCH)
 
 plugin-fixture:
 	swift build --package-path MaiCore --product MaiFixturePlugin

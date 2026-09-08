@@ -1,0 +1,724 @@
+swift-tui 0.10.1 imports Glibc on Linux without a Musl fallback, so pmai
+cannot be built with the Swift Static Linux SDK (x86_64/aarch64-swift-linux-musl).
+This patch adds the missing Musl branches next to the existing Glibc ones and
+adapts the few places where musl's C types differ (SOCK_STREAM is a plain
+Int32, sigaction keeps the handler in a union named __sa_handler, and environ
+is imported as an optional pointer). Applied by MaiCore/scripts/build-musl.sh;
+drop it once upstream swift-tui ships Musl support.
+
+diff --git a/Platforms/Arguments/Sources/SwiftTUIArguments/SwiftTUICommand.swift b/Platforms/Arguments/Sources/SwiftTUIArguments/SwiftTUICommand.swift
+index bc0edc4d..7961fb17 100644
+--- a/Platforms/Arguments/Sources/SwiftTUIArguments/SwiftTUICommand.swift
++++ b/Platforms/Arguments/Sources/SwiftTUIArguments/SwiftTUICommand.swift
+@@ -6,6 +6,8 @@ public import SwiftTUIRuntime
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(WASILibc)
+   import WASILibc
+ #elseif canImport(ucrt)
+@@ -227,6 +229,8 @@ package func failSynchronousLaunch(commandType: Any.Type) -> Never {
+     Darwin.exit(EXIT_FAILURE)
+   #elseif canImport(Glibc)
+     Glibc.exit(EXIT_FAILURE)
++  #elseif canImport(Musl)
++    Musl.exit(EXIT_FAILURE)
+   #elseif canImport(WASILibc)
+     WASILibc.exit(EXIT_FAILURE)
+   #else
+diff --git a/Platforms/CLI/Sources/SwiftTUICLIAttach/AttachProxy.swift b/Platforms/CLI/Sources/SwiftTUICLIAttach/AttachProxy.swift
+index 5cac9f6e..2812d8b2 100644
+--- a/Platforms/CLI/Sources/SwiftTUICLIAttach/AttachProxy.swift
++++ b/Platforms/CLI/Sources/SwiftTUICLIAttach/AttachProxy.swift
+@@ -7,6 +7,8 @@
+     import Darwin
+   #elseif canImport(Glibc)
+     import Glibc
++  #elseif canImport(Musl)
++    import Musl
+   #endif
+ 
+   enum AttachProxyError: Error, CustomStringConvertible {
+diff --git a/Platforms/CLI/Sources/SwiftTUICLIAttach/ScenePty.swift b/Platforms/CLI/Sources/SwiftTUICLIAttach/ScenePty.swift
+index 1138ca0e..01107e85 100644
+--- a/Platforms/CLI/Sources/SwiftTUICLIAttach/ScenePty.swift
++++ b/Platforms/CLI/Sources/SwiftTUICLIAttach/ScenePty.swift
+@@ -7,6 +7,8 @@
+     import Darwin
+   #elseif canImport(Glibc)
+     import Glibc
++  #elseif canImport(Musl)
++    import Musl
+   #endif
+ 
+   /// Attach-mode wrapper around `PTYPair`.
+diff --git a/Platforms/CLI/Sources/SwiftTUICLIAttach/SocketClient.swift b/Platforms/CLI/Sources/SwiftTUICLIAttach/SocketClient.swift
+index df93c3b7..cb0fffdb 100644
+--- a/Platforms/CLI/Sources/SwiftTUICLIAttach/SocketClient.swift
++++ b/Platforms/CLI/Sources/SwiftTUICLIAttach/SocketClient.swift
+@@ -5,6 +5,8 @@
+     import Darwin
+   #elseif canImport(Glibc)
+     import Glibc
++  #elseif canImport(Musl)
++    import Musl
+   #endif
+ 
+   // MARK: - SocketClientError
+@@ -167,7 +169,7 @@
+           nanoseconds: Int64(fileStatus.st_mtimespec.tv_nsec),
+           identifier: identifier
+         )
+-      #elseif canImport(Glibc)
++      #elseif canImport(Glibc) || canImport(Musl)
+         return InstanceSortKey(
+           seconds: Int64(fileStatus.st_mtim.tv_sec),
+           nanoseconds: Int64(fileStatus.st_mtim.tv_nsec),
+diff --git a/Platforms/CLI/Sources/SwiftTUICLIAttach/SocketServer.swift b/Platforms/CLI/Sources/SwiftTUICLIAttach/SocketServer.swift
+index 3561ac47..21e2a125 100644
+--- a/Platforms/CLI/Sources/SwiftTUICLIAttach/SocketServer.swift
++++ b/Platforms/CLI/Sources/SwiftTUICLIAttach/SocketServer.swift
+@@ -22,6 +22,8 @@
+     import Darwin
+   #elseif canImport(Glibc)
+     import Glibc
++  #elseif canImport(Musl)
++    import Musl
+   #endif
+ 
+   // MARK: - Codable conformance (stdlib Encodable/Decodable — no Foundation import needed)
+diff --git a/Platforms/CLI/Sources/SwiftTUITerminalCLI/App+TerminalLaunch.swift b/Platforms/CLI/Sources/SwiftTUITerminalCLI/App+TerminalLaunch.swift
+index a340f853..cceb6635 100644
+--- a/Platforms/CLI/Sources/SwiftTUITerminalCLI/App+TerminalLaunch.swift
++++ b/Platforms/CLI/Sources/SwiftTUITerminalCLI/App+TerminalLaunch.swift
+@@ -6,6 +6,8 @@ public import SwiftTUIArguments
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(ucrt)
+   import CRT
+ #endif
+@@ -108,6 +110,8 @@ private func exitLaunch(withError error: any Error) -> Never {
+     Darwin.exit(1)
+   #elseif canImport(Glibc)
+     Glibc.exit(1)
++  #elseif canImport(Musl)
++    Musl.exit(1)
+   #elseif canImport(ucrt)
+     CRT.exit(1)
+   #else
+diff --git a/Platforms/CLI/Sources/SwiftTUITerminalCLI/FrameDiagnosticsFileSink.swift b/Platforms/CLI/Sources/SwiftTUITerminalCLI/FrameDiagnosticsFileSink.swift
+index a1b0698e..c67fe240 100644
+--- a/Platforms/CLI/Sources/SwiftTUITerminalCLI/FrameDiagnosticsFileSink.swift
++++ b/Platforms/CLI/Sources/SwiftTUITerminalCLI/FrameDiagnosticsFileSink.swift
+@@ -4,6 +4,8 @@
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(ucrt)
+   import CRT
+ #endif
+diff --git a/Platforms/CLI/Sources/SwiftTUITerminalCLI/RenderOnce.swift b/Platforms/CLI/Sources/SwiftTUITerminalCLI/RenderOnce.swift
+index 1dd0e719..a46f0efb 100644
+--- a/Platforms/CLI/Sources/SwiftTUITerminalCLI/RenderOnce.swift
++++ b/Platforms/CLI/Sources/SwiftTUITerminalCLI/RenderOnce.swift
+@@ -6,6 +6,8 @@ import SwiftTUIRuntime
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(ucrt)
+@@ -126,7 +128,7 @@ public enum RenderOnce {
+   // MARK: - Private POSIX helpers
+ 
+   private static func ioctlTerminalWidth() -> Int? {
+-    #if canImport(Darwin) || canImport(Glibc) || canImport(Android)
++    #if canImport(Darwin) || canImport(Glibc) || canImport(Musl) || canImport(Android)
+       var size = winsize()
+       let result = unsafe withUnsafeMutablePointer(to: &size) { pointer in
+         unsafe ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), pointer)
+diff --git a/Platforms/CLI/Sources/SwiftTUITerminalCLI/SceneRuntime.swift b/Platforms/CLI/Sources/SwiftTUITerminalCLI/SceneRuntime.swift
+index 1986017e..dcae1181 100644
+--- a/Platforms/CLI/Sources/SwiftTUITerminalCLI/SceneRuntime.swift
++++ b/Platforms/CLI/Sources/SwiftTUITerminalCLI/SceneRuntime.swift
+@@ -18,6 +18,8 @@ import Foundation
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(ucrt)
+   import CRT
+ #endif
+diff --git a/Platforms/CLI/Sources/SwiftTUITerminalCLI/TerminalRunner.swift b/Platforms/CLI/Sources/SwiftTUITerminalCLI/TerminalRunner.swift
+index 57dbd36c..a35577fa 100644
+--- a/Platforms/CLI/Sources/SwiftTUITerminalCLI/TerminalRunner.swift
++++ b/Platforms/CLI/Sources/SwiftTUITerminalCLI/TerminalRunner.swift
+@@ -15,6 +15,8 @@ public import SwiftTUIArguments
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(ucrt)
+   import CRT
+ #endif
+diff --git a/Platforms/Embedding/Sources/SwiftTUIPTYPrimitives/OpenPTY.swift b/Platforms/Embedding/Sources/SwiftTUIPTYPrimitives/OpenPTY.swift
+index fcd49324..79397e66 100644
+--- a/Platforms/Embedding/Sources/SwiftTUIPTYPrimitives/OpenPTY.swift
++++ b/Platforms/Embedding/Sources/SwiftTUIPTYPrimitives/OpenPTY.swift
+@@ -6,6 +6,8 @@
+     import Darwin
+   #elseif canImport(Glibc)
+     import Glibc
++  #elseif canImport(Musl)
++    import Musl
+   #endif
+ 
+   public struct PTYHandles: Sendable {
+diff --git a/Platforms/Embedding/Sources/SwiftTUIPTYPrimitives/PTYPair.swift b/Platforms/Embedding/Sources/SwiftTUIPTYPrimitives/PTYPair.swift
+index 128812dd..2306f2c8 100644
+--- a/Platforms/Embedding/Sources/SwiftTUIPTYPrimitives/PTYPair.swift
++++ b/Platforms/Embedding/Sources/SwiftTUIPTYPrimitives/PTYPair.swift
+@@ -10,6 +10,9 @@
+   #elseif canImport(Glibc)
+     import Glibc
+     @unsafe @preconcurrency import Dispatch
++  #elseif canImport(Musl)
++    import Musl
++    @unsafe @preconcurrency import Dispatch
+   #endif
+ 
+   public actor PTYPair {
+diff --git a/Sources/SwiftTUIPlatformIO/PlatformPOSIX.swift b/Sources/SwiftTUIPlatformIO/PlatformPOSIX.swift
+index c5d3cb54..d6b1405f 100644
+--- a/Sources/SwiftTUIPlatformIO/PlatformPOSIX.swift
++++ b/Sources/SwiftTUIPlatformIO/PlatformPOSIX.swift
+@@ -7,11 +7,13 @@
+     package import Darwin
+   #elseif canImport(Glibc)
+     package import Glibc
++  #elseif canImport(Musl)
++    package import Musl
+   #elseif canImport(Android)
+     package import Android
+   #endif
+ 
+-  #if canImport(Darwin) || canImport(Android)
++  #if canImport(Darwin) || canImport(Android) || canImport(Musl)
+     private let sceneSocketStreamType = SOCK_STREAM
+   #elseif canImport(Glibc)
+     private let sceneSocketStreamType = Int32(SOCK_STREAM.rawValue)
+@@ -106,7 +108,7 @@
+     _ buffer: UnsafeRawPointer?,
+     _ count: Int
+   ) -> Int {
+-    #if canImport(Darwin) || canImport(Glibc) || canImport(Android)
++    #if canImport(Darwin) || canImport(Glibc) || canImport(Musl) || canImport(Android)
+       let sent = unsafe send(fileDescriptor, buffer, count, Int32(MSG_NOSIGNAL))
+       if sent >= 0 || errno != ENOTSOCK {
+         return sent
+diff --git a/Sources/SwiftTUIPrimitives/Draw/BrailleCanvas.swift b/Sources/SwiftTUIPrimitives/Draw/BrailleCanvas.swift
+index 0f194457..920dc47f 100644
+--- a/Sources/SwiftTUIPrimitives/Draw/BrailleCanvas.swift
++++ b/Sources/SwiftTUIPrimitives/Draw/BrailleCanvas.swift
+@@ -2,6 +2,8 @@
+   import Darwin  // macOS, iOS, tvOS, watchOS
+ #elseif canImport(Glibc)
+   import Glibc  // Linux
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(WASILibc)
+diff --git a/Sources/SwiftTUIPrimitives/Draw/CanvasGrid.swift b/Sources/SwiftTUIPrimitives/Draw/CanvasGrid.swift
+index 114c4e8e..1b4b52dc 100644
+--- a/Sources/SwiftTUIPrimitives/Draw/CanvasGrid.swift
++++ b/Sources/SwiftTUIPrimitives/Draw/CanvasGrid.swift
+@@ -2,6 +2,8 @@
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(WASILibc)
+diff --git a/Sources/SwiftTUIPrimitives/Styling/Color.swift b/Sources/SwiftTUIPrimitives/Styling/Color.swift
+index 22ec4801..a842d21b 100644
+--- a/Sources/SwiftTUIPrimitives/Styling/Color.swift
++++ b/Sources/SwiftTUIPrimitives/Styling/Color.swift
+@@ -2,6 +2,8 @@
+   internal import Darwin  // macOS, iOS, tvOS, watchOS
+ #elseif canImport(Glibc)
+   internal import Glibc  // Linux, some older Wasm
++#elseif canImport(Musl)
++  internal import Musl
+ #elseif canImport(Android)
+   internal import Android
+ #elseif canImport(WASILibc)
+diff --git a/Sources/SwiftTUIPrimitives/Styling/ColorConversions.swift b/Sources/SwiftTUIPrimitives/Styling/ColorConversions.swift
+index 2f7b9714..5d988994 100644
+--- a/Sources/SwiftTUIPrimitives/Styling/ColorConversions.swift
++++ b/Sources/SwiftTUIPrimitives/Styling/ColorConversions.swift
+@@ -2,6 +2,8 @@
+   internal import Darwin  // macOS, iOS, tvOS, watchOS
+ #elseif canImport(Glibc)
+   internal import Glibc  // Linux, some older Wasm
++#elseif canImport(Musl)
++  internal import Musl
+ #elseif canImport(Android)
+   internal import Android
+ #elseif canImport(WASILibc)
+diff --git a/Sources/SwiftTUIPrimitives/Styling/ColorHex.swift b/Sources/SwiftTUIPrimitives/Styling/ColorHex.swift
+index 62832c7f..5ab5145b 100644
+--- a/Sources/SwiftTUIPrimitives/Styling/ColorHex.swift
++++ b/Sources/SwiftTUIPrimitives/Styling/ColorHex.swift
+@@ -2,6 +2,8 @@
+   internal import Darwin  // macOS, iOS, tvOS, watchOS
+ #elseif canImport(Glibc)
+   internal import Glibc  // Linux, some older Wasm
++#elseif canImport(Musl)
++  internal import Musl
+ #elseif canImport(Android)
+   internal import Android
+ #elseif canImport(WASILibc)
+diff --git a/Sources/SwiftTUIPrimitives/Styling/ColorMath.swift b/Sources/SwiftTUIPrimitives/Styling/ColorMath.swift
+index 9d52819b..4f58da88 100644
+--- a/Sources/SwiftTUIPrimitives/Styling/ColorMath.swift
++++ b/Sources/SwiftTUIPrimitives/Styling/ColorMath.swift
+@@ -2,6 +2,8 @@
+   internal import Darwin  // macOS, iOS, tvOS, watchOS
+ #elseif canImport(Glibc)
+   internal import Glibc  // Linux, some older Wasm
++#elseif canImport(Musl)
++  internal import Musl
+ #elseif canImport(Android)
+   internal import Android
+ #elseif canImport(WASILibc)
+diff --git a/Sources/SwiftTUIPrimitives/Styling/ColorOperations.swift b/Sources/SwiftTUIPrimitives/Styling/ColorOperations.swift
+index 84c1f9c2..1f4322d0 100644
+--- a/Sources/SwiftTUIPrimitives/Styling/ColorOperations.swift
++++ b/Sources/SwiftTUIPrimitives/Styling/ColorOperations.swift
+@@ -2,6 +2,8 @@
+   internal import Darwin  // macOS, iOS, tvOS, watchOS
+ #elseif canImport(Glibc)
+   internal import Glibc  // Linux, some older Wasm
++#elseif canImport(Musl)
++  internal import Musl
+ #elseif canImport(Android)
+   internal import Android
+ #elseif canImport(WASILibc)
+diff --git a/Sources/SwiftTUIPrimitives/Styling/ColorProfile.swift b/Sources/SwiftTUIPrimitives/Styling/ColorProfile.swift
+index a8a2057b..a2e9bf7c 100644
+--- a/Sources/SwiftTUIPrimitives/Styling/ColorProfile.swift
++++ b/Sources/SwiftTUIPrimitives/Styling/ColorProfile.swift
+@@ -2,6 +2,8 @@
+   internal import Darwin  // macOS, iOS, tvOS, watchOS
+ #elseif canImport(Glibc)
+   internal import Glibc  // Linux, some older Wasm
++#elseif canImport(Musl)
++  internal import Musl
+ #elseif canImport(Android)
+   internal import Android
+ #elseif canImport(WASILibc)
+diff --git a/Sources/SwiftTUIPrimitives/Styling/ColorSpaces.swift b/Sources/SwiftTUIPrimitives/Styling/ColorSpaces.swift
+index 3a6b148f..fb797909 100644
+--- a/Sources/SwiftTUIPrimitives/Styling/ColorSpaces.swift
++++ b/Sources/SwiftTUIPrimitives/Styling/ColorSpaces.swift
+@@ -2,6 +2,8 @@
+   internal import Darwin  // macOS, iOS, tvOS, watchOS
+ #elseif canImport(Glibc)
+   internal import Glibc  // Linux, some older Wasm
++#elseif canImport(Musl)
++  internal import Musl
+ #elseif canImport(Android)
+   internal import Android
+ #elseif canImport(WASILibc)
+diff --git a/Sources/SwiftTUIPrimitives/Support/PlatformMath.swift b/Sources/SwiftTUIPrimitives/Support/PlatformMath.swift
+index 128afeda..c7c9f096 100644
+--- a/Sources/SwiftTUIPrimitives/Support/PlatformMath.swift
++++ b/Sources/SwiftTUIPrimitives/Support/PlatformMath.swift
+@@ -2,6 +2,8 @@
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(WASILibc)
+diff --git a/Sources/SwiftTUIProfiling/Sinks/TSVFileSink.swift b/Sources/SwiftTUIProfiling/Sinks/TSVFileSink.swift
+index beee495b..91f8df07 100644
+--- a/Sources/SwiftTUIProfiling/Sinks/TSVFileSink.swift
++++ b/Sources/SwiftTUIProfiling/Sinks/TSVFileSink.swift
+@@ -4,6 +4,8 @@
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(ucrt)
+   import CRT
+ #endif
+diff --git a/Sources/SwiftTUIRuntime/Input/TerminalInputStreamReading.swift b/Sources/SwiftTUIRuntime/Input/TerminalInputStreamReading.swift
+index e046447b..b4c9835d 100644
+--- a/Sources/SwiftTUIRuntime/Input/TerminalInputStreamReading.swift
++++ b/Sources/SwiftTUIRuntime/Input/TerminalInputStreamReading.swift
+@@ -2,6 +2,8 @@
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(WASILibc)
+@@ -26,6 +28,14 @@
+   ) -> Int {
+     unsafe Glibc.read(fileDescriptor, buffer, count)
+   }
++#elseif canImport(Musl)
++  private func platformRead(
++    _ fileDescriptor: Int32,
++    _ buffer: UnsafeMutableRawPointer?,
++    _ count: Int
++  ) -> Int {
++    unsafe Musl.read(fileDescriptor, buffer, count)
++  }
+ #elseif canImport(Android)
+   private func platformRead(
+     _ fileDescriptor: Int32,
+diff --git a/Sources/SwiftTUIRuntime/Support/LinkOpening.swift b/Sources/SwiftTUIRuntime/Support/LinkOpening.swift
+index c38660fa..88fd4a92 100644
+--- a/Sources/SwiftTUIRuntime/Support/LinkOpening.swift
++++ b/Sources/SwiftTUIRuntime/Support/LinkOpening.swift
+@@ -4,6 +4,8 @@ import SwiftTUIViews
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  @preconcurrency import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(ucrt)
+@@ -42,7 +44,7 @@ package func openLinkInSystem(
+   #endif
+ }
+ 
+-#if canImport(Darwin) || canImport(Glibc)
++#if canImport(Darwin) || canImport(Glibc) || canImport(Musl)
+   private func spawnDetachedProcess(
+     command: String,
+     arguments: [String],
+diff --git a/Sources/SwiftTUIRuntime/Terminal/ImageAssetRepository.swift b/Sources/SwiftTUIRuntime/Terminal/ImageAssetRepository.swift
+index 0671508c..0ae36026 100644
+--- a/Sources/SwiftTUIRuntime/Terminal/ImageAssetRepository.swift
++++ b/Sources/SwiftTUIRuntime/Terminal/ImageAssetRepository.swift
+@@ -12,6 +12,8 @@ import SwiftTUICore
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(WASILibc)
+@@ -661,6 +663,8 @@ private func openReadOnlyFile(
+       unsafe Darwin.open(cPath, O_RDONLY)
+     #elseif canImport(Glibc)
+       unsafe Glibc.open(cPath, O_RDONLY)
++    #elseif canImport(Musl)
++      unsafe Musl.open(cPath, O_RDONLY)
+     #elseif canImport(Android)
+       unsafe Android.open(cPath, O_RDONLY)
+     #elseif canImport(WASILibc)
+@@ -682,6 +686,8 @@ private func closeFile(
+     _ = Darwin.close(fileDescriptor)
+   #elseif canImport(Glibc)
+     _ = Glibc.close(fileDescriptor)
++  #elseif canImport(Musl)
++    _ = Musl.close(fileDescriptor)
+   #elseif canImport(Android)
+     _ = Android.close(fileDescriptor)
+   #elseif canImport(WASILibc)
+@@ -700,6 +706,8 @@ private func readFileChunk(
+     unsafe Darwin.read(fileDescriptor, buffer, count)
+   #elseif canImport(Glibc)
+     unsafe Glibc.read(fileDescriptor, buffer, count)
++  #elseif canImport(Musl)
++    unsafe Musl.read(fileDescriptor, buffer, count)
+   #elseif canImport(Android)
+     unsafe Android.read(fileDescriptor, buffer, count)
+   #elseif canImport(WASILibc)
+diff --git a/Sources/SwiftTUIRuntime/Terminal/TerminalClipboard.swift b/Sources/SwiftTUIRuntime/Terminal/TerminalClipboard.swift
+index e1dcf6e4..4d429490 100644
+--- a/Sources/SwiftTUIRuntime/Terminal/TerminalClipboard.swift
++++ b/Sources/SwiftTUIRuntime/Terminal/TerminalClipboard.swift
+@@ -2,6 +2,8 @@
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(ucrt)
+diff --git a/Sources/SwiftTUIRuntime/Terminal/TerminalHost.swift b/Sources/SwiftTUIRuntime/Terminal/TerminalHost.swift
+index f28ed2f5..824154e5 100644
+--- a/Sources/SwiftTUIRuntime/Terminal/TerminalHost.swift
++++ b/Sources/SwiftTUIRuntime/Terminal/TerminalHost.swift
+@@ -5,6 +5,8 @@ import Synchronization
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  @preconcurrency import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(WASILibc)
+@@ -898,7 +900,14 @@ package func currentProcessEnvironment() -> [String: String] {
+     [:]
+   #else
+     var environment: [String: String] = [:]
+-    let processEnvironment = unsafe environ
++    #if canImport(Musl)
++      // Musl imports `environ` as an optional pointer.
++      guard let processEnvironment = unsafe environ else {
++        return environment
++      }
++    #else
++      let processEnvironment = unsafe environ
++    #endif
+     var index = 0
+ 
+     while let entry = unsafe processEnvironment[index] {
+diff --git a/Sources/SwiftTUIRuntime/Terminal/TerminalModeSnapshot.swift b/Sources/SwiftTUIRuntime/Terminal/TerminalModeSnapshot.swift
+index 21e7043f..e65508f6 100644
+--- a/Sources/SwiftTUIRuntime/Terminal/TerminalModeSnapshot.swift
++++ b/Sources/SwiftTUIRuntime/Terminal/TerminalModeSnapshot.swift
+@@ -2,6 +2,8 @@
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(ucrt)
+@@ -10,7 +12,7 @@
+ 
+ // Positive host test, not "not WASI": the terminal-control family compiles
+ // exactly where a real terminal host exists (Stage 3.5 of the Windows plan).
+-#if canImport(Darwin) || canImport(Glibc) || canImport(Android) || canImport(ucrt)
++#if canImport(Darwin) || canImport(Glibc) || canImport(Musl) || canImport(Android) || canImport(ucrt)
+   /// An opaque snapshot of the terminal's pre-raw-mode state, captured by
+   /// ``TerminalControlling/enterRawMode(input:output:)`` and consumed only by
+   /// ``TerminalControlling/restore(_:input:output:)``.
+diff --git a/Sources/SwiftTUIRuntime/Terminal/TerminalPOSIXController.swift b/Sources/SwiftTUIRuntime/Terminal/TerminalPOSIXController.swift
+index 57282109..d9a30b6b 100644
+--- a/Sources/SwiftTUIRuntime/Terminal/TerminalPOSIXController.swift
++++ b/Sources/SwiftTUIRuntime/Terminal/TerminalPOSIXController.swift
+@@ -7,6 +7,8 @@ import SwiftTUICore
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(ucrt)
+@@ -15,7 +17,7 @@ import SwiftTUICore
+ 
+ // Positive host test, not "not WASI": the terminal-control seam compiles
+ // exactly where a real terminal host exists (Stage 3.5 of the Windows plan).
+-#if canImport(Darwin) || canImport(Glibc) || canImport(Android) || canImport(ucrt)
++#if canImport(Darwin) || canImport(Glibc) || canImport(Musl) || canImport(Android) || canImport(ucrt)
+   package protocol TerminalControlling: Sendable {
+     func isATTY(_ fileDescriptor: Int32) -> Bool
+     func windowSize(of fileDescriptor: Int32) throws -> CellSize
+@@ -59,7 +61,7 @@ import SwiftTUICore
+   }
+ #endif
+ 
+-#if canImport(Darwin) || canImport(Glibc) || canImport(Android)
++#if canImport(Darwin) || canImport(Glibc) || canImport(Musl) || canImport(Android)
+   struct POSIXTerminalController: TerminalControlling {
+     func isATTY(_ fileDescriptor: Int32) -> Bool {
+       isatty(fileDescriptor) == 1
+diff --git a/Sources/SwiftTUIRuntime/Terminal/TerminalPlatformIO.swift b/Sources/SwiftTUIRuntime/Terminal/TerminalPlatformIO.swift
+index 26a6a4a2..c6093b91 100644
+--- a/Sources/SwiftTUIRuntime/Terminal/TerminalPlatformIO.swift
++++ b/Sources/SwiftTUIRuntime/Terminal/TerminalPlatformIO.swift
+@@ -2,6 +2,8 @@
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(WASILibc)
+@@ -58,6 +60,30 @@
+   ) -> Int32 {
+     unsafe Glibc.poll(descriptors, count, timeoutMilliseconds)
+   }
++#elseif canImport(Musl)
++  func terminalPlatformWrite(
++    _ fileDescriptor: Int32,
++    _ buffer: UnsafeRawPointer?,
++    _ count: Int
++  ) -> Int {
++    unsafe Musl.write(fileDescriptor, buffer, count)
++  }
++
++  func terminalPlatformRead(
++    _ fileDescriptor: Int32,
++    _ buffer: UnsafeMutableRawPointer?,
++    _ count: Int
++  ) -> Int {
++    unsafe Musl.read(fileDescriptor, buffer, count)
++  }
++
++  func terminalPlatformPoll(
++    _ descriptors: UnsafeMutablePointer<pollfd>?,
++    _ count: nfds_t,
++    _ timeoutMilliseconds: Int32
++  ) -> Int32 {
++    unsafe Musl.poll(descriptors, count, timeoutMilliseconds)
++  }
+ #elseif canImport(Android)
+   func terminalPlatformWrite(
+     _ fileDescriptor: Int32,
+diff --git a/Sources/SwiftTUIRuntime/Terminal/TerminalPresentationState.swift b/Sources/SwiftTUIRuntime/Terminal/TerminalPresentationState.swift
+index c9dd0418..7063f0b0 100644
+--- a/Sources/SwiftTUIRuntime/Terminal/TerminalPresentationState.swift
++++ b/Sources/SwiftTUIRuntime/Terminal/TerminalPresentationState.swift
+@@ -5,6 +5,8 @@ import Synchronization
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(ucrt)
+diff --git a/Sources/SwiftTUIRuntime/Terminal/TerminalProcessExitCleanup.swift b/Sources/SwiftTUIRuntime/Terminal/TerminalProcessExitCleanup.swift
+index 8fe8160f..65073b8c 100644
+--- a/Sources/SwiftTUIRuntime/Terminal/TerminalProcessExitCleanup.swift
++++ b/Sources/SwiftTUIRuntime/Terminal/TerminalProcessExitCleanup.swift
+@@ -6,6 +6,8 @@ import Synchronization
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(ucrt)
+@@ -13,7 +15,7 @@ import Synchronization
+ #endif
+ 
+ // Positive host test, not "not WASI" (Stage 3.5 of the Windows plan).
+-#if canImport(Darwin) || canImport(Glibc) || canImport(Android) || canImport(ucrt)
++#if canImport(Darwin) || canImport(Glibc) || canImport(Musl) || canImport(Android) || canImport(ucrt)
+   package struct TerminalProcessExitResetAction: Sendable {
+     package let inputFileDescriptor: Int32
+     package let outputFileDescriptor: Int32
+diff --git a/Sources/SwiftTUIRuntime/Terminal/TerminalRawModeSession.swift b/Sources/SwiftTUIRuntime/Terminal/TerminalRawModeSession.swift
+index afb6a14c..cc7fb432 100644
+--- a/Sources/SwiftTUIRuntime/Terminal/TerminalRawModeSession.swift
++++ b/Sources/SwiftTUIRuntime/Terminal/TerminalRawModeSession.swift
+@@ -4,6 +4,8 @@ import SwiftTUICore
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(ucrt)
+@@ -11,7 +13,7 @@ import SwiftTUICore
+ #endif
+ 
+ // Positive host test, not "not WASI" (Stage 3.5 of the Windows plan).
+-#if canImport(Darwin) || canImport(Glibc) || canImport(Android) || canImport(ucrt)
++#if canImport(Darwin) || canImport(Glibc) || canImport(Musl) || canImport(Android) || canImport(ucrt)
+   struct TerminalRawModeRestorePlan {
+     var savedSnapshot: TerminalModeSnapshot?
+     var mouseCoordinateMode: MouseCoordinateMode
+diff --git a/Sources/SwiftTUIViews/Animation/SpringSolver.swift b/Sources/SwiftTUIViews/Animation/SpringSolver.swift
+index e02c70eb..a9eb1fd0 100644
+--- a/Sources/SwiftTUIViews/Animation/SpringSolver.swift
++++ b/Sources/SwiftTUIViews/Animation/SpringSolver.swift
+@@ -2,6 +2,8 @@
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(WASILibc)
+diff --git a/Vendor/UnixSignals/Sources/UnixSignals/CrashSignalHandler.swift b/Vendor/UnixSignals/Sources/UnixSignals/CrashSignalHandler.swift
+index e78d49f5..4b5b31a9 100644
+--- a/Vendor/UnixSignals/Sources/UnixSignals/CrashSignalHandler.swift
++++ b/Vendor/UnixSignals/Sources/UnixSignals/CrashSignalHandler.swift
+@@ -211,8 +211,11 @@
+           // __sigaction_u is a C union; assigning into one of its members has
+           // no static type-safety guarantee, so this read is genuinely unsafe.
+           unsafe action.__sigaction_u.__sa_handler = crashSignalHandler
+-        #elseif canImport(Glibc) || canImport(Musl) || canImport(Android)
+-          // The Glibc/Musl/Android shape is a typed struct, no `unsafe` needed.
++        #elseif canImport(Musl)
++          // Musl wraps the handler in an anonymous C union named __sa_handler.
++          unsafe action.__sa_handler.sa_handler = crashSignalHandler
++        #elseif canImport(Glibc) || canImport(Android)
++          // The Glibc/Android shape is a typed struct, no `unsafe` needed.
+           action.__sigaction_handler = .init(sa_handler: crashSignalHandler)
+         #endif
+         // SA_RESETHAND/SA_ONSTACK Swift-import types differ across platforms
+diff --git a/Vendor/swift-figlet/Sources/SwiftFiglet/SwiftFiglet.swift b/Vendor/swift-figlet/Sources/SwiftFiglet/SwiftFiglet.swift
+index 13b10ac8..62e4776e 100644
+--- a/Vendor/swift-figlet/Sources/SwiftFiglet/SwiftFiglet.swift
++++ b/Vendor/swift-figlet/Sources/SwiftFiglet/SwiftFiglet.swift
+@@ -2,6 +2,8 @@
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #elseif canImport(Android)
+   import Android
+ #elseif canImport(ucrt)
+diff --git a/Vendor/swift-figlet/Sources/figlet/FigletCLI.swift b/Vendor/swift-figlet/Sources/figlet/FigletCLI.swift
+index ec6d3c97..ef447ab2 100644
+--- a/Vendor/swift-figlet/Sources/figlet/FigletCLI.swift
++++ b/Vendor/swift-figlet/Sources/figlet/FigletCLI.swift
+@@ -5,6 +5,8 @@ public import SwiftTUIVendorFiglet
+   import Darwin
+ #elseif canImport(Glibc)
+   import Glibc
++#elseif canImport(Musl)
++  import Musl
+ #endif
+ 
+ public enum FigletCLI {
+@@ -217,7 +219,7 @@ private struct CLIError: Error {
+ private let defaultWidth = 80
+ 
+ private func detectedTerminalWidth() -> Int? {
+-  #if canImport(Darwin) || canImport(Glibc)
++  #if canImport(Darwin) || canImport(Glibc) || canImport(Musl)
+     var size = winsize()
+     let result = unsafe ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size)
+     guard result == 0, size.ws_col > 0 else {

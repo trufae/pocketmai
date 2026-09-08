@@ -18,3 +18,5 @@ test/results/
 # Local agent tooling state
 .codex-derived/
 .codex-profiles/
+# SwiftPM edit-mode copies (MaiCore/scripts/build-musl.sh)
+MaiCore/Packages/
