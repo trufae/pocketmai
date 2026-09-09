@@ -99,9 +99,15 @@ enum AudioTranscriptionService {
 
   /// The types the document picker offers so a recording can be picked there.
   static var pickerContentTypes: [UTType] {
-    var types: [UTType] = [.audio]
+    pickerContentTypes { UTType(filenameExtension: $0) }
+  }
+
+  static func pickerContentTypes(resolvingExtension: (String) -> UTType?) -> [UTType] {
+    // Extension lookup can return an alias or a dynamic type depending on the
+    // device's type registry. Always offer the canonical recording types too.
+    var types: [UTType] = [.audio, .mp3, .mpeg4Audio]
     for ext in audioExtensions.sorted() {
-      guard let type = UTType(filenameExtension: ext), !types.contains(type) else { continue }
+      guard let type = resolvingExtension(ext), !types.contains(type) else { continue }
       types.append(type)
     }
     return types

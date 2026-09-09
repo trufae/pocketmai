@@ -23,6 +23,26 @@ final class AudioAttachmentImportTests: XCTestCase {
     XCTAssertEqual(types.count, Set(types).count)
   }
 
+  func testPickerKeepsCanonicalTypesWithoutExtensionRegistration() {
+    let types = AudioTranscriptionService.pickerContentTypes { _ in nil }
+    XCTAssertEqual(types, [.audio, .mp3, .mpeg4Audio])
+  }
+
+  func testPickerDeduplicatesAliasesAndPreservesAdditionalTypes() {
+    var resolvedExtensions: [String] = []
+    let types = AudioTranscriptionService.pickerContentTypes { ext in
+      resolvedExtensions.append(ext)
+      switch ext {
+      case "mp3", "mpga": return .mp3
+      case "m4a", "mp4a": return .mpeg4Audio
+      case "wav", "wave": return .wav
+      default: return nil
+      }
+    }
+    XCTAssertEqual(types, [.audio, .mp3, .mpeg4Audio, .wav])
+    XCTAssertEqual(resolvedExtensions, AudioTranscriptionService.audioExtensions.sorted())
+  }
+
   func testStagedCopyOutlivesThePickedFile() throws {
     let source = FileManager.default.temporaryDirectory
       .appendingPathComponent("\(UUID().uuidString).m4a")
