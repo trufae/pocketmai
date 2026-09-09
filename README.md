@@ -17,7 +17,8 @@ This app, comes after [MAI](https://github.com/trufae/mai), a cli agent with foc
 - **Browser**: the model can open pages in an in-app WebKit view shown as a picture-in-picture card, read the text, DOM, links, or an on-device text-recognition pass over the screen, click, type, scroll, and run JavaScript. Tap the card to enlarge it and take over by hand for sign-ins and other steps only a person can do.
 - **MCP**: configure remote Streamable HTTP or CLI-local stdio servers and surface them to the model.
 - **Multiple system prompts**, persistent conversations, export to Markdown / plain text / JSON / ePUB / Word (docx).
-- **Attachments**: text, Markdown, Word (docx) and PDF files. Word and PDF are converted to Markdown on device (PDFs can also be attached as one image per page, and scanned pages are read with Vision OCR).
+- **Attachments**: text, Markdown, Word (docx), EPUB, JSON and PDF files. Word, EPUB and PDF are converted to Markdown on device (PDFs can also be attached as one image per page, and scanned pages are read with Vision OCR).
+- **Share sheet**: send pictures, voice messages and documents to PocketMai from WhatsApp, Telegram, Photos, Files or any other app. Voice messages are transcribed on device (Ogg Opus included), documents are converted to text, and pictures ask for their size or for OCR just like when they are attached inside the app.
 - **Background replies**: a Live Activity on the Lock Screen and in the Dynamic Island follows running replies and tool calls, and a local notification tells you when a reply finishes, fails, or needs a tool approval while the app is in the background. An optional "Keep working when locked" mode keeps long replies running after the screen locks.
 
 ## Build

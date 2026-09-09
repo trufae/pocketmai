@@ -7853,7 +7853,7 @@ struct MaiCLI {
     guard !trimmed.isEmpty else {
       await terminal.line("Usage: /attach PATH | /attach clear")
       await terminal.line(
-        "Word and PDF files become Markdown, JSON becomes an outline, text files attach as they are, and images attach at medium size."
+        "Word, EPUB and PDF files become Markdown, JSON becomes an outline, text files attach as they are, and images attach at medium size."
       )
       return
     }
@@ -9440,7 +9440,7 @@ struct MaiCLI {
     /skills             List, enable, disable, or send skills (/help skills)
     /mcp                Manage MCP servers; /help mcp lists commands
     /image MODE PATH    Attach at tiny/small/medium/big/full size, or OCR to Markdown
-    /attach PATH        Attach a Word, PDF, JSON, or text file as Markdown/plain text
+    /attach PATH        Attach a Word, EPUB, PDF, JSON, or text file as Markdown/plain text
     /attach clear       Drop the attachments queued for the next message
     /copy [N] [PATH]    Copy the last reply, or N messages, to the clipboard or a file
     /reply [WIDTH]      Answer the last reply in $EDITOR with it quoted above (/help reply)

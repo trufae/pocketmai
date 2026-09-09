@@ -423,6 +423,10 @@ final class AppStore: ObservableObject {
   /// A launch request from a widget tap or App Intent (Action Button / Siri),
   /// consumed by the chat UI. Cleared once handled.
   @Published var pendingLaunchAction: LaunchCommand?
+  /// Bumped when the share extension left pictures, voice messages or documents
+  /// for the composer to import.
+  @Published private(set) var sharedImportRequestID = 0
+  private var queuedSharedItems: [SharedInboxItem] = []
   /// Bumped to ask the composer to take keyboard focus (e.g. after a widget tap).
   @Published private(set) var composerFocusRequestID = 0
   @Published private(set) var composerDraftReplacement: ComposerDraftReplacement?
@@ -4557,6 +4561,28 @@ final class AppStore: ObservableObject {
     if let command = SharedAppState.takePendingLaunchCommand() {
       pendingLaunchAction = command
     }
+    drainSharedInbox()
+  }
+
+  /// Picks up whatever the share extension queued — a WhatsApp voice message, a
+  /// picture, an EPUB — and asks the composer to import it.
+  func drainSharedInbox() {
+    let items = SharedInbox.takeAll()
+    guard !items.isEmpty else { return }
+    queuedSharedItems += items
+    sharedImportRequestID &+= 1
+  }
+
+  var hasQueuedSharedItems: Bool {
+    !queuedSharedItems.isEmpty
+  }
+
+  /// Hands the queued shared items to the composer, which imports them through
+  /// the usual attachment workflow.
+  func takeQueuedSharedItems() -> [SharedInboxItem] {
+    let items = queuedSharedItems
+    queuedSharedItems = []
+    return items
   }
 
   func requestComposerFocus() {
@@ -5742,6 +5768,7 @@ final class AppStoreViewObservation: ObservableObject {
       observe(store.$appleAvailabilityMessage)
       observe(store.$openAPIServerState)
       observe(store.$pendingLaunchAction)
+      observe(store.$sharedImportRequestID)
       observe(store.$composerFocusRequestID)
       observe(store.$pendingMessageNavigation)
       observe(store.$browserSession)

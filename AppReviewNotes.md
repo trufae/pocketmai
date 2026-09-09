@@ -40,3 +40,19 @@ behaviours, none of which run without a user-started reply:
   the screen locks. It starts only while a reply is running and the app is in
   the background, and stops as soon as the reply ends or the app returns to
   the foreground. The user is told it uses more battery.
+
+## Share extension
+
+The PocketMai share extension takes pictures, voice messages, documents, text
+and links from other apps' share sheets. It has no interface of its own beyond
+a progress label: every item is copied into the app group container and PocketMai
+is opened, where the items land in the chat composer as pending attachments. The
+user still has to send the message.
+
+Shared audio is transcribed with Apple's speech recogniser on the device, on
+device whenever the language is installed for offline recognition. Voice
+messages recorded by WhatsApp or Telegram are Opus audio in an Ogg container,
+which is repackaged as CAF locally so the system decoder can read it; nothing
+about the audio is uploaded by PocketMai itself. Pictures ask for their size or
+for on-device OCR, exactly as when they are attached inside the app, and
+nothing is sent to a provider until the user submits the message.

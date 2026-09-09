@@ -169,15 +169,15 @@ the workspace makes the focused conversation the REPL conversation; the other
 conversations and the pane layout are kept in memory for the next `/visual`.
 Visual mode needs an interactive terminal and, on macOS, version 15 or later.
 
-`/attach PATH` queues a document for the next message. Word files and PDFs
-are converted to Markdown (scanned PDF pages go through on-device OCR on Apple
-platforms), JSON files become an indented outline, and other text files are
+`/attach PATH` queues a document for the next message. Word files, EPUB books
+and PDFs are converted to Markdown (scanned PDF pages go through on-device OCR
+on Apple platforms), JSON files become an indented outline, and other text files are
 attached verbatim; images are attached at medium size, so use `/image` for other
 sizes or OCR. `/attach clear` drops everything queued. The converters live in
 the `MaiDocuments` module, which PocketMai links as well, so the app, the CLI,
 and its visual mode share one implementation. `MaiDocuments` needs PDFKit for
-PDFs, so PDF conversion is unavailable on Linux while Word, JSON, and text work
-everywhere. The same module holds the exporters (`ChatExport`, `MarkdownExport`,
+PDFs, so PDF conversion is unavailable on Linux while Word, EPUB, JSON, and
+text work everywhere. The same module holds the exporters (`ChatExport`, `MarkdownExport`,
 `EPUBExport`, `DOCXExport`): they write from a small `ExportDocument` that each
 host builds from its own chat model, so `/export` here and the share sheet in
 PocketMai produce the same files.
