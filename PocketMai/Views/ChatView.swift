@@ -2572,6 +2572,7 @@ private struct ChatComposer: View {
   @State private var isImportingSharedItems = false
   @State private var isResumingSharedImport = false
   @State private var viewingPendingAttachment: ChatAttachment?
+  @State private var viewingPendingImageAttachment: ChatAttachment?
   @State private var pendingImageSizePrompt: PendingImageAttachmentImport?
   @State private var pendingPDFImport: PendingPDFImport?
   @State private var attachmentConversionMessage: String?
@@ -2800,6 +2801,9 @@ private struct ChatComposer: View {
           updatePendingAttachmentText(id: attachment.id, text: text)
         })
     }
+    .fullScreenCover(item: $viewingPendingImageAttachment) { attachment in
+      MessageImageFullscreenLoader(attachment: attachment)
+    }
     .sheet(isPresented: $showingWebXDCLauncher) {
       WebXDCAppLauncherSheet { app in
         store.startWebXDCSession(app: app)
@@ -2956,9 +2960,13 @@ private struct ChatComposer: View {
         ForEach(pendingAttachments) { attachment in
           AttachmentPill(
             attachment: attachment,
-            onOpen: attachment.kind == .textFile
-              ? { viewingPendingAttachment = attachment }
-              : nil,
+            onOpen: {
+              if attachment.kind == .image {
+                viewingPendingImageAttachment = attachment
+              } else {
+                viewingPendingAttachment = attachment
+              }
+            },
             onRemove: {
               pendingAttachments.removeAll { $0.id == attachment.id }
             })
@@ -4378,7 +4386,12 @@ private struct AttachmentPill: View {
     .padding(.vertical, 5)
     .background(.regularMaterial)
     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    .onTapGesture {
+      onOpen?()
+    }
     .accessibilityLabel("\(attachment.displayName), \(dimensionsLabel)")
+    .accessibilityHint(onOpen == nil ? "" : "Tap to preview the image")
   }
 
   @ViewBuilder
