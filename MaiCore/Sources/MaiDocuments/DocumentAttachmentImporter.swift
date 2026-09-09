@@ -21,6 +21,7 @@ public struct DocumentAttachment: Equatable, Sendable {
 public enum DocumentAttachmentKind: String, Equatable, Sendable {
   case word
   case pdf
+  case epub
   case json
   case text
   case image
@@ -71,6 +72,7 @@ public enum DocumentAttachmentImporter {
     switch (name as NSString).pathExtension.lowercased() {
     case "docx": .word
     case "pdf": .pdf
+    case "epub": .epub
     case "json": .json
     case let ext where imageExtensions.contains(ext): .image
     default: .text
@@ -105,6 +107,12 @@ public enum DocumentAttachmentImporter {
         name: baseName + ".md",
         mimeType: "text/markdown",
         note: "converted from PDF to Markdown")
+    case .epub:
+      return try converted(
+        EPUBImporter.markdown(from: data),
+        name: baseName + ".md",
+        mimeType: "text/markdown",
+        note: "converted from EPUB to Markdown")
     case .json:
       return try converted(
         JSONDocumentImporter.render(data: data).text,

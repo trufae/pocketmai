@@ -758,7 +758,7 @@ private struct MaiFileWorkspace: Sendable {
 
   /// Formats whose bytes are useless to a model and whose text the document
   /// importer can produce; everything else is read as UTF-8.
-  private static let convertedExtensions: Set<String> = ["pdf", "docx"]
+  private static let convertedExtensions: Set<String> = ["pdf", "docx", "epub"]
 
   func read(_ arguments: [String: JSONValue]) throws -> ToolOutput {
     let rawPath = try requiredPath(arguments, key: "path")
@@ -955,7 +955,7 @@ private struct MaiFileWorkspace: Sendable {
     let file = try resolve(rawPath, allowRoot: false, mustExist: true)
     let text: String
     switch file.pathExtension.lowercased() {
-    case "docx", "pdf", "json":
+    case "docx", "pdf", "epub", "json":
       let attachment = try DocumentAttachmentImporter.attachment(at: file)
       guard case .file(let content) = attachment.content, let contentText = content.text else {
         throw MaiFileWorkspaceError.invalidUTF8(displayPath(rawPath))

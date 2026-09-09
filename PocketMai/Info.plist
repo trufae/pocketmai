@@ -41,7 +41,7 @@
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>PocketMai saves chat images to your photo library when you choose Save Image.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>PocketMai uses speech recognition to turn your voice into chat messages. Native iOS Live transcription happens on device.</string>
+	<string>PocketMai uses speech recognition to turn your voice into chat messages and to transcribe voice messages shared from other apps. Native iOS Live transcription happens on device.</string>
 	<key>NSUbiquitousContainers</key>
 	<dict>
 		<key>iCloud.io.github.trufae.mai</key>

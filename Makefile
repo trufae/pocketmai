@@ -99,7 +99,7 @@ plugin-fixture:
 	swift build --package-path MaiCore --product MaiFixturePlugin
 
 fmt:
-	xcrun swift-format format -i -r PocketMai Shared PocketMaiLiveActivityExtension MaiCore/Sources MaiCore/Tests MaiCore/Package.swift
+	xcrun swift-format format -i -r PocketMai PocketMaiShare Shared SharedWidgetKit MaiCore/Sources MaiCore/Tests MaiCore/Package.swift
 
 check-shared-tooling:
 	test "$$(readlink aitest/Sources/aitest/AgentTooling.swift)" = "../../../Shared/AgentTooling.swift"

@@ -679,3 +679,144 @@ func documentAttachments() throws {
     try DocumentAttachmentImporter.attachment(at: URL(fileURLWithPath: "/nonexistent/file.txt"))
   }
 }
+
+// MARK: - EPUB
+
+private let epubContainer = """
+  <?xml version="1.0" encoding="UTF-8"?>
+  <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+    <rootfiles>
+      <rootfile full-path="OEBPS/book.opf" media-type="application/oebps-package+xml"/>
+    </rootfiles>
+  </container>
+  """
+
+private let epubPackage = """
+  <?xml version="1.0" encoding="UTF-8"?>
+  <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <dc:title>Pocket Book</dc:title>
+    </metadata>
+    <manifest>
+      <item id="c1" href="text/chapter1.xhtml" media-type="application/xhtml+xml"/>
+      <item id="c2" href="text/chapter2.xhtml" media-type="application/xhtml+xml"/>
+      <item id="css" href="style.css" media-type="text/css"/>
+    </manifest>
+    <spine>
+      <itemref idref="c1"/>
+      <itemref idref="c2"/>
+    </spine>
+  </package>
+  """
+
+private let epubChapterOne = """
+  <?xml version="1.0" encoding="utf-8"?>
+  <html xmlns="http://www.w3.org/1999/xhtml">
+    <head><title>Chapter 1</title><link rel="stylesheet" href="../style.css"/></head>
+    <body>
+      <h1>Chapter One</h1>
+      <p>Plain text with <strong>bold</strong> words and a
+        <a href="https://example.com">link</a>.</p>
+      <ul><li>First item</li><li>Second item</li></ul>
+      <blockquote><p>Quoted&nbsp;line&mdash;here.</p></blockquote>
+    </body>
+  </html>
+  """
+
+private let epubChapterTwo = """
+  <?xml version="1.0" encoding="utf-8"?>
+  <html xmlns="http://www.w3.org/1999/xhtml">
+    <body>
+      <h2>Notes</h2>
+      <pre><code>print("hi")</code></pre>
+      <table>
+        <tr><th>Name</th><th>Value</th></tr>
+        <tr><td>pages</td><td>3</td></tr>
+      </table>
+    </body>
+  </html>
+  """
+
+private func sampleEPUB() -> Data {
+  ZipArchiveWriter.archive(entries: [
+    (path: "mimetype", data: Data("application/epub+zip".utf8)),
+    (path: "META-INF/container.xml", data: Data(epubContainer.utf8)),
+    (path: "OEBPS/book.opf", data: Data(epubPackage.utf8)),
+    (path: "OEBPS/text/chapter1.xhtml", data: Data(epubChapterOne.utf8)),
+    (path: "OEBPS/text/chapter2.xhtml", data: Data(epubChapterTwo.utf8)),
+    (path: "OEBPS/style.css", data: Data("p { margin: 0 }".utf8)),
+  ])
+}
+
+@Test("An EPUB book converts to Markdown in spine order")
+func epubConvertsToMarkdown() throws {
+  let markdown = try EPUBImporter.markdown(from: sampleEPUB())
+  #expect(
+    markdown == """
+      # Pocket Book
+
+      # Chapter One
+
+      Plain text with **bold** words and a [link](https://example.com).
+
+      - First item
+      - Second item
+
+      > Quoted line—here.
+
+      ## Notes
+
+      ```
+      print("hi")
+      ```
+
+      | Name | Value |
+      | --- | --- |
+      | pages | 3 |
+      """)
+}
+
+@Test("EPUB import reports damaged books and empty books")
+func epubImportFailures() throws {
+  #expect(throws: EPUBImporter.ImportError.unreadableArchive) {
+    try EPUBImporter.markdown(from: Data("not a zip archive at all".utf8))
+  }
+  #expect(throws: EPUBImporter.ImportError.missingPackage) {
+    try EPUBImporter.markdown(parts: ["META-INF/container.xml": Data(epubContainer.utf8)])
+  }
+  #expect(throws: EPUBImporter.ImportError.emptyDocument) {
+    try EPUBImporter.markdown(parts: [
+      "book.opf": Data(
+        """
+        <package xmlns="http://www.idpf.org/2007/opf">
+          <manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/></manifest>
+          <spine><itemref idref="c1"/></spine>
+        </package>
+        """.utf8),
+      "c1.xhtml": Data("<html><body><p>   </p></body></html>".utf8),
+    ])
+  }
+}
+
+@Test("Unknown HTML entities survive as text instead of failing the parse")
+func epubEntityNormalization() throws {
+  let normalized = String(
+    decoding: XHTMLEntities.normalized(Data("R&D &nbsp; &unknown; &amp; &#x41;".utf8)),
+    as: UTF8.self)
+  #expect(normalized == "R&amp;D &#160; &amp;unknown; &amp; &#x41;")
+}
+
+@Test("An EPUB attaches as a converted Markdown file")
+func epubDocumentAttachment() throws {
+  let attachment = try DocumentAttachmentImporter.attachment(
+    data: sampleEPUB(), filename: "pocket book.epub")
+  #expect(attachment.name == "pocket book.md")
+  #expect(attachment.note == "converted from EPUB to Markdown")
+  #expect(DocumentAttachmentImporter.kind(forFilename: "Book.EPUB") == .epub)
+  guard case .file(let file) = attachment.content else {
+    Issue.record("Expected a file part")
+    return
+  }
+  #expect(file.mimeType == "text/markdown")
+  #expect(file.text?.hasPrefix("# Pocket Book") == true)
+}

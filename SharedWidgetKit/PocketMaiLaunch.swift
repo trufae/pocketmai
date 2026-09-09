@@ -11,6 +11,9 @@ enum LaunchCommand: Codable, Equatable, Sendable {
   /// Jump to an existing chat, e.g. from a Live Activity or a finished-reply
   /// notification.
   case openConversation(id: UUID)
+  /// Import whatever the share extension left in the shared inbox: pictures,
+  /// voice messages and documents shared from WhatsApp, Telegram, Files, ...
+  case importSharedContent
 }
 
 /// Builds and parses the `pocketmai://` deep links used by the home/lock-screen
@@ -20,6 +23,7 @@ enum PocketMaiDeepLink {
   static let promptHost = "prompt"
   static let voiceHost = "voice"
   static let conversationHost = "conversation"
+  static let sharedContentHost = "shared"
 
   static func url(for command: LaunchCommand) -> URL {
     var components = URLComponents()
@@ -35,6 +39,8 @@ enum PocketMaiDeepLink {
     case .openConversation(let id):
       components.host = conversationHost
       components.path = "/\(id.uuidString)"
+    case .importSharedContent:
+      components.host = sharedContentHost
     }
     return components.url ?? URL(string: "\(scheme)://\(promptHost)").unsafelyUnwrapped
   }
@@ -53,6 +59,8 @@ enum PocketMaiDeepLink {
     case conversationHost:
       guard let id = UUID(uuidString: url.lastPathComponent) else { return nil }
       return .openConversation(id: id)
+    case sharedContentHost:
+      return .importSharedContent
     default:
       return nil
     }

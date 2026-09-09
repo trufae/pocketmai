@@ -1352,6 +1352,11 @@ struct ChatView: View {
       liveVoiceSession.start(store: store, ttsPlayer: ttsPlayer)
     case .openConversation(let id):
       await store.selectConversation(id: id)
+    case .importSharedContent:
+      if store.currentConversation == nil {
+        store.newConversation()
+      }
+      store.drainSharedInbox()
     }
   }
 
@@ -2561,6 +2566,11 @@ private struct ChatComposer: View {
   @State private var selectedPhotoItems: [PhotosPickerItem] = []
   @State private var draftText = ""
   @State private var pendingAttachments: [ChatAttachment] = []
+  @State private var sharedImportQueue: [SharedInboxItem] = []
+  @State private var sharedImportImages: [PendingImageAttachmentImport.Item] = []
+  @State private var sharedImportFailures: [String] = []
+  @State private var isImportingSharedItems = false
+  @State private var isResumingSharedImport = false
   @State private var viewingPendingAttachment: ChatAttachment?
   @State private var pendingImageSizePrompt: PendingImageAttachmentImport?
   @State private var pendingPDFImport: PendingPDFImport?
@@ -2675,6 +2685,12 @@ private struct ChatComposer: View {
         restoreQueuedMessageToComposer(message)
         queuedMessagePendingEdit = nil
       }
+      // A share that arrived before the composer was on screen, e.g. when the
+      // share sheet launched the app.
+      if store.hasQueuedSharedItems { beginSharedImport() }
+    }
+    .onChange(of: store.sharedImportRequestID) { _, _ in
+      beginSharedImport()
     }
     .onChange(of: store.draftStorageRevision) { _, _ in
       let storedDraft = store.draftText(for: conversationID)
@@ -2776,32 +2792,54 @@ private struct ChatComposer: View {
     .imageSizeConfirmationDialog(
       isPresented: Binding(
         get: { pendingImageSizePrompt != nil },
-        set: { if !$0 { pendingImageSizePrompt = nil } }),
+        set: {
+          if !$0 {
+            pendingImageSizePrompt = nil
+            resumeSharedImportAfterAnswer()
+          }
+        }),
       presenting: pendingImageSizePrompt,
       message: { pending in
         pending.imageSizePromptMessage
       },
       onSelect: { pending, size in
         appendImageAttachment(pending, size: size)
+        resumeSharedImportAfterAnswer()
       },
       onOCR: { pending in
         convertImagesToText(pending)
+        resumeSharedImportAfterAnswer()
       },
       onCancel: {
         pendingImageSizePrompt = nil
+        resumeSharedImportAfterAnswer()
       }
     )
     .confirmationDialog(
       "Import PDF",
       isPresented: Binding(
         get: { pendingPDFImport != nil },
-        set: { if !$0 { pendingPDFImport = nil } }),
+        set: {
+          if !$0 {
+            pendingPDFImport = nil
+            resumeSharedImportAfterAnswer()
+          }
+        }),
       titleVisibility: .visible,
       presenting: pendingPDFImport
     ) { pending in
-      Button("Text as Markdown") { convertPDFToMarkdown(pending) }
-      Button("One Image per Page") { convertPDFToImages(pending) }
-      Button("Cancel", role: .cancel) { pendingPDFImport = nil }
+      Button("Text as Markdown") {
+        convertPDFToMarkdown(pending)
+        resumeSharedImportAfterAnswer()
+      }
+      Button("One Image per Page") {
+        convertPDFToImages(pending)
+        resumeSharedImportAfterAnswer()
+      }
+      Button("Cancel", role: .cancel) {
+        pendingPDFImport = nil
+        resumeSharedImportAfterAnswer()
+      }
     } message: { pending in
       Text("How should \(pending.name).pdf be attached?")
     }
@@ -3619,6 +3657,8 @@ private struct ChatComposer: View {
     {
       types.append(word)
     }
+    types.append(.epub)
+    types.append(.json)
     types.append(.pdf)
     return types
   }
@@ -3630,55 +3670,43 @@ private struct ChatComposer: View {
       defer {
         if access { url.stopAccessingSecurityScopedResource() }
       }
-      let ext = url.pathExtension.lowercased()
-      let attachment: ChatAttachment
-      switch ext {
-      case "docx":
-        // Word documents are converted to Markdown so they can travel as text.
-        let markdown = try DOCXImporter.markdown(from: url)
-        guard markdown.utf8.count <= Self.textAttachmentByteLimit else {
-          attachmentError = "Text attachments are limited to 1.5 MB."
-          return
-        }
-        attachment = .textFile(
-          filename: url.deletingPathExtension().lastPathComponent + ".md",
-          text: markdown,
-          mimeType: "text/markdown")
-      case "pdf":
-        // A PDF can be worth reading either way, so the choice is the user's:
-        // its text as Markdown, or a picture of every page.
+      if case .failed(let message) = importDocument(at: url, filename: url.lastPathComponent) {
+        attachmentError = message
+      }
+    } catch {
+      attachmentError = error.localizedDescription
+    }
+  }
+
+  /// Converts a document into a text attachment, the same way for a file picked
+  /// in the app and for one shared from another app: Word, EPUB and JSON become
+  /// Markdown or an outline, text files travel as they are. A PDF is worth
+  /// reading either way, so it asks first and the caller waits for the answer.
+  private func importDocument(at url: URL, filename: String) -> DocumentImportOutcome {
+    do {
+      if (filename as NSString).pathExtension.lowercased() == "pdf" {
         let pending = PendingPDFImport(
-          name: url.deletingPathExtension().lastPathComponent,
+          name: (filename as NSString).deletingPathExtension,
           data: try PDFImporter.data(at: url),
           canAttachImages: canAttachImage)
         guard pending.canAttachImages else {
           convertPDFToMarkdown(pending)
-          return
+          return .attached
         }
         pendingPDFImport = pending
-        return
-      case "txt", "md", "markdown":
-        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-        guard data.count <= Self.textAttachmentByteLimit else {
-          attachmentError = "Text attachments are limited to 1.5 MB."
-          return
-        }
-        guard let text = String(data: data, encoding: .utf8) else {
-          attachmentError = "The selected file is not UTF-8 text."
-          return
-        }
-        attachment = .textFile(
-          filename: url.lastPathComponent,
-          text: text,
-          mimeType: ext == "txt" ? "text/plain" : "text/markdown")
-      default:
-        attachmentError = "Choose a .txt, .md, .docx, or .pdf file."
-        return
+        return .awaitingAnswer
       }
-      pendingAttachments.append(attachment)
+      let data = try Data(contentsOf: url)
+      let imported = try DocumentAttachmentImporter.attachment(data: data, filename: filename)
+      guard case .file(let file) = imported.content, let text = file.text else {
+        return .failed("\(filename) does not contain any text.")
+      }
+      pendingAttachments.append(
+        .textFile(filename: imported.name, text: text, mimeType: file.mimeType))
       composerFocused = true
+      return .attached
     } catch {
-      attachmentError = error.localizedDescription
+      return .failed(error.localizedDescription)
     }
   }
 
@@ -3943,6 +3971,176 @@ private struct ChatComposer: View {
     return "\(prefix)-\(timestamp)-\(index).jpg"
   }
 
+  // MARK: - Shared content
+
+  /// Imports what another app sent to PocketMai through the share sheet.
+  ///
+  /// Each item follows the same path it would have taken inside the app: a
+  /// picture asks for its size or offers OCR, a PDF asks how it should be
+  /// attached, a voice message is transcribed, a document is converted to text,
+  /// and shared text or a link is appended to the draft.
+  private func beginSharedImport() {
+    let items = store.takeQueuedSharedItems()
+    guard !items.isEmpty else { return }
+    sharedImportQueue.append(contentsOf: items)
+    Task { await processSharedImportQueue() }
+  }
+
+  @MainActor
+  private func processSharedImportQueue() async {
+    guard !isImportingSharedItems else { return }
+    isImportingSharedItems = true
+    defer { isImportingSharedItems = false }
+    while !sharedImportQueue.isEmpty {
+      let item = sharedImportQueue.removeFirst()
+      // An item that puts a question on screen stops the queue; the answer
+      // starts it again.
+      if await importSharedItem(item) { return }
+    }
+    finishSharedImport()
+  }
+
+  private var hasPendingSharedImports: Bool {
+    !sharedImportQueue.isEmpty || !sharedImportImages.isEmpty || !sharedImportFailures.isEmpty
+  }
+
+  /// Continues the import once a confirmation dialog has been answered, after
+  /// the dialog has had time to dismiss. Dismissing a dialog reports both the
+  /// button and the binding, so a resume already on its way is left alone.
+  private func resumeSharedImportAfterAnswer() {
+    guard hasPendingSharedImports, !isResumingSharedImport else { return }
+    isResumingSharedImport = true
+    Task { @MainActor in
+      try? await Task.sleep(for: .milliseconds(400))
+      isResumingSharedImport = false
+      await processSharedImportQueue()
+    }
+  }
+
+  /// Returns true when the item is waiting on a dialog.
+  @MainActor
+  private func importSharedItem(_ item: SharedInboxItem) async -> Bool {
+    defer { SharedInbox.discard(item) }
+    switch item.kind {
+    case .text, .link:
+      let text = (item.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !text.isEmpty else { return false }
+      draftText = mergedDraftText(appending: text)
+      persistDraftTextNow()
+      composerFocused = true
+      return false
+    case .image:
+      await collectSharedImage(item)
+      return false
+    case .audio:
+      await transcribeSharedAudio(item)
+      return false
+    case .document:
+      guard let url = SharedInbox.fileURL(for: item) else {
+        sharedImportFailures.append("\(item.filename) could not be read.")
+        return false
+      }
+      switch importDocument(at: url, filename: item.filename) {
+      case .attached:
+        return false
+      case .awaitingAnswer:
+        return true
+      case .failed(let message):
+        sharedImportFailures.append(message)
+        return false
+      }
+    }
+  }
+
+  @MainActor
+  private func collectSharedImage(_ item: SharedInboxItem) async {
+    guard let url = SharedInbox.fileURL(for: item),
+      let data = try? Data(contentsOf: url),
+      let image = await AttachmentImageLoader.decodeImageData(data)
+    else {
+      sharedImportFailures.append("\(item.filename) could not be read.")
+      return
+    }
+    // The attachment is re-encoded as JPEG, so the name follows.
+    let name = (item.filename as NSString).deletingPathExtension
+    sharedImportImages.append(
+      PendingImageAttachmentImport.Item(
+        filename: (name.isEmpty ? "shared-image" : name) + ".jpg",
+        image: image))
+  }
+
+  @MainActor
+  private func transcribeSharedAudio(_ item: SharedInboxItem) async {
+    guard let url = SharedInbox.fileURL(for: item) else {
+      sharedImportFailures.append("\(item.filename) could not be read.")
+      return
+    }
+    attachmentConversionMessage = "Transcribing audio..."
+    defer { attachmentConversionMessage = nil }
+    do {
+      let transcript = try await AudioTranscriptionService.transcribe(
+        fileURL: url,
+        localeIdentifier: store.settings.conversation.speechRecognitionLanguageIdentifier)
+      pendingAttachments.append(
+        .textFile(
+          filename: transcriptAttachmentFilename(for: item.filename),
+          text: transcript,
+          mimeType: "text/plain"))
+      composerFocused = true
+    } catch {
+      sharedImportFailures.append(
+        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+    }
+  }
+
+  /// Pictures are attached together at the end, the way a multiple-photo pick
+  /// asks for one size for the whole batch.
+  @MainActor
+  private func finishSharedImport() {
+    let images = sharedImportImages
+    let note = sharedImportFailures.isEmpty ? nil : sharedImportFailures.joined(separator: "\n")
+    sharedImportImages = []
+    sharedImportFailures = []
+
+    guard !images.isEmpty else {
+      if let note { attachmentError = note }
+      return
+    }
+    guard canAttachImage else {
+      // The chosen model cannot read pictures, so their text is read instead of
+      // dropping the share.
+      convertImagesToText(
+        PendingImageAttachmentImport(
+          items: images,
+          failedCount: 0,
+          note: note
+            ?? "The selected model does not accept images, so their text was attached instead."))
+      return
+    }
+    let imageSize = store.settings.attachmentImageSize
+    guard imageSize != .prompt else {
+      pendingImageSizePrompt = PendingImageAttachmentImport(
+        items: images,
+        failedCount: 0,
+        note: note)
+      return
+    }
+    appendImageAttachments(images, size: imageSize)
+    if let note { attachmentError = note }
+  }
+
+  private func transcriptAttachmentFilename(for filename: String) -> String {
+    let stem = (filename as NSString).deletingPathExtension
+    let base = stem.isEmpty ? "voice-message" : stem
+    var name = "\(base).txt"
+    var suffix = 2
+    while pendingAttachments.contains(where: { $0.filename == name }) {
+      name = "\(base)-\(suffix).txt"
+      suffix += 1
+    }
+    return name
+  }
+
   private func voiceNoteAttachmentFilename() -> String {
     let base = "voice-note-\(Int(Date().timeIntervalSince1970))"
     var filename = "\(base).txt"
@@ -3957,6 +4155,14 @@ private struct ChatComposer: View {
   private func imageImportFailureMessage(count: Int) -> String {
     count == 1 ? "1 image could not be read." : "\(count) images could not be read."
   }
+}
+
+/// What happened to a document handed to `importDocument`.
+private enum DocumentImportOutcome {
+  case attached
+  /// A dialog is on screen asking how the document should be attached.
+  case awaitingAnswer
+  case failed(String)
 }
 
 private struct PendingPDFImport {
