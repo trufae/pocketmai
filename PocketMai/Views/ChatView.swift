@@ -2670,6 +2670,41 @@ private struct ChatComposer: View {
   }
 
   var body: some View {
+    composerControls
+      .alert(
+        "Import failed",
+        isPresented: attachmentErrorBinding,
+        presenting: attachmentError
+      ) { _ in
+        Button("OK", role: .cancel) { attachmentError = nil }
+      } message: { message in
+        Text(message)
+      }
+      .imageSizeConfirmationDialog(
+        isPresented: imageSizePromptBinding,
+        presenting: pendingImageSizePrompt,
+        message: { pending in pending.imageSizePromptMessage },
+        onSelect: { pending, size in attachSharedImages(pending, size: size) },
+        onOCR: { pending in extractTextFromImages(pending) },
+        onCancel: { dismissImageSizePrompt() }
+      )
+      .confirmationDialog(
+        "Import PDF",
+        isPresented: pdfImportBinding,
+        titleVisibility: .visible,
+        presenting: pendingPDFImport
+      ) { pending in
+        Button("Text as Markdown") { attachPDFAsMarkdown(pending) }
+        Button("One Image per Page") { attachPDFAsImages(pending) }
+        Button("Cancel", role: .cancel) { dismissPDFImport() }
+      } message: { pending in
+        Text("How should \(pending.name).pdf be attached?")
+      }
+  }
+
+  /// The composer's questions live in `body`; everything else is built here, so
+  /// neither chain grows past what the type checker will accept.
+  private var composerControls: some View {
     Group {
       if liveVoiceSession.isActive {
         voiceControls
@@ -2778,71 +2813,65 @@ private struct ChatComposer: View {
           .environmentObject(store)
       }
     }
-    .alert(
-      "Import failed",
-      isPresented: Binding(
-        get: { attachmentError != nil },
-        set: { if !$0 { attachmentError = nil } }),
-      presenting: attachmentError
-    ) { _ in
-      Button("OK", role: .cancel) { attachmentError = nil }
-    } message: { message in
-      Text(message)
-    }
-    .imageSizeConfirmationDialog(
-      isPresented: Binding(
-        get: { pendingImageSizePrompt != nil },
-        set: {
-          if !$0 {
-            pendingImageSizePrompt = nil
-            resumeSharedImportAfterAnswer()
-          }
-        }),
-      presenting: pendingImageSizePrompt,
-      message: { pending in
-        pending.imageSizePromptMessage
-      },
-      onSelect: { pending, size in
-        appendImageAttachment(pending, size: size)
-        resumeSharedImportAfterAnswer()
-      },
-      onOCR: { pending in
-        convertImagesToText(pending)
-        resumeSharedImportAfterAnswer()
-      },
-      onCancel: {
-        pendingImageSizePrompt = nil
-        resumeSharedImportAfterAnswer()
-      }
-    )
-    .confirmationDialog(
-      "Import PDF",
-      isPresented: Binding(
-        get: { pendingPDFImport != nil },
-        set: {
-          if !$0 {
-            pendingPDFImport = nil
-            resumeSharedImportAfterAnswer()
-          }
-        }),
-      titleVisibility: .visible,
-      presenting: pendingPDFImport
-    ) { pending in
-      Button("Text as Markdown") {
-        convertPDFToMarkdown(pending)
-        resumeSharedImportAfterAnswer()
-      }
-      Button("One Image per Page") {
-        convertPDFToImages(pending)
-        resumeSharedImportAfterAnswer()
-      }
-      Button("Cancel", role: .cancel) {
-        pendingPDFImport = nil
-        resumeSharedImportAfterAnswer()
-      }
-    } message: { pending in
-      Text("How should \(pending.name).pdf be attached?")
-    }
+  }
+
+  // MARK: - Import questions
+
+  private var attachmentErrorBinding: Binding<Bool> {
+    Binding(
+      get: { attachmentError != nil },
+      set: { isPresented in
+        if !isPresented { attachmentError = nil }
+      })
+  }
+
+  private var imageSizePromptBinding: Binding<Bool> {
+    Binding(
+      get: { pendingImageSizePrompt != nil },
+      set: { isPresented in
+        if !isPresented { dismissImageSizePrompt() }
+      })
+  }
+
+  private var pdfImportBinding: Binding<Bool> {
+    Binding(
+      get: { pendingPDFImport != nil },
+      set: { isPresented in
+        if !isPresented { dismissPDFImport() }
+      })
+  }
+
+  private func attachSharedImages(
+    _ pending: PendingImageAttachmentImport,
+    size: AttachmentImageSize
+  ) {
+    appendImageAttachment(pending, size: size)
+    resumeSharedImportAfterAnswer()
+  }
+
+  private func extractTextFromImages(_ pending: PendingImageAttachmentImport) {
+    convertImagesToText(pending)
+    resumeSharedImportAfterAnswer()
+  }
+
+  private func dismissImageSizePrompt() {
+    pendingImageSizePrompt = nil
+    resumeSharedImportAfterAnswer()
+  }
+
+  private func attachPDFAsMarkdown(_ pending: PendingPDFImport) {
+    convertPDFToMarkdown(pending)
+    resumeSharedImportAfterAnswer()
+  }
+
+  private func attachPDFAsImages(_ pending: PendingPDFImport) {
+    convertPDFToImages(pending)
+    resumeSharedImportAfterAnswer()
+  }
+
+  private func dismissPDFImport() {
+    pendingPDFImport = nil
+    resumeSharedImportAfterAnswer()
   }
 
   private var textControls: some View {
