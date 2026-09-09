@@ -68,6 +68,10 @@ jobs:
       # development symlinks are missing on the arm64 runner image.
       - name: Install static link dependencies
         run: |
+          # Chrome's unrelated apt repository occasionally publishes an index
+          # while its Release metadata is still being mirrored. We do not need
+          # it for this build, so keep it out of apt-get update.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libxml2-dev
 
