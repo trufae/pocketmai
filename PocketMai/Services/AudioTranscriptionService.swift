@@ -1,10 +1,12 @@
 import AVFoundation
 import Foundation
 import Speech
+import UniformTypeIdentifiers
 
 /// Turns a shared audio file into text with the on-device recogniser.
 ///
-/// This is the path a voice message takes when it is shared into PocketMai:
+/// This is the path a voice message takes when it is shared into PocketMai, or
+/// picked from Files with "Attach Document":
 /// WhatsApp and Telegram hand over Opus audio in an Ogg container, which
 /// AVFoundation does not read, so those files are repackaged as CAF first (see
 /// `OggOpusRemuxer`). Everything AVFoundation already reads — m4a voice memos,
@@ -78,6 +80,41 @@ enum AudioTranscriptionService {
   }
 
   // MARK: - Formats
+
+  /// What a voice message arrives as, for the picker to offer and the importer
+  /// to route. Opus and Ogg are not always registered as audio types, so the
+  /// file name is read before the system's own answer — that is exactly how
+  /// WhatsApp and Telegram voice messages travel. The share extension keeps its
+  /// own copy of this list: it runs in a target this service is not part of.
+  static let audioExtensions: Set<String> = [
+    "opus", "ogg", "oga", "m4a", "mp3", "wav", "wave", "caf", "aac", "aif", "aiff", "aifc",
+    "amr", "flac", "mp4a", "mpga", "3gp", "3gpp", "wma",
+  ]
+
+  static func isAudioFile(_ url: URL) -> Bool {
+    let ext = url.pathExtension.lowercased()
+    if audioExtensions.contains(ext) { return true }
+    return UTType(filenameExtension: ext)?.conforms(to: .audio) == true
+  }
+
+  /// The types the document picker offers so a recording can be picked there.
+  static var pickerContentTypes: [UTType] {
+    var types: [UTType] = [.audio]
+    for ext in audioExtensions.sorted() {
+      guard let type = UTType(filenameExtension: ext), !types.contains(type) else { continue }
+      types.append(type)
+    }
+    return types
+  }
+
+  /// Copies a picked file somewhere the recogniser can read it later: the
+  /// picker's access to the original ends as soon as the import call returns.
+  static func stagedCopy(of url: URL) throws -> URL {
+    let ext = url.pathExtension.isEmpty ? "m4a" : url.pathExtension
+    let destination = temporaryURL(extension: ext)
+    try FileManager.default.copyItem(at: url, to: destination)
+    return destination
+  }
 
   /// Returns a URL the recogniser can read: the file itself when AVFoundation
   /// decodes it, otherwise a temporary PCM copy decoded from Ogg Opus.

@@ -3452,7 +3452,7 @@ private struct ChatComposer: View {
         showingToolMenu = false
         liveVoiceSession.startVoiceNoteAttachment(store: store, ttsPlayer: ttsPlayer)
       } label: {
-        toolMenuRowLabel("Attach Voice Note", systemImage: "mic.badge.plus")
+        toolMenuRowLabel("Record voice", systemImage: "mic.badge.plus")
       }
       .buttonStyle(.plain)
       .padding(.horizontal, 12)
@@ -3499,7 +3499,7 @@ private struct ChatComposer: View {
     .background(.regularMaterial)
     .fileImporter(
       isPresented: $showingTextFileImporter,
-      allowedContentTypes: Self.textAttachmentTypes
+      allowedContentTypes: Self.documentAttachmentTypes
     ) { result in
       showingToolMenu = false
       importTextAttachment(result)
@@ -3676,7 +3676,7 @@ private struct ChatComposer: View {
 
   private static let textAttachmentByteLimit = 1_500_000
 
-  private static var textAttachmentTypes: [UTType] {
+  private static var documentAttachmentTypes: [UTType] {
     var types: [UTType] = [.plainText, .text]
     if let markdown = UTType(filenameExtension: "md") {
       types.append(markdown)
@@ -3689,6 +3689,8 @@ private struct ChatComposer: View {
     types.append(.epub)
     types.append(.json)
     types.append(.pdf)
+    // A recording picked here is transcribed, then attached as its text.
+    types.append(contentsOf: AudioTranscriptionService.pickerContentTypes)
     return types
   }
 
@@ -3698,6 +3700,10 @@ private struct ChatComposer: View {
       let access = url.startAccessingSecurityScopedResource()
       defer {
         if access { url.stopAccessingSecurityScopedResource() }
+      }
+      guard !AudioTranscriptionService.isAudioFile(url) else {
+        transcribePickedAudio(at: url, filename: url.lastPathComponent)
+        return
       }
       if case .failed(let message) = importDocument(at: url, filename: url.lastPathComponent) {
         attachmentError = message
@@ -3736,6 +3742,41 @@ private struct ChatComposer: View {
       return .attached
     } catch {
       return .failed(error.localizedDescription)
+    }
+  }
+
+  /// Transcribes a recording picked with "Attach Document" and attaches the
+  /// text under the recording's own name, the same way a shared voice message
+  /// is handled. The file is copied first: recognition outlives the picker's
+  /// access to it.
+  private func transcribePickedAudio(at url: URL, filename: String) {
+    let staged: URL
+    do {
+      staged = try AudioTranscriptionService.stagedCopy(of: url)
+    } catch {
+      attachmentError = error.localizedDescription
+      return
+    }
+    attachmentConversionMessage = "Transcribing audio..."
+    let localeIdentifier = store.settings.conversation.speechRecognitionLanguageIdentifier
+    Task { @MainActor in
+      defer {
+        attachmentConversionMessage = nil
+        try? FileManager.default.removeItem(at: staged)
+      }
+      do {
+        let transcript = try await AudioTranscriptionService.transcribe(
+          fileURL: staged,
+          localeIdentifier: localeIdentifier)
+        pendingAttachments.append(
+          .textFile(
+            filename: transcriptAttachmentFilename(for: filename),
+            text: transcript,
+            mimeType: "text/plain"))
+        composerFocused = true
+      } catch {
+        attachmentError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+      }
     }
   }
 
