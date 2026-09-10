@@ -2,10 +2,9 @@ import Foundation
 
 /// Where an agent's tool calls actually happen.
 ///
-/// `inline` is what MaiCore has always done: the agent sees its tools and calls
-/// them in its own transcript. `subagent` keeps those tools and adds the
-/// `agent_*` family (where the agents group is enabled and children are
-/// permitted), so bulky work can be sent one level down to a child whose
+/// `inline` lets the agent call tools in its own transcript. An explicitly
+/// enabled agents group also lets it start workers. `subagent` additionally
+/// enables workers for legacy requests without explicit tool groups, so bulky work can be sent one level down to a child whose
 /// transcript is thrown away — the parent's context grows by one answer
 /// instead of by a call and a result for every step. It costs four schemas
 /// on every call, so it pays only when a task's tool output is large.

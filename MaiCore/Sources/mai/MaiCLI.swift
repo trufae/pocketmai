@@ -2045,11 +2045,13 @@ struct MaiCLI {
           await terminal.note("No agent #\(pid.rawValue). /agents tree lists the running ones.")
           return
         }
-        if info.depth == 0 {
+        if pid == chatProcessIDs[session.id] {
           await deliver(text, to: .main)
           return
         }
-        guard !info.state.isTerminal else {
+        // A top-level pid from another chat owns a different inbox, even
+        // when that chat is idle. Never redirect it to the focused chat.
+        guard info.depth == 0 || !info.state.isTerminal else {
           await terminal.note(
             "agent#\(pid.rawValue) (\(info.agentID)) has finished; /agents log \(pid.rawValue) shows what it did."
           )
