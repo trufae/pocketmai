@@ -70,7 +70,9 @@ extension SettingsBackupSection {
 
 struct SettingsImportView: View {
   @EnvironmentObject private var store: AppStore
-  @Environment(\.dismiss) private var dismiss
+
+  private let initialFile: PendingConversationImportFile?
+  private let onFinish: (() -> Void)?
 
   @State private var showingFileImporter = false
   @State private var importPreview: SettingsImportFilePreview?
@@ -83,6 +85,14 @@ struct SettingsImportView: View {
 
   @State private var toast: String?
   @State private var errorMessage: String?
+
+  init(
+    initialFile: PendingConversationImportFile? = nil,
+    onFinish: (() -> Void)? = nil
+  ) {
+    self.initialFile = initialFile
+    self.onFinish = onFinish
+  }
 
   var body: some View {
     Form {
@@ -127,6 +137,13 @@ struct SettingsImportView: View {
     }
     .navigationTitle("Import")
     .navigationBarTitleDisplayMode(.inline)
+    .toolbar {
+      if initialFile != nil {
+        ToolbarItem(placement: .cancellationAction) {
+          Button("Cancel") { onFinish?() }
+        }
+      }
+    }
     .fileImporter(
       isPresented: $showingFileImporter,
       allowedContentTypes: [.json]
@@ -152,8 +169,13 @@ struct SettingsImportView: View {
         pendingConversationCollectionImport = nil
         importPreview = nil
         selectedSections = SettingsBackupSelection()
+        onFinish?()
       }
       .environmentObject(store)
+    }
+    .task(id: initialFile?.id) {
+      guard let initialFile else { return }
+      prepareImportPreview(from: initialFile)
     }
     .settingsToast($toast, style: .success)
   }
@@ -163,7 +185,7 @@ struct SettingsImportView: View {
     Section {
       infoRow("File", preview.filename)
       infoRow("Type", previewType(preview))
-      infoRow("PocketMai", preview.pocketMaiVersion)
+      infoRow("Created by", preview.pocketMaiVersion)
       infoRow("Exported", formattedDate(preview.exportedAt))
       switch preview.kind {
       case .backup(let envelope):
@@ -176,6 +198,14 @@ struct SettingsImportView: View {
           infoRow("Messages", "\(envelope.conversation.messages.count)")
         } else {
           infoRow("Conversations", "\(envelope.exportedConversations.count)")
+        }
+      case .portable(let archive):
+        infoRow("Archive format", "\(archive.version)")
+        if let agents = archive.settings?.agents {
+          infoRow("pmai agents", "\(agents.count) (not imported on iOS)")
+        }
+        if let skills = archive.skills {
+          infoRow("pmai skills", "\(skills.count) (not imported on iOS)")
         }
       }
     } header: {
@@ -253,6 +283,22 @@ struct SettingsImportView: View {
     }
   }
 
+  @MainActor
+  private func prepareImportPreview(from file: PendingConversationImportFile) {
+    do {
+      let preview = try store.previewSettingsImportFile(filename: file.filename, data: file.data)
+      importPreview = preview
+      selectedSections = preview.availableSelection
+      restoreAudio = false
+      includePictures = false
+      errorMessage = nil
+    } catch {
+      importPreview = nil
+      selectedSections = SettingsBackupSelection()
+      errorMessage = error.localizedDescription
+    }
+  }
+
   private func importSelected(from preview: SettingsImportFilePreview) {
     let selection = selectedSections.intersection(preview.availableSelection)
     guard !selection.isEmpty else {
@@ -266,6 +312,17 @@ struct SettingsImportView: View {
           envelope,
           selection: selection,
           restoreAudio: restoreAudio,
+          includePictures: includePictures)
+        errorMessage = nil
+        showToast(summary)
+      } catch {
+        errorMessage = error.localizedDescription
+      }
+    case .portable(let archive):
+      do {
+        let summary = try store.importPortableArchive(
+          archive,
+          selection: selection,
           includePictures: includePictures)
         errorMessage = nil
         showToast(summary)
@@ -317,6 +374,12 @@ struct SettingsImportView: View {
     withAnimation(.snappy) {
       toast = message
     }
+    if let onFinish {
+      Task { @MainActor in
+        try? await Task.sleep(for: .milliseconds(900))
+        onFinish()
+      }
+    }
   }
 
   private func selectionBinding(
@@ -359,6 +422,24 @@ struct SettingsImportView: View {
       }
       return
         "\(displayValue(envelope.title)) · \(envelope.conversation.messages.count) \(itemLabel(envelope.conversation.messages.count, singular: "message"))."
+    case .portable(let archive):
+      switch section {
+      case .providers:
+        let count = archive.settings?.providers?.count ?? 0
+        return "\(count) provider \(itemLabel(count, singular: "endpoint"))."
+      case .prompts:
+        let prompts = archive.settings?.prompts
+        let systemCount = prompts?.system.count ?? 0
+        let userCount = prompts?.user.count ?? 0
+        return
+          "\(systemCount) system \(itemLabel(systemCount, singular: "prompt")), \(userCount) user \(itemLabel(userCount, singular: "prompt"))."
+      case .tools:
+        let count = archive.settings?.mcpServers?.count ?? 0
+        return "\(count) MCP \(itemLabel(count, singular: "server"))."
+      case .conversations:
+        let count = archive.chats?.count ?? 0
+        return "\(count) \(itemLabel(count, singular: "conversation"))."
+      }
     }
   }
 
@@ -367,6 +448,7 @@ struct SettingsImportView: View {
     case .backup: return "PocketMai backup"
     case .conversation(let envelope):
       return envelope.exportedConversations.count == 1 ? "Single conversation" : "Conversation pack"
+    case .portable: return "Mai archive"
     }
   }
 
@@ -456,14 +538,16 @@ struct SettingsExportView: View {
 
   private func exportSelected() {
     errorMessage = nil
-    if let url = store.exportSettingsBackupFile(
-      selection: selectedSections,
-      includeAudio: includeAudio,
-      includePictures: includePictures)
-    {
-      shareFile = BackupSharedFile(url: url)
-    } else {
-      errorMessage = store.errorMessage ?? "Could not export."
+    Task {
+      if let url = await store.exportSettingsBackupFile(
+        selection: selectedSections,
+        includeAudio: includeAudio,
+        includePictures: includePictures)
+      {
+        shareFile = BackupSharedFile(url: url)
+      } else {
+        errorMessage = store.errorMessage ?? "Could not export."
+      }
     }
   }
 

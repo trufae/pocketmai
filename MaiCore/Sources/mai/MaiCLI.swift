@@ -2360,6 +2360,29 @@ struct MaiCLI {
             await releaseIfIdle(workspace: workspace)
             continue
           }
+          if name == "/import" {
+            await recordSubagents()
+            workspace.upsert(session.chat, selecting: true)
+            await withTurnInterruptSetAside {
+              await handleImportCommand(
+                argument,
+                session: &session,
+                workspace: &workspace,
+                runtime: runtime,
+                plugins: plugins,
+                configuration: &configuration,
+                catalogs: &catalogs,
+                visual: visual,
+                selectImportedChat: loop.activeTurn == nil,
+                terminal: terminal)
+            }
+            await restoreSavedSubagents()
+            workspace.upsert(session.chat, selecting: true)
+            await saveWorkspace(&workspace, store: store, terminal: terminal)
+            await noteTurnEffects(since: before)
+            await releaseIfIdle(workspace: workspace)
+            continue
+          }
           await recordSubagents()
           #if PMAI_HAS_VISUAL
             if text == "/visual" {
@@ -2890,6 +2913,8 @@ struct MaiCLI {
         await terminal.line(queueHelp)
       case "export", "/export":
         await terminal.line(exportHelp)
+      case "import", "/import":
+        await terminal.line(importHelp)
       case "reply", "/reply":
         await terminal.line(replyHelp)
       case "copy", "/copy":
@@ -2900,7 +2925,7 @@ struct MaiCLI {
         await terminal.line(skillsHelp)
       default:
         await terminal.line(
-          "Unknown help topic '\(argument)'. Try /help, or /help set, memory, todo, prompts, agents, mcp, chat, edit, tools, skills, queue, export, copy, or stats."
+          "Unknown help topic '\(argument)'. Try /help, or /help set, memory, todo, prompts, agents, mcp, chat, edit, tools, skills, queue, export, import, copy, or stats."
         )
       }
     case "/cwd", "/pwd":
@@ -3134,7 +3159,15 @@ struct MaiCLI {
       await copyToClipboard(argument, session: session, terminal: terminal)
     case "/export":
       await handleExportCommand(
-        argument, session: session, runtime: runtime, process: chatProcess, terminal: terminal)
+        argument,
+        session: session,
+        runtime: runtime,
+        process: chatProcess,
+        configuration: configuration,
+        skills: visual.skills.catalog,
+        terminal: terminal)
+    case "/import":
+      await terminal.line("Use /import PATH at the interactive chat prompt.")
     case "/stats":
       await handleStatsCommand(argument, store: visual.usageStats, terminal: terminal)
     #if PMAI_HAS_VISUAL
@@ -7484,32 +7517,61 @@ struct MaiCLI {
     }
   }
 
-  /// `/export FORMAT [PATH]` writes this chat as a file. The formats are the
-  /// ones PocketMai offers, produced by the same code: markdown, json, debug
-  /// (json plus the tools and settings the run used), epub, and docx.
+  /// `/export FORMAT [PATH]` writes this chat as a document, or writes a
+  /// portable archive containing the active configuration, visible skills,
+  /// and current chat. MaiCore owns the archive format used by both hosts.
   private static func handleExportCommand(
     _ argument: String,
     session: REPLSession,
     runtime: AgentRuntime,
     process: AgentPID?,
+    configuration: MaiConfiguration?,
+    skills: AgentSkillCatalog,
     terminal: TerminalWriter
   ) async {
     let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
       String.init)
-    guard let first = fields.first, let format = ChatExportFormat(argument: first) else {
+    guard let first = fields.first else {
       await terminal.line(exportHelp)
       return
     }
     var chat = session.chat
+    // The agents of this chat's runs as they stand: what the process table
+    // holds now, live or finished, over what was saved with the chat.
+    if chat.hasConversation, let process {
+      chat.subagents = AgentProcessRecord.merging(
+        saved: chat.subagents, current: await runtime.supervisor.records(under: process))
+    }
+    if ["archive", "pack", "portable"].contains(first.lowercased()) {
+      do {
+        let archive = MaiArchive(
+          generator: "pmai",
+          settings: configuration.map { MaiArchiveSettings(configuration: $0) },
+          chats: chat.hasConversation ? [chat] : nil,
+          skills: try skills.skills.map { try MaiArchiveSkill(skill: $0) })
+        let filename =
+          chat.hasConversation
+          ? archiveFilename(for: chat) : "Mai-Archive.\(MaiArchive.fileExtension)"
+        let target = exportTarget(
+          fields.count > 1 ? fields[1] : nil, defaultFilename: filename)
+        let data = try archive.encoded()
+        try data.write(to: target, options: .atomic)
+        await terminal.line(
+          "Exported Mai archive (\(AgentProcessInfo.compactCount(data.count)) bytes) to \(target.path)"
+        )
+      } catch {
+        await terminal.line(
+          "error: Could not export: \(error.localizedDescription)", to: .standardError)
+      }
+      return
+    }
+    guard let format = ChatExportFormat(argument: first) else {
+      await terminal.line(exportHelp)
+      return
+    }
     guard chat.hasConversation else {
       await terminal.line("Nothing to export yet: this chat has no messages.")
       return
-    }
-    // The agents of this chat's runs as they stand: what the process table
-    // holds now, live or finished, over what was saved with the chat.
-    if let process {
-      chat.subagents = AgentProcessRecord.merging(
-        saved: chat.subagents, current: await runtime.supervisor.records(under: process))
     }
     var debug: ChatExportDebug?
     if format == .debug {
@@ -7541,22 +7603,9 @@ struct MaiCLI {
         ],
         subagents: chat.subagents)
     }
-    let current = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-    var target: URL
-    if fields.count > 1 {
-      let raw = fields[1].trimmingCharacters(in: .whitespacesAndNewlines)
-      let expanded = NSString(string: raw).expandingTildeInPath
-      target = URL(fileURLWithPath: expanded, relativeTo: current).standardizedFileURL
-      var isDirectory: ObjCBool = false
-      let exists = FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory)
-      if raw.hasSuffix("/") || (exists && isDirectory.boolValue) {
-        // A folder, existing or not: the file is named after the chat inside it.
-        try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
-        target.appendPathComponent(ChatExport.filename(for: chat, format: format))
-      }
-    } else {
-      target = current.appendingPathComponent(ChatExport.filename(for: chat, format: format))
-    }
+    let target = exportTarget(
+      fields.count > 1 ? fields[1] : nil,
+      defaultFilename: ChatExport.filename(for: chat, format: format))
     do {
       let data = try ChatExport.data(for: chat, format: format, generator: "pmai", debug: debug)
       try data.write(to: target, options: .atomic)
@@ -7566,6 +7615,236 @@ struct MaiCLI {
     } catch {
       await terminal.line(
         "error: Could not export: \(error.localizedDescription)", to: .standardError)
+    }
+  }
+
+  private static func exportTarget(_ path: String?, defaultFilename: String) -> URL {
+    let current = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    guard let path else { return current.appendingPathComponent(defaultFilename) }
+    let raw = path.trimmingCharacters(in: .whitespacesAndNewlines)
+    let expanded = NSString(string: raw).expandingTildeInPath
+    var target = URL(fileURLWithPath: expanded, relativeTo: current).standardizedFileURL
+    var isDirectory: ObjCBool = false
+    let exists = FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory)
+    if raw.hasSuffix("/") || (exists && isDirectory.boolValue) {
+      try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+      target.appendPathComponent(defaultFilename)
+    }
+    return target
+  }
+
+  private static func archiveFilename(for chat: AgentChat) -> String {
+    let json = ChatExport.filename(for: chat, format: .json)
+    return String(json.dropLast(".json".count)) + "." + MaiArchive.fileExtension
+  }
+
+  /// Imports a Mai archive (standalone or embedded in a PocketMai backup).
+  /// Older pmai JSON chat exports remain valid inputs as a convenience.
+  private static func handleImportCommand(
+    _ argument: String,
+    session: inout REPLSession,
+    workspace: inout AgentChatWorkspace,
+    runtime: AgentRuntime,
+    plugins: PluginRegistry,
+    configuration: inout MaiConfiguration?,
+    catalogs: inout [MCPServerCatalog],
+    visual: VisualBridge,
+    selectImportedChat: Bool,
+    terminal: TerminalWriter
+  ) async {
+    guard !argument.isEmpty else {
+      await terminal.line(importHelp)
+      return
+    }
+    let expanded = NSString(string: argument).expandingTildeInPath
+    let current = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let url = URL(fileURLWithPath: expanded, relativeTo: current).standardizedFileURL
+    do {
+      let archive = try importArchive(from: Data(contentsOf: url))
+      let summary = try await applyImportedArchive(
+        archive,
+        session: &session,
+        workspace: &workspace,
+        runtime: runtime,
+        plugins: plugins,
+        configuration: &configuration,
+        catalogs: &catalogs,
+        visual: visual,
+        selectImportedChat: selectImportedChat,
+        terminal: terminal)
+      await terminal.line("Imported \(summary.joined(separator: ", ")) from \(url.path).")
+      if !selectImportedChat, archive.chats?.isEmpty == false {
+        await terminal.line("The current turn kept its chat; /chat list shows the imported chats.")
+      }
+    } catch {
+      await terminal.line(
+        "error: Could not import: \(error.localizedDescription)", to: .standardError)
+    }
+  }
+
+  private static func importArchive(from data: Data) throws -> MaiArchive {
+    do {
+      return try MaiArchive.decode(from: data)
+    } catch let archiveError {
+      let decoder = MaiJSONCoding.default.makeDecoder()
+      guard let envelope = try? decoder.decode(ChatExportEnvelope.self, from: data),
+        envelope.format == ChatExportEnvelope.format,
+        envelope.version == 1
+      else { throw archiveError }
+      return MaiArchive(
+        generator: envelope.generator, exportedAt: envelope.exportedAt, chats: [envelope.chat])
+    }
+  }
+
+  private static func applyImportedArchive(
+    _ archive: MaiArchive,
+    session: inout REPLSession,
+    workspace: inout AgentChatWorkspace,
+    runtime: AgentRuntime,
+    plugins: PluginRegistry,
+    configuration: inout MaiConfiguration?,
+    catalogs: inout [MCPServerCatalog],
+    visual: VisualBridge,
+    selectImportedChat: Bool,
+    terminal: TerminalWriter
+  ) async throws -> [String] {
+    var summary: [String] = []
+    var importedConfiguration = configuration
+    if let settings = archive.settings {
+      guard let path = visual.configurationPath else {
+        throw ArchiveImportError.configurationUnavailable
+      }
+      var draft = configuration ?? MaiConfiguration()
+      let merged = try draft.mergeArchiveSettings(settings)
+      try draft.save(to: URL(fileURLWithPath: path))
+      importedConfiguration = draft
+      configuration = draft
+      summary.append(contentsOf: archiveSettingsSummary(merged))
+    }
+
+    if let skills = archive.skills {
+      for skill in skills { try skill.install(in: visual.skills.userDirectory) }
+      _ = await synchronizeSkillTools(runtime: runtime, state: visual.skills)
+      summary.append("\(skills.count) skill\(skills.count == 1 ? "" : "s")")
+    }
+
+    if let settings = archive.settings, let draft = importedConfiguration {
+      await reloadImportedSettings(
+        settings,
+        configuration: draft,
+        session: &session,
+        runtime: runtime,
+        plugins: plugins,
+        catalogs: &catalogs,
+        providerBaseURLs: visual.providerBaseURLs,
+        terminal: terminal)
+    }
+
+    if let chats = archive.chats {
+      var existingIDs = Set(workspace.chats.map(\.id))
+      var firstImported: AgentChat?
+      for var chat in chats {
+        if existingIDs.contains(chat.id) {
+          chat.id = UUID()
+          chat.sessionID = ChatSession.newID()
+        }
+        while !existingIDs.insert(chat.id).inserted { chat.id = UUID() }
+        workspace.upsert(chat)
+        if firstImported == nil { firstImported = chat }
+      }
+      if selectImportedChat, let firstImported {
+        workspace.selectChat(id: firstImported.id)
+        session = REPLSession(chat: firstImported)
+      }
+      summary.append("\(chats.count) chat\(chats.count == 1 ? "" : "s")")
+    }
+    return summary.isEmpty ? ["nothing"] : summary
+  }
+
+  private static func archiveSettingsSummary(_ summary: MaiArchiveMergeSummary) -> [String] {
+    [
+      (summary.providers, "provider"),
+      (summary.prompts, "prompt"),
+      (summary.mcpServers, "MCP server"),
+      (summary.agents, "agent"),
+    ].compactMap { item in
+      let (count, name) = item
+      count == 0 ? nil : "\(count) \(name)\(count == 1 ? "" : "s")"
+    }
+  }
+
+  private static func reloadImportedSettings(
+    _ imported: MaiArchiveSettings,
+    configuration: MaiConfiguration,
+    session: inout REPLSession,
+    runtime: AgentRuntime,
+    plugins: PluginRegistry,
+    catalogs: inout [MCPServerCatalog],
+    providerBaseURLs: ProviderBaseURLStore,
+    terminal: TerminalWriter
+  ) async {
+    let environment = ProcessInfo.processInfo.environment
+    for requested in imported.providers ?? [] {
+      guard let provider = configuration.providers.first(where: { $0.id == requested.id }) else {
+        continue
+      }
+      do {
+        try await runtime.register(
+          plugins.makeProvider(from: provider, environment: environment), replacingExisting: true)
+        if let url = provider.baseURL { providerBaseURLs.set(url, for: provider.id) }
+      } catch {
+        await terminal.line(
+          "warning: Provider '\(provider.id)' was saved but could not be loaded: \(error.localizedDescription)",
+          to: .standardError)
+      }
+    }
+
+    for requested in imported.mcpServers ?? [] {
+      guard let server = configuration.mcpServers.first(where: { $0.id == requested.id }) else {
+        continue
+      }
+      _ = await runtime.unregisterMCP(serverID: server.id)
+      catalogs.removeAll { $0.serverID == server.id }
+      guard server.enabled else { continue }
+      do {
+        let source = try await plugins.makeMCPToolSource(
+          kind: server.kind, configuration: server, environment: environment)
+        catalogs.append(try await runtime.register(mcp: source))
+      } catch {
+        await terminal.line(
+          "warning: MCP server '\(server.id)' was saved but could not connect: \(error.localizedDescription)",
+          to: .standardError)
+      }
+    }
+
+    await runtime.configureDelegation(
+      prompt: configuration.prompts?.delegation,
+      workerInstructions: configuration.prompts?.worker)
+    await runtime.configureCompaction(prompt: configuration.prompts?.compact)
+    let knownTools = Set(await runtime.availableTools().map(\.name))
+    for requested in imported.agents ?? [] {
+      guard var agent = configuration.agents.first(where: { $0.id == requested.id }) else {
+        continue
+      }
+      agent.toolNames.formIntersection(knownTools)
+      do {
+        try await runtime.register(agent: agent, replacingExisting: true)
+      } catch {
+        await terminal.line(
+          "warning: Agent '\(agent.id)' was saved but could not be loaded: \(error.localizedDescription)",
+          to: .standardError)
+      }
+    }
+    if let agent = configuration.agents.first(where: { $0.id == session.profile.agentID }) {
+      try? applyDefinition(agent, to: &session)
+    }
+  }
+
+  private enum ArchiveImportError: LocalizedError {
+    case configurationUnavailable
+
+    var errorDescription: String? {
+      "No writable configuration is active; chats and skills were not imported."
     }
   }
 
@@ -7676,8 +7955,10 @@ struct MaiCLI {
     """
 
   private static let exportHelp = """
-    Export this chat as a file, the same formats PocketMai offers:
+    Export this chat as a document, or make a portable Mai archive:
 
+      /export archive [PATH]    Providers, prompts, MCPs, agents, visible skills,
+                                and this chat (.pocketmai.json)
       /export markdown [PATH]   A Markdown transcript (.md)
       /export json [PATH]       The chat as stored, in a JSON envelope (.json)
       /export debug [PATH]      The JSON plus the tools, settings, and every child agent's
@@ -7687,6 +7968,21 @@ struct MaiCLI {
 
     PATH may be a file or a folder; without it the file is named after the
     chat title and written to the current directory.
+
+    Archives can contain credentials already stored literally in the
+    configuration. Environment-variable and key-file references stay as references.
+    """
+
+  private static let importHelp = """
+    Import a portable Mai archive into this project:
+
+      /import PATH              Merge providers, prompts, MCPs, and agents; install
+                                skills for the current user; add chats to this project
+
+    Standalone .pocketmai.json archives and archives embedded by PocketMai are
+    accepted. Existing settings are replaced only when their stable IDs or prompt
+    names match; existing chats are never overwritten. Older pmai JSON chat exports
+    are accepted too.
     """
 
   private static let replyHelp = """
@@ -9116,7 +9412,8 @@ struct MaiCLI {
       "/prompts add ", "/prompts edit ", "/prompts rm ", "/edit user ", "/edit system ",
       "/agents", "/agents tree", "/agents clear", "/agents log ", "/agents kill ", "/agents focus ",
       "/agents focus main", "/queue", "/queue push ", "/queue pop", "/queue drop",
-      "/help queue", "/help export", "/export markdown ", "/export json ", "/export debug ",
+      "/help queue", "/help export", "/help import", "/export archive ", "/import ",
+      "/export markdown ", "/export json ", "/export debug ",
       "/stats", "/stats ranking", "/stats speed", "/stats time", "/stats efficiency",
       "/stats show ",
       "/stats reset", "/stats rm ", "/stats path", "/help stats",
@@ -9444,7 +9741,8 @@ struct MaiCLI {
     /attach clear       Drop the attachments queued for the next message
     /copy [N] [PATH]    Copy the last reply, or N messages, to the clipboard or a file
     /reply [WIDTH]      Answer the last reply in $EDITOR with it quoted above (/help reply)
-    /export FORMAT [PATH]  Save this chat as markdown, json, debug, epub, or docx
+    /export FORMAT [PATH]  Save a portable archive, or this chat as markdown, json, debug, epub, or docx
+    /import PATH           Merge a PocketMai/pmai archive into settings, skills, and chats
     /stats              Combined ranking, tokens/s, time in use, and efficiency per provider:model, as bars
     \(visualHelp)/clear              Clear conversation history
     /exit               Exit the REPL

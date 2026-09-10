@@ -224,7 +224,8 @@ final class AppStore: ObservableObject {
   private var responseTasks: [UUID: Task<Void, Never>] = [:]
   private var responseTaskTokens: [UUID: UUID] = [:]
   /// The process table for child agents, one for the whole app the way pmai
-  /// keeps one per session. Nothing in it is persisted.
+  /// keeps one per session. Runtime state stays transient; durable child
+  /// records and transcripts live with their conversations.
   let agentSupervisor = AgentSupervisor()
   /// Written only by the supervisor feed; views read it.
   @Published var agentProcesses: [AgentProcessInfo] = []
@@ -1257,6 +1258,7 @@ final class AppStore: ObservableObject {
     }
     setSelectedConversationID(id)
     selectConversationFolder(conversations[index].folderID)
+    await restoreAgentProcessRecordsIfNeeded(for: conversations[index])
     ResponseNotificationService.shared.clearNotifications(for: id)
     if previousID != id, discardDisposableConversation(id: previousID) {
       saveConversations()
@@ -3200,20 +3202,32 @@ final class AppStore: ObservableObject {
     guard let data = try? Data(contentsOf: url) else {
       throw SettingsBackupError.unreadableFile
     }
+    return try previewSettingsImportFile(filename: url.lastPathComponent, data: data)
+  }
+
+  func previewSettingsImportFile(filename: String, data: Data) throws
+    -> SettingsImportFilePreview
+  {
     let decoder = JSONDecoder()
     decoder.dateDecodingStrategy = .iso8601
     if let envelope = try? decoder.decode(SettingsBackupEnvelope.self, from: data),
       envelope.format == SettingsBackupEnvelope.format
     {
       return SettingsImportFilePreview(
-        filename: url.lastPathComponent,
+        filename: filename,
         kind: .backup(envelope),
         sourceData: data)
     }
     if let envelope = try? Self.decodeConversationImportEnvelope(from: data) {
       return SettingsImportFilePreview(
-        filename: url.lastPathComponent,
+        filename: filename,
         kind: .conversation(envelope),
+        sourceData: data)
+    }
+    if let archive = try? MaiArchive.decode(from: data) {
+      return SettingsImportFilePreview(
+        filename: filename,
+        kind: .portable(archive),
         sourceData: data)
     }
     throw SettingsBackupError.invalidJSON
@@ -3469,11 +3483,17 @@ final class AppStore: ObservableObject {
   ) async -> URL?
   {
     switch format {
-    case .markdown, .json, .debug:
+    case .markdown:
       return writeConversationExport(
         conversation: conversation,
         format: format,
         content: export(conversation: conversation, format: format))
+    case .json, .debug:
+      let exportable = await conversationIncludingAgentRecords(conversation)
+      return writeConversationExport(
+        conversation: exportable,
+        format: format,
+        content: export(conversation: exportable, format: format))
     case .epub:
       return await exportConversationEPUB(conversation, imageSize: imageSize)
     case .docx:
@@ -3490,17 +3510,24 @@ final class AppStore: ObservableObject {
       ids.contains(summary.id) ? conversation(withID: summary.id) : nil
     }
     guard !selected.isEmpty else { return nil }
+    var exportable: [Conversation] = []
+    for conversation in selected {
+      exportable.append(await conversationIncludingAgentRecords(conversation))
+    }
 
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     encoder.dateEncodingStrategy = .iso8601
-    let envelope = ConversationExportEnvelope(conversations: selected)
+    var envelope = ConversationExportEnvelope(conversations: exportable)
+    envelope.portable = MaiArchive(
+      generator: "PocketMai \(ConversationExportEnvelope.currentPocketMaiVersion)",
+      chats: exportable.map { AgentChat(pocketMai: $0, settings: settings) })
     do {
       let data = try encoder.encode(envelope)
       let filename =
-        selected.count == 1
-        ? ConversationExportFiles.filename(for: selected[0])
-        : "PocketMai-\(selected.count)-Conversations"
+        exportable.count == 1
+        ? ConversationExportFiles.filename(for: exportable[0])
+        : "PocketMai-\(exportable.count)-Conversations"
       let url = try ConversationExportFiles.url(
         filename: filename,
         fileExtension: ConversationExportFiles.fileExtension)
@@ -3529,18 +3556,19 @@ final class AppStore: ObservableObject {
   }
 
   func exportConversationDebugJSONFile(_ conversation: Conversation) async -> URL? {
+    let exportable = await conversationIncludingAgentRecords(conversation)
     let latestPrompt =
-      conversation.messages.last(where: { $0.role == .user })
+      exportable.messages.last(where: { $0.role == .user })
       .map { MessageContentFilter.promptSafeText(from: $0.text) } ?? ""
     let context = await ContextBuilder.build(
       input: latestPrompt,
-      conversation: conversation,
+      conversation: exportable,
       settings: settings,
       locationService: { self.locationService })
     return writeConversationExport(
-      conversation: conversation,
+      conversation: exportable,
       format: .debug,
-      content: export(conversation: conversation, format: .debug, debugContext: context))
+      content: export(conversation: exportable, format: .debug, debugContext: context))
   }
 
   func corruptedConversationCount() async -> Int {
@@ -4298,6 +4326,21 @@ final class AppStore: ObservableObject {
     persistence.saveConversations(conversations, retaining: retained)
   }
 
+  /// Stores the session supervisor's latest copy of child-agent records
+  /// without discarding records it has already pruned from memory.
+  func mergeAgentProcessRecords(
+    _ current: [AgentProcessRecord],
+    into conversationID: UUID
+  ) {
+    guard let index = indexedConversationIndex(for: conversationID) else { return }
+    let merged = AgentProcessRecord.merging(
+      saved: conversations[index].subagents,
+      current: current)
+    guard merged != conversations[index].subagents else { return }
+    conversations[index].subagents = merged
+    saveConversations()
+  }
+
   /// Placeholders worth a file even though nothing was said yet: a draft is
   /// waiting in them, or a reply is on its way. The store drops every other
   /// untouched placeholder, as pmai does.
@@ -4988,6 +5031,7 @@ final class AppStore: ObservableObject {
       && lhs.showThinking == rhs.showThinking
       && lhs.lastContextSignature == rhs.lastContextSignature
       && lhs.effectiveLanguageOverrideIdentifier == rhs.effectiveLanguageOverrideIdentifier
+      && lhs.subagents == rhs.subagents
       && messageContentsMatch(lhs.messages, rhs.messages)
   }
 
@@ -5026,10 +5070,13 @@ final class AppStore: ObservableObject {
       let encoder = JSONEncoder()
       encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
       encoder.dateEncodingStrategy = .iso8601
-      let envelope = ConversationExportEnvelope(
+      var envelope = ConversationExportEnvelope(
         conversation: conversation,
         toolCallingDebug: format == .debug
           ? toolCallingDebug(for: conversation, context: debugContext) : nil)
+      envelope.portable = MaiArchive(
+        generator: "PocketMai \(ConversationExportEnvelope.currentPocketMaiVersion)",
+        chats: [AgentChat(pocketMai: conversation, settings: settings)])
       guard let data = try? encoder.encode(envelope),
         let json = String(data: data, encoding: .utf8)
       else {
@@ -5335,9 +5382,13 @@ final class AppStore: ObservableObject {
     scope: SettingsBackupScope,
     includeAudio: Bool = false,
     includePictures: Bool = false
-  ) -> URL? {
-    let envelope = makeBackupEnvelope(
-      selection: SettingsBackupSelection(scope: scope),
+  ) async -> URL? {
+    let selection = SettingsBackupSelection(scope: scope)
+    if selection.conversations {
+      await loadStoredConversationsForSearch()
+    }
+    let envelope = await makeBackupEnvelope(
+      selection: selection,
       includeAudio: includeAudio,
       includePictures: includePictures)
     return exportSettingsBackupFile(envelope: envelope, filename: backupFilename(scope: scope))
@@ -5347,12 +5398,15 @@ final class AppStore: ObservableObject {
     selection: SettingsBackupSelection,
     includeAudio: Bool = false,
     includePictures: Bool = false
-  ) -> URL? {
+  ) async -> URL? {
     guard !selection.isEmpty else {
       errorMessage = SettingsBackupError.emptySelection.localizedDescription
       return nil
     }
-    let envelope = makeBackupEnvelope(
+    if selection.conversations {
+      await loadStoredConversationsForSearch()
+    }
+    let envelope = await makeBackupEnvelope(
       selection: selection,
       includeAudio: includeAudio,
       includePictures: includePictures)
@@ -5365,7 +5419,11 @@ final class AppStore: ObservableObject {
       endpoints: [endpoint],
       selectedEndpointID: endpoint.id,
       defaultProvider: .openAICompatible)
-    let envelope = SettingsBackupEnvelope(providers: providers)
+    let envelope = SettingsBackupEnvelope(
+      providers: providers,
+      portable: MaiArchive(
+        generator: "PocketMai \(ConversationExportEnvelope.currentPocketMaiVersion)",
+        settings: MaiArchiveSettings(providers: [ConfiguredProvider(pocketMai: endpoint)])))
     return exportSettingsBackupFile(envelope: envelope, filename: backupFilename(for: endpoint))
   }
 
@@ -5379,7 +5437,9 @@ final class AppStore: ObservableObject {
       return nil
     }
     do {
-      let url = try ConversationExportFiles.url(filename: filename, fileExtension: "json")
+      let url = try ConversationExportFiles.url(
+        filename: filename,
+        fileExtension: MaiArchive.fileExtension)
       try data.write(to: url, options: .atomic)
       return url
     } catch {
@@ -5393,17 +5453,37 @@ final class AppStore: ObservableObject {
     includeAudio: Bool,
     includePictures: Bool
   )
-    -> SettingsBackupEnvelope
+    async -> SettingsBackupEnvelope
   {
-    let exportedConversations =
+    let baseConversations =
       selection.conversations
       ? (includePictures ? conversations : conversationsRemovingImageAttachments(conversations))
       : nil
+    var exportedConversations: [Conversation]? = nil
+    if let baseConversations {
+      var snapshots: [Conversation] = []
+      for conversation in baseConversations {
+        snapshots.append(await conversationIncludingAgentRecords(conversation))
+      }
+      exportedConversations = snapshots
+    }
     let attachments =
       includeAudio && selection.conversations
       ? collectVoiceRecordingAttachments(from: exportedConversations ?? [])
       : nil
 
+    let portableSettings = MaiArchiveSettings(
+      providers: selection.providers
+        ? settings.openAIEndpoints.map { ConfiguredProvider(pocketMai: $0) } : nil,
+      prompts: selection.prompts ? ConfiguredPrompts(pocketMai: settings) : nil,
+      mcpServers: selection.tools
+        ? settings.mcpServers.map { ConfiguredMCPServer(pocketMai: $0) } : nil)
+    let portable = MaiArchive(
+      generator: "PocketMai \(ConversationExportEnvelope.currentPocketMaiVersion)",
+      settings: portableSettings,
+      chats: selection.conversations
+        ? (exportedConversations ?? []).map { AgentChat(pocketMai: $0, settings: settings) }
+        : nil)
     return SettingsBackupEnvelope(
       providers: selection.providers ? providersBackup() : nil,
       prompts: selection.prompts ? promptsBackup() : nil,
@@ -5412,7 +5492,8 @@ final class AppStore: ObservableObject {
       conversationFolders: selection.conversations ? settings.conversationFolders : nil,
       conversationFolderDefaults: selection.conversations
         ? settings.conversationFolderDefaults : nil,
-      voiceRecordings: attachments)
+      voiceRecordings: attachments,
+      portable: portable)
   }
 
   private func collectVoiceRecordingAttachments(from conversations: [Conversation])
@@ -5567,6 +5648,48 @@ final class AppStore: ObservableObject {
       includePictures: includePictures)
   }
 
+  /// Imports the cross-host part of an archive. Unlike the native PocketMai
+  /// backup path, portable sections are merged by stable id or prompt name so
+  /// moving one file between the phone and pmai does not erase host-only
+  /// settings on either side.
+  @discardableResult
+  func importPortableArchive(
+    _ archive: MaiArchive,
+    selection: SettingsBackupSelection,
+    includePictures: Bool = true
+  ) throws -> String {
+    guard !selection.isEmpty else { throw SettingsBackupError.emptySelection }
+    var applied: [String] = []
+    if selection.providers, let providers = archive.settings?.providers {
+      let imported = providers.compactMap { OpenAIEndpoint(archive: $0) }
+      mergePortableProviders(imported)
+      applied.append("\(imported.count) provider\(imported.count == 1 ? "" : "s")")
+    }
+    if selection.prompts, let prompts = archive.settings?.prompts {
+      let count = mergePortablePrompts(prompts)
+      applied.append("\(count) prompt\(count == 1 ? "" : "s")")
+    }
+    if selection.tools, let servers = archive.settings?.mcpServers {
+      let imported = servers.compactMap { MCPServer(archive: $0) }
+      mergePortableMCPServers(imported)
+      applied.append("\(imported.count) MCP server\(imported.count == 1 ? "" : "s")")
+    }
+    if selection.conversations, let chats = archive.chats {
+      var imported = chats.map {
+        Conversation(
+          archive: $0,
+          settings: settings,
+          providers: archive.settings?.providers ?? [])
+      }
+      if !includePictures {
+        imported = conversationsRemovingImageAttachments(imported)
+      }
+      applyConversationsBackup(imported)
+      applied.append("\(imported.count) conversation\(imported.count == 1 ? "" : "s")")
+    }
+    return finishApplyBackup(applied: applied)
+  }
+
   @discardableResult
   private func applyBackup(
     _ envelope: SettingsBackupEnvelope,
@@ -5672,6 +5795,28 @@ final class AppStore: ObservableObject {
     endpointVoices.removeAll()
   }
 
+  private func mergePortableProviders(_ imported: [OpenAIEndpoint]) {
+    for var endpoint in imported {
+      let match = settings.openAIEndpoints.firstIndex {
+        $0.id == endpoint.id
+          || ($0.name.caseInsensitiveCompare(endpoint.name) == .orderedSame
+            && $0.baseURL == endpoint.baseURL)
+      }
+      if let match {
+        endpoint.id = settings.openAIEndpoints[match].id
+        settings.openAIEndpoints[match] = endpoint
+      } else {
+        settings.openAIEndpoints.append(endpoint)
+      }
+    }
+    if settings.selectedEndpointID == nil {
+      settings.selectedEndpointID = settings.openAIEndpoints.first?.id
+    }
+    endpointStatuses.removeAll()
+    endpointModels.removeAll()
+    endpointVoices.removeAll()
+  }
+
   private func applyPromptsBackup(_ payload: SettingsPromptsBackup) {
     let prompts = payload.prompts.isEmpty ? [AppSettings.defaultSystemPrompt] : payload.prompts
     settings.systemPrompts = prompts
@@ -5689,6 +5834,30 @@ final class AppStore: ObservableObject {
     if let followUps = payload.followUps {
       settings.followUps = followUps
     }
+  }
+
+  private func mergePortablePrompts(_ imported: ConfiguredPrompts) -> Int {
+    func key(_ name: String) -> String {
+      PromptSlashCommand.normalized(PromptSlashCommand.commandName(for: name))
+    }
+    for (name, text) in imported.system.sorted(by: { $0.key < $1.key }) {
+      if let index = settings.systemPrompts.firstIndex(where: { key($0.displayName) == key(name) }) {
+        settings.systemPrompts[index].name = name
+        settings.systemPrompts[index].text = text
+      } else {
+        settings.systemPrompts.append(SystemPrompt(name: name, text: text))
+      }
+    }
+    for (name, text) in imported.user.sorted(by: { $0.key < $1.key }) {
+      if let index = settings.userPrompts.firstIndex(where: { key($0.displayName) == key(name) }) {
+        settings.userPrompts[index].name = name
+        settings.userPrompts[index].text = text
+      } else {
+        settings.userPrompts.append(UserPrompt(name: name, text: text))
+      }
+    }
+    if let compact = imported.compact { settings.compactPrompt = compact }
+    return imported.system.count + imported.user.count
   }
 
   private func applyToolsBackup(_ payload: SettingsToolsBackup) {
@@ -5717,6 +5886,26 @@ final class AppStore: ObservableObject {
     }
     if let proxy = payload.useToolProxy {
       settings.useToolProxy = proxy
+    }
+    mcpStatuses.removeAll()
+    mcpTools.removeAll()
+    mcpResources.removeAll()
+    Task { await MCPHTTPClient.resetAllSessions() }
+  }
+
+  private func mergePortableMCPServers(_ imported: [MCPServer]) {
+    for var server in imported {
+      let match = settings.mcpServers.firstIndex {
+        $0.id == server.id
+          || ($0.name.caseInsensitiveCompare(server.name) == .orderedSame
+            && $0.baseURL == server.baseURL)
+      }
+      if let match {
+        server.id = settings.mcpServers[match].id
+        settings.mcpServers[match] = server
+      } else {
+        settings.mcpServers.append(server)
+      }
     }
     mcpStatuses.removeAll()
     mcpTools.removeAll()
@@ -5999,7 +6188,7 @@ final class AppStoreViewObservation: ObservableObject {
 }
 
 enum ConversationExportFiles {
-  static let fileExtension = "pocketmai.json"
+  static let fileExtension = MaiArchive.fileExtension
 
   static func isConversationExport(filename: String) -> Bool {
     filename.lowercased().hasSuffix(".\(fileExtension)")

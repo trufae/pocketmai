@@ -3,8 +3,8 @@ import MaiCore
 
 /// The app's side of the agent process table: which process a conversation
 /// runs as, what its children are doing, and the controls the chat offers
-/// over them. Processes are session state, like pmai's; nothing here is
-/// saved.
+/// over them. Processes are session state, like pmai's; durable records are
+/// merged into `Conversation.subagents` and restored under fresh pids.
 extension AppStore {
   /// Mirrors the supervisor's table into `agentProcesses` as it changes, so
   /// views follow children without polling.
@@ -12,8 +12,11 @@ extension AppStore {
     Task { [weak self] in
       guard let self else { return }
       let events = await agentSupervisor.events()
-      for await _ in events {
+      for await event in events {
         await refreshAgentProcesses()
+        if case .finished(let process) = event {
+          await saveAgentProcessRecords(containing: process.pid)
+        }
       }
     }
   }
@@ -23,6 +26,16 @@ extension AppStore {
     if processes != agentProcesses {
       agentProcesses = processes
     }
+  }
+
+  /// Rehydrates a saved process tree when its conversation becomes active.
+  /// The regular `agentProcessID` path also calls this before a later turn,
+  /// so records are available even when a host opens the chat indirectly.
+  func restoreAgentProcessRecordsIfNeeded(for conversation: Conversation) async {
+    guard !conversation.subagents.isEmpty else { return }
+    _ = await agentProcessID(
+      for: conversation,
+      agentName: settings.selectedAgent.name)
   }
 
   // MARK: - Conversation processes
@@ -51,6 +64,10 @@ extension AppStore {
       return existing
     }
     agentProcessIDs[conversation.id] = pid
+    if !conversation.subagents.isEmpty {
+      await agentSupervisor.restore(conversation.subagents, under: pid)
+      await refreshAgentProcesses()
+    }
     return pid
   }
 
@@ -78,7 +95,37 @@ extension AppStore {
   /// children carry on; the next turn can still collect them.
   func completeAgentProcess(for conversationID: UUID) {
     guard let pid = agentProcessIDs[conversationID] else { return }
-    Task { await agentSupervisor.complete(pid) }
+    Task {
+      await agentSupervisor.complete(pid)
+      await saveAgentProcessRecords(for: conversationID, under: pid)
+    }
+  }
+
+  /// The exportable conversation with the latest live process records folded
+  /// into its durable records. Records already pruned from this session stay
+  /// present, while current copies replace the same durable run identity.
+  func conversationIncludingAgentRecords(_ conversation: Conversation) async -> Conversation {
+    var result = conversation
+    guard let pid = agentProcessIDs[conversation.id], await agentSupervisor.info(pid) != nil else {
+      return result
+    }
+    result.subagents = AgentProcessRecord.merging(
+      saved: result.subagents,
+      current: await agentSupervisor.records(under: pid))
+    return result
+  }
+
+  private func saveAgentProcessRecords(containing pid: AgentPID) async {
+    let tree = await agentSupervisor.tree()
+    guard let entry = agentProcessIDs.first(where: { _, root in
+      tree.subtree(of: root).contains { $0.pid == pid }
+    }) else { return }
+    await saveAgentProcessRecords(for: entry.key, under: entry.value)
+  }
+
+  private func saveAgentProcessRecords(for conversationID: UUID, under pid: AgentPID) async {
+    let current = await agentSupervisor.records(under: pid)
+    mergeAgentProcessRecords(current, into: conversationID)
   }
 
   /// A child started without waiting reports into the chat's inbox. When the
@@ -125,6 +172,7 @@ extension AppStore {
     guard let pid = agentProcessIDs.removeValue(forKey: conversationID) else { return }
     Task {
       let stopped = await agentSupervisor.stop(pid, reason: reason)
+      await saveAgentProcessRecords(for: conversationID, under: pid)
       for victim in stopped.reversed() {
         await agentSupervisor.forget(victim)
       }
@@ -187,6 +235,9 @@ extension AppStore {
     }
     guard !finished.isEmpty else { return }
     Task {
+      if let conversationID, let root = agentProcessIDs[conversationID] {
+        await saveAgentProcessRecords(for: conversationID, under: root)
+      }
       for process in finished.reversed() {
         await agentSupervisor.forget(process.pid)
       }
