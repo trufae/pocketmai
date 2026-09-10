@@ -404,30 +404,22 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
     #else
       signal(SIGWINCH, SIG_IGN)
       let source = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: .global())
-      source.setEventHandler { [weak self] in self?.resized() }
+      source.setEventHandler { [weak self] in self?.resizedIfNeeded() }
     #endif
     source.resume()
     resizeSource = source
   }
 
-  #if os(Windows)
-    private func resizedIfNeeded() {
-      let changed: Bool = lock.withLock {
-        guard active else { return false }
-        var size = winsize()
-        guard ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size) == 0 else { return false }
-        return Int(size.ws_row) != rows || Int(size.ws_col) != columns
-      }
-      if changed { resized() }
-    }
-  #endif
-
-  /// After a resize the saved cursor is anywhere; output continues from the
-  /// bottom of the new region and the reserved rows are drawn again.
-  private func resized() {
+  private func resizedIfNeeded() {
     lock.withLock {
       guard active else { return }
-      measure()
+      var size = winsize()
+      guard ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size) == 0 else { return }
+      let newRows = size.ws_row >= 3 ? Int(size.ws_row) : rows
+      let newColumns = size.ws_col > 0 ? Int(size.ws_col) : columns
+      guard newRows != rows || newColumns != columns else { return }
+      rows = newRows
+      columns = newColumns
       clampInputRows()
       let bottom = regionBottom
       var out = "\u{1B}[1;\(bottom)r"
