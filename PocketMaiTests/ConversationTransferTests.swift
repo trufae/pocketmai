@@ -172,6 +172,13 @@ final class ConversationTransferTests: XCTestCase {
     let restoredEndpoint = try XCTUnwrap(OpenAIEndpoint(archive: ConfiguredProvider(pocketMai: endpoint)))
     XCTAssertEqual(restoredEndpoint, endpoint)
 
+    let namedProvider = ConfiguredProvider(
+      id: "openrouter", kind: .openAICompatible, displayName: "OpenRouter",
+      baseURL: URL(string: "https://openrouter.ai/api/v1"))
+    let namedEndpoint = try XCTUnwrap(OpenAIEndpoint(archive: namedProvider))
+    XCTAssertEqual(namedEndpoint.portableID, "openrouter")
+    XCTAssertEqual(ConfiguredProvider(pocketMai: namedEndpoint).id, "openrouter")
+
     var authentication = MCPAuthentication()
     authentication.method = .oauth
     authentication.oauthAccessToken = "access"
@@ -183,5 +190,11 @@ final class ConversationTransferTests: XCTestCase {
       transport: .streamableHTTP, authentication: authentication)
     let restoredServer = try XCTUnwrap(MCPServer(archive: ConfiguredMCPServer(pocketMai: server)))
     XCTAssertEqual(restoredServer, server)
+
+    let namedMCP = ConfiguredMCPServer(
+      id: "search", enabled: true, url: URL(string: "https://mcp.example/search"))
+    let namedServer = try XCTUnwrap(MCPServer(archive: namedMCP))
+    XCTAssertEqual(namedServer.portableID, "search")
+    XCTAssertEqual(ConfiguredMCPServer(pocketMai: namedServer).id, "search")
   }
 }

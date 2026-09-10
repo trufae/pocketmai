@@ -1696,6 +1696,9 @@ enum EndpointAuthMethod: String, Codable, CaseIterable, Identifiable, Sendable {
 
 struct OpenAIEndpoint: Identifiable, Codable, Equatable, Sendable {
   var id: UUID
+  /// The original Mai provider ID when it is not representable as an iOS
+  /// UUID. Keeping it makes repeated CLI/iOS imports stable and reversible.
+  var portableID: String?
   var name: String
   var baseURL: String
   var apiKey: String
@@ -1735,9 +1738,11 @@ struct OpenAIEndpoint: Identifiable, Codable, Equatable, Sendable {
     oauthAccessTokenExpiresAt: Date? = nil,
     oauthAuthorizeURL: String = "",
     oauthTokenURL: String = "",
-    headers: [String: String] = [:]
+    headers: [String: String] = [:],
+    portableID: String? = nil
   ) {
     self.id = id
+    self.portableID = portableID
     self.name = name
     self.baseURL = baseURL
     self.apiKey = apiKey
@@ -1758,7 +1763,7 @@ struct OpenAIEndpoint: Identifiable, Codable, Equatable, Sendable {
   }
 
   enum CodingKeys: String, CodingKey {
-    case id, name, baseURL, apiKey, defaultModel, defaultReasoningLevel, isEnabled
+    case id, portableID, name, baseURL, apiKey, defaultModel, defaultReasoningLevel, isEnabled
     case authMethod, oauthIssuer, oauthClientID, oauthAudience, oauthScope, oauthRedirectURI
     case oauthRefreshToken, oauthAccessTokenExpiresAt
     case oauthAuthorizeURL, oauthTokenURL
@@ -1768,6 +1773,7 @@ struct OpenAIEndpoint: Identifiable, Codable, Equatable, Sendable {
   init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
     id = try c.decode(UUID.self, forKey: .id)
+    portableID = try? c.decode(String.self, forKey: .portableID)
     name = try c.decode(String.self, forKey: .name)
     baseURL = try c.decode(String.self, forKey: .baseURL)
     apiKey = try c.decode(String.self, forKey: .apiKey)
@@ -1794,6 +1800,7 @@ struct OpenAIEndpoint: Identifiable, Codable, Equatable, Sendable {
   func encode(to encoder: Encoder) throws {
     var c = encoder.container(keyedBy: CodingKeys.self)
     try c.encode(id, forKey: .id)
+    try c.encodeIfPresent(portableID, forKey: .portableID)
     try c.encode(name, forKey: .name)
     try c.encode(baseURL, forKey: .baseURL)
     try c.encode(apiKey, forKey: .apiKey)
@@ -2568,6 +2575,8 @@ struct MCPAuthentication: Codable, Equatable, Sendable {
 
 struct MCPServer: Identifiable, Codable, Equatable, Sendable {
   var id: UUID
+  /// The original Mai MCP ID when it is not representable as an iOS UUID.
+  var portableID: String?
   var name: String
   var baseURL: String
   var isEnabled: Bool
@@ -2577,9 +2586,10 @@ struct MCPServer: Identifiable, Codable, Equatable, Sendable {
   init(
     id: UUID = UUID(), name: String = "MCP Server", baseURL: String = "https://",
     isEnabled: Bool = true, transport: MCPTransport? = nil,
-    authentication: MCPAuthentication = MCPAuthentication()
+    authentication: MCPAuthentication = MCPAuthentication(), portableID: String? = nil
   ) {
     self.id = id
+    self.portableID = portableID
     self.name = name
     self.baseURL = baseURL
     self.isEnabled = isEnabled
@@ -2588,12 +2598,13 @@ struct MCPServer: Identifiable, Codable, Equatable, Sendable {
   }
 
   enum CodingKeys: String, CodingKey {
-    case id, name, baseURL, isEnabled, transport, authentication
+    case id, portableID, name, baseURL, isEnabled, transport, authentication
   }
 
   init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
     id = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
+    portableID = try? c.decode(String.self, forKey: .portableID)
     name = (try? c.decode(String.self, forKey: .name)) ?? "MCP Server"
     baseURL = (try? c.decode(String.self, forKey: .baseURL)) ?? "https://"
     isEnabled = (try? c.decode(Bool.self, forKey: .isEnabled)) ?? true
