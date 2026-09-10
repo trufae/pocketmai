@@ -3,34 +3,7 @@ import Foundation
 /// Splits inline think tags across arbitrary transport chunks and retains the
 /// order of text/reasoning spans. Tags inside fenced code remain literal text.
 public struct ReasoningStream: Sendable {
-  private var fragments: [ContentPart] = []
-  /// Coalesce once at completion, rather than copying growing strings per token.
-  public var parts: [ContentPart] {
-    var result: [ContentPart] = []
-    var run = ""
-    var reasoning = false
-    for fragment in fragments {
-      let value: String
-      let next: Bool
-      switch fragment {
-      case .text(let text):
-        value = text
-        next = false
-      case .reasoning(let text):
-        value = text
-        next = true
-      default: continue
-      }
-      if next != reasoning && !run.isEmpty {
-        result.append(reasoning ? .reasoning(run) : .text(run))
-        run = ""
-      }
-      reasoning = next
-      run += value
-    }
-    if !run.isEmpty { result.append(reasoning ? .reasoning(run) : .text(run)) }
-    return result
-  }
+  public private(set) var parts: [ContentPart] = []
   private var pending = ""
   private var thinking = false
   private var codeTicks = 0
@@ -87,8 +60,8 @@ public struct ReasoningStream: Sendable {
   }
 
   public mutating func appendReasoning(_ text: String) -> [ContentPart] {
+    guard !text.isEmpty else { return [] }
     var output = flush()
-    guard !text.isEmpty else { return output }
     let part = ContentPart.reasoning(text)
     record(part)
     output.append(part)
@@ -109,7 +82,18 @@ public struct ReasoningStream: Sendable {
   }
 
   private mutating func record(_ part: ContentPart) {
-    fragments.append(part)
+    // Remove the tail before appending so its String buffer can grow in place.
+    switch (parts.popLast(), part) {
+    case (.text(var previous), .text(let delta)):
+      previous += delta
+      parts.append(.text(previous))
+    case (.reasoning(var previous), .reasoning(let delta)):
+      previous += delta
+      parts.append(.reasoning(previous))
+    case (let previous, _):
+      if let previous { parts.append(previous) }
+      parts.append(part)
+    }
   }
 
 }

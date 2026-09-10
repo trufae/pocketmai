@@ -553,8 +553,8 @@ enum PromptComposer {
       settings: settings,
       limit: effectiveLimit,
       excludingMessageID: excludingMessageID)
-    let echoReasoningContent = OpenAICompatibleProvider.shouldEchoReasoningContent(
-      model: model, endpoint: endpoint, settings: settings)
+    let echoReasoningContent = ReasoningEffort.requiresReasoningHistory(
+      model: model, provider: endpoint.name, baseURL: endpoint.baseURL)
     let includeImageAttachments = ProviderVisionSupport.openAICompatibleSupportsVision(
       model: model, endpoint: endpoint)
     let latestUserMessageID = limited.last(where: { $0.role == .user })?.id
@@ -1289,7 +1289,6 @@ enum OpenAICompatibleProvider {
         toolPromptInContext: request.toolPromptInContext,
         messageLimitOverride: request.messageLimitOverride
       )
-      let coreMessages = messages
       let coreTools = request.nativeTools ?? []
       let coreOptions = MaiCore.GenerationOptions(
         reasoningEffort: request.conversation.reasoningLevel.optionValue,
@@ -1305,7 +1304,7 @@ enum OpenAICompatibleProvider {
         userInputTokens: request.userInputTokens,
         imageInputCount: messages.reduce(0) { $0 + $1.imageInputCount },
         fallbackInputTokenEstimate: GenerationStats.estimatedTokenCount(
-          forCharacterCount: coreMessages.reduce(0) { $0 + $1.text.count }))
+          forCharacterCount: messages.reduce(0) { $0 + $1.text.count }))
       let accumulator = await MainActor.run {
         CoreProviderEventAccumulator(onUpdate: onUpdate)
       }
@@ -1314,7 +1313,7 @@ enum OpenAICompatibleProvider {
         response = try await provider.complete(
           MaiCore.ProviderRequest(
             model: model,
-            messages: coreMessages,
+            messages: messages,
             tools: coreTools,
             options: coreOptions,
             stream: request.conversation.usesStreaming,
@@ -1414,15 +1413,8 @@ enum OpenAICompatibleProvider {
       return false
     }
     let model = conversation.modelID.isEmpty ? endpoint.defaultModel : conversation.modelID
-    return shouldEchoReasoningContent(model: model, endpoint: endpoint, settings: settings)
-  }
-
-  static func shouldEchoReasoningContent(
-    model: String,
-    endpoint: OpenAIEndpoint,
-    settings: AppSettings
-  ) -> Bool {
-    ReasoningEffort.requiresReasoningHistory(model: model, provider: endpoint.name, baseURL: endpoint.baseURL)
+    return ReasoningEffort.requiresReasoningHistory(
+      model: model, provider: endpoint.name, baseURL: endpoint.baseURL)
   }
 
   private static func selectedEndpoint(for request: ChatCompletionRequest) -> OpenAIEndpoint? {

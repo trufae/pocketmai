@@ -204,7 +204,7 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
   func setThinking(_ lines: [String]) {
     lock.withLock {
       let oldCount = thinkingRows.count
-      thinkingRows = Array(lines.suffix(min(3, max(1, rows / 4))))
+      thinkingRows = Array(lines.suffix(min(3, rows / 4)))
       guard active else { return }
       resizeRegion(
         inputRows: inputRows.count + oldCount,
@@ -388,6 +388,7 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
   /// Keeps the input area within what the screen allows; the editor draws
   /// it again in full at its next keystroke.
   private func clampInputRows() {
+    thinkingRows = Array(thinkingRows.suffix(min(3, rows / 4)))
     let maximum = maximumInputRowsLocked
     guard inputRows.count > maximum else { return }
     inputRows = Array(inputRows.suffix(maximum))
