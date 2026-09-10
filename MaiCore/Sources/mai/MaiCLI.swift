@@ -883,11 +883,17 @@ private actor TerminalApprovalHandler: ApprovalHandler {
 
 @main
 struct MaiCLI {
+  private static let version = "1.7.5"
+
   static func main() async {
     let environment = ProcessInfo.processInfo.environment
     let commandLineArguments = platformCommandLineArguments(environment: environment)
     if commandLineArguments.dropFirst().contains(where: { $0 == "--help" || $0 == "-h" }) {
       printUsage()
+      return
+    }
+    if commandLineArguments.dropFirst().contains(where: { $0 == "--version" || $0 == "-v" }) {
+      print(version)
       return
     }
 
@@ -2930,6 +2936,8 @@ struct MaiCLI {
     switch parts[0] {
     case "/exit", "/quit":
       return true
+    case "/version":
+      await terminal.line(version)
     case "/help":
       switch argument.lowercased() {
       case "":
@@ -9817,6 +9825,7 @@ struct MaiCLI {
     /stop                  Interrupt the current turn and keep its queue; /continue resumes it
     /todo                  Show, add to, tick off, or edit this project's todo list
     /tools                 List logical tool groups for the current agent
+    /version               Print the pmai version
     \(visualHelp)
     Input: Shift+Enter adds a line (Alt+Enter or Ctrl+J where the terminal sends Enter for it)
            A paste keeps its lines · Enter sends the whole text
@@ -10160,41 +10169,42 @@ struct MaiCLI {
   private static func printUsage() {
     print(
       """
-      mai — config-driven MaiCore agent CLI
+      pmai — the Pocket Mai command-line agent
 
       Usage:
-        mai [options] [message]
+        pmai [options] [message]
 
       Options:
-        --config PATH       load plugins, providers, tools, MCPs, agents, and approvals
-        --home DIR          keep the project index and shared state in DIR (or PMAI_HOME)
-        --state DIR         keep this project's chats in DIR, not ./.pmai/chats (or PMAI_STATE)
-        --history PATH      persist editable input history (or PMAI_HISTORY)
-        --projects          list every project pmai has been started in, then exit
-        --plugin PATH       load a native .dylib plugin (repeatable)
-        --print-config      print a complete example configuration
         --acp               serve pmai as an ACP agent on stdio (for IDEs)
-        --mcp               serve pmai as an MCP server on stdio (one prompt tool)
         --agent ID          select a configured agent
-        --provider ID       override the selected provider
-        --model NAME        override the selected model
-        --base-url URL      ad-hoc OpenAI-compatible endpoint
         --api-key KEY       prefer an environment variable or config reference
-        --system TEXT       override agent instructions
+        --base-url URL      ad-hoc OpenAI-compatible endpoint
+        --config PATH       load plugins, providers, tools, MCPs, agents, and approvals
+        -h, --help          show this help
+        --history PATH      persist editable input history (or PMAI_HISTORY)
+        --home DIR          keep the project index and shared state in DIR (or PMAI_HOME)
+        --image PATH        attach an image (repeatable)
+        -l, --list          list saved chats in this project and exit
+        --markdown          render replies as markdown even when piped
+        --max-subagents N   children an agent may run at once (default 5)
         --max-tool-calls N  tool calls allowed per agent run (default 100)
         --max-turns N       model turns allowed per agent run (default 50)
-        --max-subagents N   children an agent may run at once (default 5)
-        --image PATH        attach an image (repeatable)
-        --stdin             attach standard input as a text file (git diff | pmai --stdin "review it")
+        --mcp               serve pmai as an MCP server on stdio (one prompt tool)
+        --model NAME        override the selected model
+        --no-markdown       print replies verbatim
         --no-stream         disable response streaming
-        -y, --yolo          permit all tool calls without prompting for this run
-                            (/set yolo on saves the choice for every run)
-        -l, --list          list saved chats in this project and exit
+        --plugin PATH       load a native .dylib plugin (repeatable)
+        --print-config      print a complete example configuration
+        --projects          list every project pmai has been started in, then exit
+        --provider ID       override the selected provider
         -r, --resume [CHAT] reopen CHAT (list index, ID, or title), or the latest chat,
                             with the agents its runs started
-        --markdown          render replies as markdown even when piped
-        --no-markdown       print replies verbatim
-        -h, --help          show this help
+        --state DIR         keep this project's chats in DIR, not ./.pmai/chats (or PMAI_STATE)
+        --stdin             attach standard input as a text file (git diff | pmai --stdin "review it")
+        --system TEXT       override agent instructions
+        -v, --version       print the pmai version
+        -y, --yolo          permit all tool calls without prompting for this run
+                            (/set yolo on saves the choice for every run)
 
       Config discovery:
         --config, PMAI_CONFIG, ./pmai.json, ~/.config/pmai/config.json
