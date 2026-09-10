@@ -1537,6 +1537,7 @@ struct MaiCLI {
     var focus: REPLMessageTarget = .main
     var approvals: [(request: ApprovalRequest, reply: REPLApprovalReply)] = []
     var editingApproval: (request: ApprovalRequest, reply: REPLApprovalReply)?
+    var pendingQueueMessage: String?
     /// True while the input thread waits for the loop before reading again.
     var readerParked = true
     var exiting = false
@@ -1714,7 +1715,9 @@ struct MaiCLI {
 
     func promptText() -> String {
       let prompt: String
-      if loop.editingApproval != nil {
+      if loop.pendingQueueMessage != nil {
+        prompt = "queue [submit/ignore/clear]> "
+      } else if loop.editingApproval != nil {
         prompt = "json> "
       } else if let waiting = loop.approvals.first {
         let who = waiting.request.run.pid.map { "#\($0.rawValue) " } ?? ""
@@ -1846,9 +1849,11 @@ struct MaiCLI {
     /// Starts one turn with whatever is queued for the chat followed by the
     /// texts just typed. The turn runs in its own task; the loop hears about
     /// its end as an event.
-    func startTurn(_ texts: [String]) async {
+    func startTurn(_ texts: [String], ignoringQueue: Bool = false) async {
       let pid = await mainProcess()
-      var messages = await runtime.supervisor.drainInbox(pid)
+      let held = ignoringQueue
+        ? Set(await runtime.supervisor.queuedMessages(for: pid).map(\.id)) : []
+      var messages = await runtime.supervisor.drainInbox(pid, excluding: held)
       messages.append(contentsOf: texts.map { AgentMessage.user($0) })
       guard !messages.isEmpty else { return }
       if !session.pendingContent.isEmpty {
@@ -1857,7 +1862,9 @@ struct MaiCLI {
       }
       for message in messages { session.history.append(message) }
       session.refreshTitle(from: messages[0].text)
-      await beginTurn(chatRequest(), process: pid, kind: .chat)
+      var request = chatRequest()
+      request.ignoredQueuedMessageIDs = held
+      await beginTurn(request, process: pid, kind: .chat)
     }
 
     /// The chat's next run: its whole history under the current profile.
@@ -2017,7 +2024,15 @@ struct MaiCLI {
       switch target {
       case .main:
         guard loop.activeTurn != nil else {
-          await startTurn([text])
+          let pid = await mainProcess()
+          let count = await runtime.supervisor.queuedMessages(for: pid).count
+          if count > 0 {
+            loop.pendingQueueMessage = text
+            await terminal.line(
+              "\(count) queued message(s). Submit them before this message, ignore them for this turn, or clear them? [submit/ignore/clear]")
+          } else {
+            await startTurn([text])
+          }
           return
         }
         let pid = await mainProcess()
@@ -2157,6 +2172,25 @@ struct MaiCLI {
           ? ("/prompts " + typed.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
           : typed
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+          await releaseIfIdle(workspace: workspace)
+          continue
+        }
+        if let pending = loop.pendingQueueMessage {
+          switch text.lowercased() {
+          case "submit", "s":
+            loop.pendingQueueMessage = nil
+            await startTurn([pending])
+          case "ignore", "i":
+            loop.pendingQueueMessage = nil
+            await startTurn([pending], ignoringQueue: true)
+          case "clear", "c":
+            loop.pendingQueueMessage = nil
+            let pid = await mainProcess()
+            await runtime.supervisor.clearQueuedMessages(for: pid)
+            await startTurn([pending])
+          default:
+            await terminal.line("Choose submit, ignore, or clear. Ctrl+C cancels this new message and keeps the queue.")
+          }
           await releaseIfIdle(workspace: workspace)
           continue
         }
@@ -2436,7 +2470,10 @@ struct MaiCLI {
         // Reflect Ctrl+C immediately, rather than waiting for a provider or
         // tool cancellation to make its way through the supervisor.
         activityWasInterrupted = true
-        if let turn = loop.activeTurn {
+        if loop.pendingQueueMessage != nil {
+          loop.pendingQueueMessage = nil
+          await terminal.note("New message cancelled; the queue is unchanged.")
+        } else if let turn = loop.activeTurn {
           turn.task.cancel()
         } else if let waiting = loop.approvals.first {
           loop.approvals.removeFirst()
@@ -2529,14 +2566,11 @@ struct MaiCLI {
           } else {
             waiting = 0
           }
-          if waiting > 0, succeeded || !atPrompt {
-            // Typed after the run's last look at its inbox — or into another
-            // chat while this run held the prompt: it becomes the next turn
-            // right away, the way it would have joined this one.
-            await startTurn([])
-          } else if waiting > 0 {
+          // Entries deliberately ignored, or arriving after the last model
+          // turn, stay queued until the person chooses to submit them.
+          if waiting > 0 {
             await terminal.note(
-              "\(waiting) queued message\(waiting == 1 ? "" : "s") still waiting: /queue shows them; they go with your next message."
+              "\(waiting) queued message\(waiting == 1 ? "" : "s") still waiting: /queue shows them; /continue submits them; a new message asks what to do."
             )
           } else if let paused, atPrompt {
             // A spent turn budget is a checkpoint, and with yolo on the person
@@ -2560,7 +2594,7 @@ struct MaiCLI {
             let left = await runtime.supervisor.queuedMessages(for: turn.pid).count
             if left > 0 {
               await terminal.note(
-                "\(left) queued message\(left == 1 ? "" : "s") wait in '\(elsewhere)'; they go with the next message there."
+                "\(left) queued message\(left == 1 ? "" : "s") wait in '\(elsewhere)'; /continue there submits them; a new message asks what to do."
               )
             } else if paused != nil || kept > 0 {
               await terminal.note(

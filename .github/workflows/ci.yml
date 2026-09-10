@@ -37,6 +37,12 @@ jobs:
           swift build --package-path MaiCore -c release --product pmai -Xswiftc -Osize
           strip -x MaiCore/.build/release/pmai
 
+      - name: Test agent queues and tools
+        if: matrix.name == 'Linux x64'
+        run: |
+          swift test --package-path MaiCore --filter 'queued|Inbox|inbox|cancelledTool|enabledAgentGroup|agentToolGroup|toolDelegation|subagentsUseDefault|disabledAgents'
+          python3 test/repl-queue-smoke.py MaiCore/.build/release/pmai
+
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v7
         with:

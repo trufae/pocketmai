@@ -1854,7 +1854,7 @@ func toolDelegationNeedsASubagentBudget() async throws {
       toolDelegation: .subagent))
 
   let names = Set(try #require(await provider.requests.first).tools.map(\.name))
-  #expect(names == ["read_file"])
+  #expect(names == Set(["read_file"]).union(AgentRuntime.agentToolNames.subtracting([AgentRuntime.agentStartToolName])))
 }
 
 @Test("Disabled agents are never offered as subagents")
@@ -2881,4 +2881,46 @@ private actor OrderedReasoningEvents {
     default: break
     }
   }
+}
+
+@Test("Enabling agents permits a worker in inline mode without configured subagents")
+func enabledAgentGroupStartsWorker() async throws {
+  let provider = ScriptedProvider(responses: [
+    ProviderResponse(message: AgentMessage(role: .assistant, content: [
+      .toolCall(ToolCall(id: "start", name: "agent_start", arguments: .object([
+        "task": .string("Compute"), "output": .string("One line")
+      ])))
+    ]), stopReason: .toolCall),
+    ProviderResponse(message: .assistant("Child answer"), stopReason: .stop),
+    ProviderResponse(message: .assistant("Parent answer"), stopReason: .stop),
+  ])
+  let runtime = AgentRuntime(approvalHandler: AllowAllApprovals())
+  try await runtime.register(provider)
+  let result = try await runtime.run(AgentRequest(
+    provider: "scripted", model: "fixture", messages: [.user("delegate")],
+    toolGroupNames: [AgentRuntime.agentToolGroup.id]))
+  #expect(result.transcript.flatMap(\.toolResults).map(\.text) == ["Child answer"])
+  #expect(await runtime.supervisor.processes().contains { $0.depth == 1 })
+}
+
+@Test("A child budget of zero keeps management tools and explains why start is refused")
+func enabledAgentGroupExplainsLimits() async throws {
+  let provider = ScriptedProvider(responses: [
+    ProviderResponse(message: AgentMessage(role: .assistant, content: [
+      .toolCall(ToolCall(id: "start", name: "agent_start", arguments: .object([
+        "task": .string("Compute"), "output": .string("One line")
+      ])))
+    ]), stopReason: .toolCall),
+    ProviderResponse(message: .assistant("Done"), stopReason: .stop),
+  ])
+  let runtime = AgentRuntime()
+  try await runtime.register(provider)
+  let result = try await runtime.run(AgentRequest(
+    provider: "scripted", model: "fixture", messages: [.user("delegate")],
+    toolGroupNames: [AgentRuntime.agentToolGroup.id], limits: AgentRunLimits(maxSubagents: 0)))
+  let names = Set(try #require(await provider.requests.first).tools.map(\.name))
+  #expect(!names.contains(AgentRuntime.agentStartToolName))
+  #expect(names.contains(AgentRuntime.agentStatusToolName))
+  #expect(result.transcript.flatMap(\.toolResults).first?.text.contains("limits.maxSubagents is 0") == true)
+  #expect(await runtime.supervisor.processes().count == 1)
 }

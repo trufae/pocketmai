@@ -95,7 +95,7 @@ extension MaiCLI {
       await supervisor.post(.user(body), to: pid)
       let count = await supervisor.queuedMessages(for: pid).count
       await terminal.line(
-        "Queued for \(describe(pid, main: main, info: info)) (\(count) waiting). It goes out at the agent's next model turn; the chat's own queue also goes with your next message."
+        "Queued for \(describe(pid, main: main, info: info)) (\(count) waiting). It goes out at the agent's next model turn; /continue submits the chat queue; a new message asks what to do."
       )
 
     case "pop":
@@ -145,6 +145,10 @@ extension MaiCLI {
       /queue push @PID TEXT  Queue TEXT for one agent
       /queue pop [PID]       Drop the newest queued message (of one agent)
       /queue drop [PID]      Drop every queued message (of one agent)
+
+    Ctrl+C keeps undelivered messages. /continue submits the chat queue.
+    If you type a new message with a nonempty queue, choose submit (queue
+    first), ignore (keep it for a later turn), or clear (discard it).
 
     @PID TEXT sends one message to a running agent; /agents focus PID makes it
     the target of everything you type until /agents focus main.
