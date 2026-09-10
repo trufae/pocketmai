@@ -25,7 +25,6 @@ actor TerminalWriter {
   private var thinkingDisplay: ThinkingDisplay = .status
   private var thinkingPreview = ThinkingPreview()
   private var thinkingActive = false
-  private var thinkingFull = false
   private var lastThinkingDraw = Date.distantPast
   private var childReasoning: [AgentPID: String] = [:]
   private var wroteRootDelta = false
@@ -471,7 +470,6 @@ actor TerminalWriter {
       let text = String(String.UnicodeScalarView(safe))
       write(colorsOutput ? "\u{1B}[3;38;5;248m\(text)\u{1B}[0m" : text)
       outputEndedLine = text.hasSuffix("\n")
-      thinkingFull = true
     } else {
       thinkingPreview.append(delta)
       let now = Date()
@@ -491,9 +489,8 @@ actor TerminalWriter {
   private func finishThinking() {
     guard thinkingActive else { return }
     screen?.setThinking([])
-    if thinkingFull && !outputEndedLine { write("\n") }
+    if thinkingDisplay == .full && !outputEndedLine { write("\n") }
     thinkingActive = false
-    thinkingFull = false
     thinkingPreview = ThinkingPreview()
   }
 

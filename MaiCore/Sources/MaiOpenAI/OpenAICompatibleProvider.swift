@@ -221,10 +221,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       // anything else is a value meant for the endpoint and goes as it is.
       // Fields set through `additional` are the person's own and stay.
       if let effort = ReasoningEffort(name: reasoningEffort) {
-        let fields = effort.requestFields(
-          model: model,
-          provider: "\(descriptor.id.rawValue) \(descriptor.displayName)",
-          baseURL: configuration.baseURL.absoluteString)
+        let fields = effort.requestFields(family: family, model: model)
         for (key, value) in fields where request.options.additional[key] == nil {
           body[key] = value
         }
@@ -372,7 +369,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       throw httpError(statusCode: http.statusCode, data: body)
     }
 
-    var text = ""
+    var hasContent = false
     var reasoningStream = ReasoningStream()
     var usage: TokenUsage?
     var stopReason = ProviderStopReason.unknown
@@ -419,7 +416,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       }
       let textDelta = decodedText(delta["content"])
       if !textDelta.isEmpty {
-        text += textDelta
+        hasContent = hasContent || !textDelta.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         await emitParts(reasoningStream.append(textDelta), emit: emit)
       }
       if delta["tool_calls"]?.arrayValue?.isEmpty == false {
@@ -455,7 +452,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       guard let accumulator = toolCalls[index] else { return nil }
       return try accumulator.toolCall(index: index, resolver: resolver)
     }
-    if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+    if !hasContent,
       completedCalls.isEmpty,
       !rawLines.isEmpty,
       let data = rawLines.joined(separator: "\n").data(using: .utf8),
@@ -463,7 +460,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     {
       return fallback
     }
-    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !completedCalls.isEmpty
+    guard hasContent || !completedCalls.isEmpty
     else {
       throw OpenAICompatibleEmptyReply()
     }

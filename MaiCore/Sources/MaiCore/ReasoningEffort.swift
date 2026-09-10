@@ -238,11 +238,8 @@ public enum ReasoningEffort: String, Codable, CaseIterable, Identifiable, Sendab
     switch self {
     case .automatic: "auto"
     case .disabled: "none"
-    case .minimal: "minimal"
-    case .low: "low"
-    case .medium: "medium"
-    case .high: "high"
     case .xhigh, .max: allowingXHigh ? "xhigh" : "high"
+    default: rawValue
     }
   }
 
@@ -259,7 +256,6 @@ public enum ReasoningEffort: String, Codable, CaseIterable, Identifiable, Sendab
     }
   }
 
-  /// Shared by frontends; the persisted iOS names remain compatible.
   /// Local chat-template controls, used by MLX without a provider-specific UI.
   public func templateContext(model: String) -> [String: any Sendable]? {
     guard self != .automatic else { return nil }
@@ -302,10 +298,7 @@ public enum ReasoningEffort: String, Codable, CaseIterable, Identifiable, Sendab
     if name.contains("kimi-k3")
       || (family == .gemini
         && (name.contains("gemini-3") || name.contains("gemini-2.5-pro")))
-    {
-      return "This model cannot disable thinking; the lowest supported effort is requested."
-    }
-    if model.lowercased().contains("gpt-oss")
+      || name.contains("gpt-oss")
       || (family == .openAI && Self.isOpenAIReasoningModel(model)
         && !Self.supportsOpenAINone(model))
     {

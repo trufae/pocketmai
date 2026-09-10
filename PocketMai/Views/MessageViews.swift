@@ -371,7 +371,7 @@ private struct MessageBubbleContent: View, Equatable {
               content: section.content,
               monospaced: false,
               dimmedContent: true,
-              initiallyExpanded: showThinking,
+              initiallyExpanded: showThinking && thinkingDisplay == .full,
               italicContent: true,
               markdownAppearance: canRenderMarkdown ? appearance : nil,
               renderImages: renderImages
