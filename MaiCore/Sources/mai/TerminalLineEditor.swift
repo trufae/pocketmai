@@ -118,7 +118,9 @@ private final class ClassicEditorSurface: LineEditorSurface {
       caretRow = 0
       drawnRows = 0
       _ = tcsetattr(STDIN_FILENO, TCSADRAIN, &cooked)
-      _ = kill(getpid(), SIGTSTP)
+      // Stop this thread synchronously. A process-directed kill can be
+      // delivered to another thread after this one has restored raw mode.
+      _ = raise(SIGTSTP)
       _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw)
       write(TerminalInputModes.enable)
     #endif
