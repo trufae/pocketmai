@@ -33,7 +33,7 @@ jobs:
         run: swift --version
 
       - name: Test agent queues and tools
-        if: matrix.name == 'Linux x64'
+        if: matrix.name == 'macOS'
         run: swift test --package-path MaiCore --filter 'queued|Inbox|inbox|cancelledTool|enabledAgentGroup|agentToolGroup|toolDelegation|subagentsUseDefault|disabledAgents'
 
       - name: Build release CLI
