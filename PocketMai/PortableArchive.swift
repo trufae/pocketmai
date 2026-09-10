@@ -164,7 +164,7 @@ extension AgentChat {
       model: conversation.modelID,
       toolNames: conversation.toolsEnabled ? Set(conversation.enabledTools.map(\.rawValue)) : [],
       stream: conversation.usesStreaming,
-      options: GenerationOptions(reasoningEffort: conversation.reasoningLevel.reasoningEffortValue),
+      options: GenerationOptions(reasoningEffort: conversation.reasoningLevel.optionValue),
       toolCallingStrategy: strategy)
     var messages = conversation.messages.map { AgentMessage(pocketMai: $0) }
     if let prompt, !prompt.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -242,7 +242,7 @@ extension Conversation {
     enabledTools = BuiltInToolID.knownTools(from: Array(chat.primaryAgent.toolNames))
     toolsEnabled = !enabledTools.isEmpty
     reasoningLevel = ReasoningLevel(
-      rawValue: chat.primaryAgent.options.reasoningEffort ?? "") ?? .automatic
+      name: chat.primaryAgent.options.reasoningEffort ?? "") ?? .automatic
 
     switch chat.primaryAgent.provider.rawValue {
     case "apple":

@@ -124,6 +124,20 @@ final class ConversationTransferTests: XCTestCase {
     XCTAssertEqual(portable.chats?.first?.title, original.title)
   }
 
+  func testPortableConversationKeepsEveryReasoningLevel() {
+    let settings = AppSettings()
+    for level in ReasoningLevel.allCases {
+      var original = conversation("Reasoning", createdAt: 1_700_000_400)
+      original.reasoningLevel = level
+      let portable = AgentChat(pocketMai: original, settings: settings)
+      XCTAssertEqual(portable.primaryAgent.options.reasoningEffort, level.optionValue)
+      XCTAssertEqual(Conversation(archive: portable, settings: settings).reasoningLevel, level)
+    }
+    var legacy = AgentChat(pocketMai: conversation("Legacy", createdAt: 1_700_000_400), settings: settings)
+    legacy.primaryAgent.options.reasoningEffort = "none"
+    XCTAssertEqual(Conversation(archive: legacy, settings: settings).reasoningLevel, .disabled)
+  }
+
   func testPortableConversationRoundTripKeepsNestedSubagentChats() throws {
     let childRunID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
     var original = conversation("Delegated chat", createdAt: 1_700_000_400)
