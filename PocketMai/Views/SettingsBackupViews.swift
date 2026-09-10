@@ -79,6 +79,7 @@ struct SettingsImportView: View {
   @State private var includePictures = false
 
   @State private var pendingConversationImport: ConversationImportPreview?
+  @State private var pendingConversationCollectionImport: PendingConversationImportFile?
 
   @State private var toast: String?
   @State private var errorMessage: String?
@@ -146,7 +147,15 @@ struct SettingsImportView: View {
         }
       )
     }
-    .settingsToast($toast)
+    .sheet(item: $pendingConversationCollectionImport) { file in
+      ConversationCollectionImportView(file: file) {
+        pendingConversationCollectionImport = nil
+        importPreview = nil
+        selectedSections = SettingsBackupSelection()
+      }
+      .environmentObject(store)
+    }
+    .settingsToast($toast, style: .success)
   }
 
   @ViewBuilder
@@ -160,10 +169,14 @@ struct SettingsImportView: View {
       case .backup(let envelope):
         infoRow("Backup format", "\(envelope.version)")
       case .conversation(let envelope):
-        infoRow("Title", envelope.title)
-        infoRow("Provider", envelope.providerDisplayName)
-        infoRow("Model", envelope.model)
-        infoRow("Messages", "\(envelope.conversation.messages.count)")
+        if envelope.exportedConversations.count == 1 {
+          infoRow("Title", envelope.title)
+          infoRow("Provider", envelope.providerDisplayName)
+          infoRow("Model", envelope.model)
+          infoRow("Messages", "\(envelope.conversation.messages.count)")
+        } else {
+          infoRow("Conversations", "\(envelope.exportedConversations.count)")
+        }
       }
     } header: {
       Text("File Info")
@@ -264,6 +277,12 @@ struct SettingsImportView: View {
         errorMessage = SettingsBackupError.emptySelection.localizedDescription
         return
       }
+      if envelope.exportedConversations.count > 1, let data = preview.sourceData {
+        pendingConversationCollectionImport = PendingConversationImportFile(
+          filename: preview.filename,
+          data: data)
+        return
+      }
       Task { await prepareConversationImport(from: envelope) }
     }
   }
@@ -334,6 +353,10 @@ struct SettingsImportView: View {
         return "\(count) \(itemLabel(count, singular: "conversation"))."
       }
     case .conversation(let envelope):
+      let conversations = envelope.exportedConversations
+      if conversations.count > 1 {
+        return "\(conversations.count) conversations."
+      }
       return
         "\(displayValue(envelope.title)) · \(envelope.conversation.messages.count) \(itemLabel(envelope.conversation.messages.count, singular: "message"))."
     }
@@ -342,7 +365,8 @@ struct SettingsImportView: View {
   private func previewType(_ preview: SettingsImportFilePreview) -> String {
     switch preview.kind {
     case .backup: return "PocketMai backup"
-    case .conversation: return "Single conversation"
+    case .conversation(let envelope):
+      return envelope.exportedConversations.count == 1 ? "Single conversation" : "Conversation pack"
     }
   }
 
