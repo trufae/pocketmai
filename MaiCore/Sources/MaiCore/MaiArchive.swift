@@ -135,7 +135,7 @@ public struct MaiArchiveSkill: Codable, Equatable, Sendable {
       }
       try file.data.write(to: target, options: .atomic)
       if file.executable {
-        try fileManager.setAttributes([.posixPermissions: 0o755], atPath: target.path)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: target.path)
       }
     }
   }
