@@ -241,6 +241,8 @@ private struct StreamingMessageBubble: View {
 }
 
 private struct MessageBubbleContent: View, Equatable {
+  @AppStorage("thinkingDisplay") private var thinkingDisplay: ThinkingDisplay = .full
+  @State private var thinkingWidth: CGFloat = 280
   let message: ChatMessage
   let messageRenderKey: ChatMessageRenderKey
   var streamingOverride: String? = nil
@@ -333,17 +335,48 @@ private struct MessageBubbleContent: View, Equatable {
             entry: entry,
             onEdit: toolEditAction(for: entry, partID: part.id, in: prepared))
         case .reasoning(_, let section):
-          FoldableMetaSection(
-            title: "Reasoning",
-            systemImage: "brain",
-            content: isStreaming ? Self.tailWindow(section.content) : section.content,
-            monospaced: false,
-            dimmedContent: true,
-            initiallyExpanded: showThinking,
-            italicContent: true,
-            markdownAppearance: canRenderMarkdown ? appearance : nil,
-            renderImages: renderImages
-          )
+          if isStreaming && index == prepared.parts.count - 1
+            && thinkingDisplay != .full && showThinking
+          {
+            VStack(alignment: .leading, spacing: 2) {
+              if thinkingDisplay == .status {
+                Text("Thinking…").italic().foregroundStyle(.secondary)
+              } else {
+                let lines = ThinkingPreview.lines(
+                  section.content, count: thinkingDisplay.lineCount,
+                  width: max(
+                    1,
+                    Int(
+                      thinkingWidth
+                        / (UIFont.preferredFont(forTextStyle: .caption1).pointSize * 0.65))))
+                ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
+                  Text(line).font(.system(.caption, design: .monospaced)).italic().foregroundStyle(
+                    .secondary
+                  )
+                  .opacity(Double(index + 1) / Double(lines.count))
+                  .lineLimit(1)
+                }
+              }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .onGeometryChange(for: CGFloat.self) {
+              $0.size.width
+            } action: {
+              thinkingWidth = $0
+            }
+          } else {
+            FoldableMetaSection(
+              title: "Reasoning",
+              systemImage: "brain",
+              content: section.content,
+              monospaced: false,
+              dimmedContent: true,
+              initiallyExpanded: showThinking,
+              italicContent: true,
+              markdownAppearance: canRenderMarkdown ? appearance : nil,
+              renderImages: renderImages
+            )
+          }
         case .transcript(_, let section):
           FoldableMetaSection(
             title: "Prompt Transcript",
@@ -823,23 +856,6 @@ private struct MessageBubbleContent: View, Equatable {
     return AnyShapeStyle(.regularMaterial)
   }
 
-  private static let streamingReasoningTail = 1500
-
-  /// While a message is still streaming, the reasoning section keeps growing
-  /// and SwiftUI re-lays out the entire `Text` block on every token tick — at
-  /// 5-10 KB that dominates the main thread. Showing only the trailing window
-  /// caps layout cost at O(streamingReasoningTail) per update; the full text
-  /// is rendered once the stream finalizes.
-  private static func tailWindow(_ text: String) -> String {
-    guard
-      let start = text.index(
-        text.endIndex, offsetBy: -streamingReasoningTail, limitedBy: text.startIndex
-      )
-    else {
-      return text
-    }
-    return "…" + text[start...]
-  }
 }
 
 private enum MessageBubblePalette {

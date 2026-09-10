@@ -22,6 +22,12 @@ import MaiMarkdown
 /// prefixed with the child's pid (`agent#3`), so two children working at once
 /// stay readable and the prefix says who said what.
 actor TerminalWriter {
+  private var thinkingDisplay: ThinkingDisplay = .status
+  private var thinkingPreview = ThinkingPreview()
+  private var thinkingActive = false
+  private var thinkingFull = false
+  private var lastThinkingDraw = Date.distantPast
+  private var childReasoning: [AgentPID: String] = [:]
   private var wroteRootDelta = false
   private var rootLineOpen = false
   /// When set, output is collected for another surface instead of hitting the tty.
@@ -105,6 +111,11 @@ actor TerminalWriter {
     subagentOutput = level
   }
 
+  func configureThinking(_ mode: ThinkingDisplay) {
+    finishThinking()
+    thinkingDisplay = mode
+  }
+
   func configurePromptColor(_ color: String) {
     promptColor = color
   }
@@ -134,6 +145,7 @@ actor TerminalWriter {
   }
 
   func resetResponse() {
+    finishThinking()
     wroteRootDelta = false
     rootLineOpen = false
     markdown?.reset()
@@ -146,7 +158,13 @@ actor TerminalWriter {
         finishReply()
         closeRootLine()
       }
+      if thinkingDisplay != .full { showThinking("") }
+    case .provider(let context, .reasoningDelta(let text)) where context.depth == 0:
+      showThinking(text)
+    case .provider(let context, .toolCallDelta) where context.depth == 0:
+      finishThinking()
     case .provider(let context, .textDelta(let text)) where context.depth == 0:
+      finishThinking()
       if var renderer = markdown {
         let output = renderer.feed(text)
         markdown = renderer
@@ -188,6 +206,7 @@ actor TerminalWriter {
         "↻ retry \(attempt)/\(limit) in \(ModelUsageFormat.duration(delay)): \(error)",
         color: "yellow")
     case .finished(let context, let result) where context.depth == 0:
+      finishThinking()
       if wroteRootDelta {
         finishReply()
       } else if result.interruption == nil {
@@ -230,7 +249,15 @@ actor TerminalWriter {
       if tools > 0 { facts.append("\(tools) tool\(tools == 1 ? "" : "s")") }
       if let tokens = childTokens[pid], tokens > 0 { facts.append(ModelUsageFormat.tokens(tokens)) }
       childBlock(pid, "· " + facts.joined(separator: " · "))
+    case .provider(let context, .reasoningDelta(let text)):
+      guard let pid = context.pid, subagentOutput == .all else { return }
+      if childReasoning[pid] == nil { flushChildText(pid) }
+      childReasoning[pid, default: ""] += text
+      if thinkingDisplay != .full {
+        childReasoning[pid] = ThinkingPreview.tail(childReasoning[pid] ?? "")
+      }
     case .provider(let context, .textDelta(let text)):
+      if let pid = context.pid { flushChildReasoning(pid) }
       guard let pid = context.pid, subagentOutput == .all else { return }
       childText[pid, default: ""] += text
     case .provider(let context, .usage(let usage)):
@@ -360,7 +387,20 @@ actor TerminalWriter {
 
   // MARK: - Child blocks
 
+  private func flushChildReasoning(_ pid: AgentPID) {
+    guard let text = childReasoning.removeValue(forKey: pid) else { return }
+    let visible =
+      thinkingDisplay == .full
+      ? text
+      : thinkingDisplay == .status
+        ? "Thinking…"
+        : ThinkingPreview.lines(text, count: thinkingDisplay.lineCount, width: 70).joined(
+          separator: "\n")
+    childBlock(pid, visible, color: "grey", italic: true)
+  }
+
   private func flushChildText(_ pid: AgentPID) {
+    flushChildReasoning(pid)
     guard let text = childText.removeValue(forKey: pid) else { return }
     let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
     var trimmed = lines
@@ -376,11 +416,13 @@ actor TerminalWriter {
 
   /// One block from one child: every line carries the pid, and the whole
   /// block is written in one go so nothing else lands in the middle of it.
-  private func childBlock(_ pid: AgentPID, _ text: String, color: String? = nil) {
+  private func childBlock(_ pid: AgentPID, _ text: String, color: String? = nil, italic: Bool = false) {
     finishReply()
     closeRootLine()
     let prefix = childPrefix(pid)
-    let body = styledLines(text, color: color).map { prefix + $0 }.joined(separator: "\n")
+    let body = styledLines(text, color: color).map { line in
+      prefix + (italic && colorsStatus ? "\u{1B}[3m\(line)\u{1B}[23m" : line)
+    }.joined(separator: "\n")
     emitStatus(body)
   }
 
@@ -404,10 +446,55 @@ actor TerminalWriter {
 
   /// Writes what the markdown renderer still holds for the current reply.
   private func finishReply() {
+    finishThinking()
     guard var renderer = markdown else { return }
     let output = renderer.flush()
     markdown = renderer
     write(output)
+  }
+
+  private func showThinking(_ delta: String) {
+    if !thinkingActive {
+      finishReply()
+      closeRootLine()
+      thinkingActive = true
+      thinkingPreview = ThinkingPreview()
+      lastThinkingDraw = .distantPast
+      if thinkingDisplay != .full && screen == nil {
+        status("Thinking…", color: "grey")
+      }
+    }
+    if thinkingDisplay == .full {
+      let safe = delta.unicodeScalars.filter {
+        $0 == "\n" || $0 == "\t" || !CharacterSet.controlCharacters.contains($0)
+      }
+      let text = String(String.UnicodeScalarView(safe))
+      write(colorsOutput ? "\u{1B}[3;38;5;248m\(text)\u{1B}[0m" : text)
+      outputEndedLine = text.hasSuffix("\n")
+      thinkingFull = true
+    } else {
+      thinkingPreview.append(delta)
+      let now = Date()
+      if now.timeIntervalSince(lastThinkingDraw) >= 0.05 {
+        let lines =
+          thinkingDisplay == .status
+          ? ["Thinking…"]
+          : ThinkingPreview.lines(
+            thinkingPreview.text, count: thinkingDisplay.lineCount,
+            width: screen?.lineWidth ?? 79, measure: TerminalScreen.displayWidth)
+        screen?.setThinking(lines)
+        lastThinkingDraw = now
+      }
+    }
+  }
+
+  private func finishThinking() {
+    guard thinkingActive else { return }
+    screen?.setThinking([])
+    if thinkingFull && !outputEndedLine { write("\n") }
+    thinkingActive = false
+    thinkingFull = false
+    thinkingPreview = ThinkingPreview()
   }
 
   private func write(_ value: String) {

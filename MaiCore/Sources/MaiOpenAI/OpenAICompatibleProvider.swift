@@ -1,8 +1,9 @@
 import Foundation
-#if canImport(FoundationNetworking)
-import FoundationNetworking
-#endif
 import MaiCore
+
+#if canImport(FoundationNetworking)
+  import FoundationNetworking
+#endif
 
 public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
   public struct Configuration: Sendable {
@@ -190,10 +191,15 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     model: String,
     resolver: ToolNameResolver
   ) throws -> URLRequest {
+    let family = ReasoningEffort.APIFamily.detect(
+      model: model,
+      provider: "\(descriptor.id.rawValue) \(descriptor.displayName)",
+      baseURL: configuration.baseURL.absoluteString)
     var body = request.options.additional
     body["model"] = .string(model)
     body["messages"] = .array(
-      try request.messages.flatMap { try openAIMessages($0, resolver: resolver) })
+      try ReasoningEffort.messages(request.messages, options: request.options, model: model)
+        .flatMap { try openAIMessages($0, resolver: resolver, family: family) })
     body["stream"] = .bool(request.stream)
     if request.stream && request.options.includeStreamUsage {
       body["stream_options"] = .object(["include_usage": .bool(true)])
@@ -222,7 +228,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
         for (key, value) in fields where request.options.additional[key] == nil {
           body[key] = value
         }
-      } else {
+      } else if request.options.additional["reasoning_effort"] == nil {
         body["reasoning_effort"] = .string(reasoningEffort)
       }
     }
@@ -264,8 +270,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     var path = components.path
     while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
     for suffix in ["/chat/completions", "/audio/speech", "/models", "/voices"]
-    where path.hasSuffix(suffix)
-    {
+    where path.hasSuffix(suffix) {
       path.removeLast(suffix.count)
       break
     }
@@ -311,8 +316,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       throw OpenAICompatibleEmptyReply()
     }
 
-    if !message.reasoning.isEmpty { await emit(.reasoningDelta(message.reasoning)) }
-    if !message.text.isEmpty { await emit(.textDelta(message.text)) }
+    await emitParts(message.content, emit: emit)
     for (index, call) in message.toolCalls.enumerated() {
       await emit(
         .toolCallDelta(
@@ -337,15 +341,15 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
   ) async throws -> ProviderResponse {
     let delegate = ProviderRedirectDelegate(originalRequest: request)
     let (bytes, response) = try await session.bytes(for: request, delegate: delegate)
-#if !canImport(FoundationNetworking)
-    let urlTask = bytes.task
-#endif
+    #if !canImport(FoundationNetworking)
+      let urlTask = bytes.task
+    #endif
     return try await withTaskCancellationHandler {
       try await decodedStream(bytes, response: response, resolver: resolver, emit: emit)
     } onCancel: {
-#if !canImport(FoundationNetworking)
-      urlTask.cancel()
-#endif
+      #if !canImport(FoundationNetworking)
+        urlTask.cancel()
+      #endif
     }
   }
 
@@ -369,10 +373,11 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     }
 
     var text = ""
-    var reasoning = ""
+    var reasoningStream = ReasoningStream()
     var usage: TokenUsage?
     var stopReason = ProviderStopReason.unknown
     var toolCalls: [Int: ToolCallAccumulator] = [:]
+    var reasoningDetailsSnapshot = ""
     var rawLines: [String] = []
     var rawCharacterCount = 0
 
@@ -397,17 +402,28 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       if let value = tokenUsage(root["usage"]) { usage = value }
       guard let choice = root["choices"]?.arrayValue?.first?.objectValue else { continue }
       let delta = choice["delta"]?.objectValue ?? choice["message"]?.objectValue ?? [:]
+      var reasoningDelta = decodedReasoning(delta)
+      if configuration.baseURL.host?.contains("minimax") == true,
+        delta["reasoning_details"] != nil,
+        delta["reasoning_content"]?.stringValue?.isEmpty != false,
+        delta["reasoning"]?.stringValue?.isEmpty != false
+      {
+        let snapshot = reasoningDelta
+        if snapshot.hasPrefix(reasoningDetailsSnapshot) {
+          reasoningDelta = String(snapshot.dropFirst(reasoningDetailsSnapshot.count))
+        }
+        reasoningDetailsSnapshot = snapshot
+      }
+      if !reasoningDelta.isEmpty {
+        await emitParts(reasoningStream.appendReasoning(reasoningDelta), emit: emit)
+      }
       let textDelta = decodedText(delta["content"])
       if !textDelta.isEmpty {
         text += textDelta
-        await emit(.textDelta(textDelta))
+        await emitParts(reasoningStream.append(textDelta), emit: emit)
       }
-      let reasoningDelta =
-        delta["reasoning_content"]?.stringValue
-        ?? delta["reasoning"]?.stringValue ?? ""
-      if !reasoningDelta.isEmpty {
-        reasoning += reasoningDelta
-        await emit(.reasoningDelta(reasoningDelta))
+      if delta["tool_calls"]?.arrayValue?.isEmpty == false {
+        await emitParts(reasoningStream.flush(), emit: emit)
       }
       for rawCall in delta["tool_calls"]?.arrayValue ?? [] {
         guard let object = rawCall.objectValue else { continue }
@@ -434,6 +450,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       }
     }
 
+    await emitParts(reasoningStream.flush(), emit: emit)
     let completedCalls = try toolCalls.keys.sorted().compactMap { index -> ToolCall? in
       guard let accumulator = toolCalls[index] else { return nil }
       return try accumulator.toolCall(index: index, resolver: resolver)
@@ -450,15 +467,23 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     else {
       throw OpenAICompatibleEmptyReply()
     }
-    var parts: [ContentPart] = []
-    if !reasoning.isEmpty { parts.append(.reasoning(reasoning)) }
-    if !text.isEmpty { parts.append(.text(text)) }
+    var parts = reasoningStream.parts
     parts.append(contentsOf: completedCalls.map(ContentPart.toolCall))
     if let usage { await emit(.usage(usage)) }
     return ProviderResponse(
       message: AgentMessage(role: .assistant, content: parts),
       usage: usage,
       stopReason: completedCalls.isEmpty ? stopReason : .toolCall)
+  }
+
+  private func emitParts(_ parts: [ContentPart], emit: ProviderEventHandler) async {
+    for part in parts {
+      switch part {
+      case .text(let text): await emit(.textDelta(text))
+      case .reasoning(let text): await emit(.reasoningDelta(text))
+      default: break
+      }
+    }
   }
 
   private func appendRawLine(
@@ -475,7 +500,8 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
 
   private func openAIMessages(
     _ message: AgentMessage,
-    resolver: ToolNameResolver
+    resolver: ToolNameResolver,
+    family: ReasoningEffort.APIFamily
   ) throws -> [JSONValue] {
     if message.role == .tool || !message.toolResults.isEmpty {
       return try message.toolResults.map { result in
@@ -515,7 +541,13 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       }
     }
     object["content"] = visibleParts.isEmpty ? .null : try openAIContent(visibleParts)
-    if !message.reasoning.isEmpty { object["reasoning_content"] = .string(message.reasoning) }
+    if !message.reasoning.isEmpty {
+      if family == .minimax {
+        object["content"] = .string(ReasoningText.render(message.content))
+      } else {
+        object["reasoning_content"] = .string(message.reasoning)
+      }
+    }
     if !message.toolCalls.isEmpty {
       object["tool_calls"] = .array(
         message.toolCalls.map { call in
@@ -643,11 +675,12 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     resolver: ToolNameResolver
   ) throws -> AgentMessage {
     let text = decodedText(payload["content"] ?? payload["text"])
-    let reasoning =
-      payload["reasoning_content"]?.stringValue ?? payload["reasoning"]?.stringValue ?? ""
-    var parts: [ContentPart] = []
-    if !reasoning.isEmpty { parts.append(.reasoning(reasoning)) }
-    if !text.isEmpty { parts.append(.text(text)) }
+    let reasoning = decodedReasoning(payload)
+    var stream = ReasoningStream()
+    _ = stream.appendReasoning(reasoning)
+    _ = stream.append(text)
+    _ = stream.flush()
+    var parts = stream.parts
     for (index, raw) in (payload["tool_calls"]?.arrayValue ?? []).enumerated() {
       guard let object = raw.objectValue else { continue }
       let function = object["function"]?.objectValue ?? [:]
@@ -661,6 +694,15 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       parts.append(.toolCall(call))
     }
     return AgentMessage(role: .assistant, content: parts)
+  }
+
+  private func decodedReasoning(_ payload: [String: JSONValue]) -> String {
+    for key in ["reasoning_content", "reasoning", "thinking"] {
+      if let value = payload[key]?.stringValue, !value.isEmpty { return value }
+    }
+    return (payload["reasoning_details"]?.arrayValue ?? []).compactMap {
+      $0.objectValue?["text"]?.stringValue ?? $0.objectValue?["summary"]?.stringValue
+    }.joined()
   }
 
   private func decodedText(_ value: JSONValue?) -> String {

@@ -695,29 +695,9 @@ extension ToolCallingMode {
   }
 }
 
-enum ReasoningLevel: String, Codable, CaseIterable, Identifiable, Sendable {
-  case automatic
-  case disabled
-  case minimal
-  case low
-  case medium
-  case high
-  case xhigh
+typealias ReasoningLevel = MaiCore.ReasoningEffort
 
-  var id: String { rawValue }
-
-  var displayName: String {
-    switch self {
-    case .automatic: "Auto"
-    case .disabled: "Off"
-    case .minimal: "Minimal"
-    case .low: "Low"
-    case .medium: "Medium"
-    case .high: "High"
-    case .xhigh: "Extra High"
-    }
-  }
-
+extension ReasoningLevel {
   var systemImage: String {
     switch self {
     case .automatic: "brain"
@@ -726,18 +706,7 @@ enum ReasoningLevel: String, Codable, CaseIterable, Identifiable, Sendable {
     case .low: "speedometer"
     case .medium: "circle.lefthalf.filled"
     case .high: "flame"
-    case .xhigh: "flame.fill"
-    }
-  }
-
-  var reasoningEffortValue: String? {
-    switch self {
-    case .automatic: nil
-    case .disabled: "none"
-    case .minimal: "minimal"
-    case .low: "low"
-    case .medium: "medium"
-    case .high, .xhigh: "high"
+    case .xhigh, .max: "flame.fill"
     }
   }
 }

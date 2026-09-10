@@ -430,8 +430,7 @@ private struct PocketMaiConversation: Decodable {
   private var reasoningEffort: String? {
     switch reasoningLevel {
     case "disabled": "none"
-    case "minimal", "low", "medium", "high": reasoningLevel
-    case "xhigh": "high"
+    case "minimal", "low", "medium", "high", "xhigh", "max": reasoningLevel
     default: nil
     }
   }

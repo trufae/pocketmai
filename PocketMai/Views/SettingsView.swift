@@ -326,6 +326,7 @@ private struct SettingsLazyDisclosureGroup<Label: View, Content: View>: View {
 
 struct SettingsView: View {
   let store: AppStore
+  @AppStorage("thinkingDisplay") private var thinkingDisplay: ThinkingDisplay = .full
   @ObservedObject var storeObservation: AppStoreViewObservation
   @Environment(\.dismiss) private var dismiss
   @State private var showingToolFileImporter = false
@@ -521,6 +522,11 @@ struct SettingsView: View {
   @ViewBuilder
   private var advancedOptionsContent: some View {
     Toggle("Show thinking", isOn: settingsBinding(\.showThinkingByDefault))
+    Picker("Thinking display", selection: $thinkingDisplay) {
+      ForEach(ThinkingDisplay.allCases) { mode in
+        Text(mode.displayName).tag(mode)
+      }
+    }
     Toggle("Stream responses", isOn: settingsBinding(\.streamByDefault))
     Picker("LLM Timeout", selection: llmRequestTimeoutBinding) {
       ForEach(AppSettings.llmRequestTimeoutChoices, id: \.self) { seconds in
@@ -3644,7 +3650,9 @@ private struct EndpointDetailView: View {
   }
 
   private var reasoningLevelField: some View {
-    ReasoningLevelControl(level: $endpoint.defaultReasoningLevel)
+    ReasoningLevelControl(
+      level: $endpoint.defaultReasoningLevel,
+      model: endpoint.defaultModel, endpointName: endpoint.name, baseURL: endpoint.baseURL)
   }
 
   @ViewBuilder

@@ -2316,6 +2316,9 @@ extension ChatView: Equatable {
 
 struct ReasoningLevelControl: View {
   @Binding var level: ReasoningLevel
+  var model: String = ""
+  var endpointName: String = ""
+  var baseURL: String = ""
   @State private var dragValue: Double?
 
   private static let thumbSize: CGFloat = 26
@@ -2347,6 +2350,10 @@ struct ReasoningLevelControl: View {
       }
       sliderTrack
         .accessibilityValue(displayLevel.displayName)
+      if let note = displayLevel.limitation(model: model, provider: endpointName, baseURL: baseURL)
+      {
+        Text(note).font(.caption).foregroundStyle(.secondary)
+      }
     }
   }
 
@@ -5636,7 +5643,10 @@ private struct ConversationModelSettingsView: View {
           }
 
           Section {
-            ReasoningLevelControl(level: reasoningBinding)
+            ReasoningLevelControl(
+              level: reasoningBinding,
+              model: store.currentConversation?.modelID ?? "",
+              endpointName: selectedEndpoint?.name ?? "", baseURL: selectedEndpoint?.baseURL ?? "")
           }
 
           Section("System Prompt") {

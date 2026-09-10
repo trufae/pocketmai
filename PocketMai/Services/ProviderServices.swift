@@ -457,6 +457,11 @@ enum PromptComposer {
     }()
 
     var parts = [base]
+    if let effort = ReasoningEffort.promptSection(
+      effort: conversation.reasoningLevel, guidance: nil)
+    {
+      parts.append(effort)
+    }
     if conversation.toolsEnabled, conversation.enabledTools.contains(.memory),
       let section = AgentMemory(text: memory).promptSection
     {
@@ -561,7 +566,7 @@ enum PromptComposer {
           echoReasoningContent: echoReasoningContent,
           includeImageAttachments: includeImageAttachments
             && message.id == latestUserMessageID,
-          includeReasoning: settings.includeReasoningContentInContext)
+          includeReasoning: settings.includeReasoningContentInContext || echoReasoningContent)
       }
     )
     messages.append(contentsOf: nativeContinuationMessages)
@@ -570,12 +575,6 @@ enum PromptComposer {
       includeToolPrompt: !toolPromptInContext)
     {
       messages.append(AgentMessage(role: .user, content: reminder))
-    }
-    if let directive = ReasoningCompatibility.promptDirective(
-      level: conversation.reasoningLevel, model: model, endpoint: endpoint),
-      let lastUserIndex = messages.lastIndex(where: { $0.role == .user })
-    {
-      messages[lastUserIndex].appendText(directive)
     }
     return messages
   }
@@ -740,18 +739,19 @@ enum PromptComposer {
     let visible = rendered.visibleText.trimmingCharacters(in: .whitespacesAndNewlines)
     let reasoning = includeReasoning && !echoReasoningContent ? reasoningText(in: rendered) : ""
     let content = assistantContextContent(visible: visible, reasoning: reasoning)
-    if !content.isEmpty {
-      var parts: [ContentPart] = [.text(content)]
-      if let reasoning = reasoningContent(
-        from: rawText,
-        echoReasoningContent: echoReasoningContent)
-      {
-        parts.append(.reasoning(reasoning))
-      }
+    let orderedParts: [ContentPart] = echoReasoningContent
+      ? MessageContentFilter.render(rawText).parts.compactMap { part in
+        switch part.kind {
+        case .visible(let text): return .text(text)
+        case .hidden(let section):
+          return section.tag == "think" ? .reasoning(section.content) : nil
+        }
+      } : [.text(content)]
+    if !content.isEmpty || !orderedParts.isEmpty && echoReasoningContent {
       messages.append(
         AgentMessage(
           role: .assistant,
-          content: parts))
+          content: orderedParts))
     }
     return messages
   }
@@ -1207,227 +1207,6 @@ enum AppleFoundationProvider {
   }
 }
 
-private struct OpenAIReasoningConfig: Encodable {
-  var effort: String?
-  var enabled: Bool?
-  var exclude: Bool?
-}
-
-private struct OpenAIThinkingConfig: Encodable {
-  var type: String
-}
-
-private struct OpenAIChatTemplateKwargs: Encodable {
-  var enableThinking: Bool
-
-  enum CodingKeys: String, CodingKey {
-    case enableThinking = "enable_thinking"
-  }
-}
-
-private enum OpenAIThinkValue: Encodable {
-  case bool(Bool)
-  case string(String)
-
-  func encode(to encoder: Encoder) throws {
-    var container = encoder.singleValueContainer()
-    switch self {
-    case .bool(let value):
-      try container.encode(value)
-    case .string(let value):
-      try container.encode(value)
-    }
-  }
-}
-
-private struct ReasoningRequestPayload: Encodable {
-  var reasoningEffort: String? = nil
-  var reasoning: OpenAIReasoningConfig? = nil
-  var thinking: OpenAIThinkingConfig? = nil
-  var enableThinking: Bool? = nil
-  var thinkingBudget: Int? = nil
-  var chatTemplateKwargs: OpenAIChatTemplateKwargs? = nil
-  var think: OpenAIThinkValue? = nil
-
-  enum CodingKeys: String, CodingKey {
-    case reasoningEffort = "reasoning_effort"
-    case reasoning
-    case thinking
-    case enableThinking = "enable_thinking"
-    case thinkingBudget = "thinking_budget"
-    case chatTemplateKwargs = "chat_template_kwargs"
-    case think
-  }
-}
-
-private enum ReasoningCompatibility {
-  static func payload(
-    level: ReasoningLevel, model: String, endpoint: OpenAIEndpoint
-  ) -> ReasoningRequestPayload {
-    guard level != .automatic else { return ReasoningRequestPayload() }
-
-    switch profile(model: model, endpoint: endpoint) {
-    case .openRouter:
-      return openRouterPayload(level)
-    case .deepSeek:
-      return deepSeekPayload(level)
-    case .qwen:
-      return qwenPayload(level)
-    case .ollama:
-      return ollamaPayload(level, model: model)
-    case .openAI:
-      return openAIPayload(level, model: model)
-    case .generic:
-      return genericPayload(level)
-    }
-  }
-
-  static func promptDirective(
-    level: ReasoningLevel, model: String, endpoint: OpenAIEndpoint
-  ) -> String? {
-    guard level == .disabled else { return nil }
-    let normalized = normalizedText(model, endpoint)
-    guard normalized.contains("qwen") else { return nil }
-    return "/no_think"
-  }
-
-  private enum Profile {
-    case openAI
-    case openRouter
-    case deepSeek
-    case qwen
-    case ollama
-    case generic
-  }
-
-  private static func profile(model: String, endpoint: OpenAIEndpoint) -> Profile {
-    let text = normalizedText(model, endpoint)
-    if text.contains("openrouter.ai") { return .openRouter }
-    if text.contains("ollama") || text.contains(":11434") { return .ollama }
-    if text.contains("dashscope") || text.contains("aliyuncs") || text.contains("qwen") {
-      return .qwen
-    }
-    if text.contains("deepseek") { return .deepSeek }
-    if text.contains("api.openai.com") || text.contains("openai.azure.com") {
-      return .openAI
-    }
-    return .generic
-  }
-
-  private static func normalizedText(_ model: String, _ endpoint: OpenAIEndpoint) -> String {
-    "\(model) \(endpoint.name) \(endpoint.baseURL)".lowercased()
-  }
-
-  private static func openAIPayload(
-    _ level: ReasoningLevel, model: String
-  ) -> ReasoningRequestPayload {
-    guard isKnownOpenAIReasoningModel(model) else { return ReasoningRequestPayload() }
-    if level == .disabled && !supportsOpenAINone(model) {
-      return ReasoningRequestPayload(reasoningEffort: "minimal")
-    }
-    return ReasoningRequestPayload(reasoningEffort: openAIEffort(for: level))
-  }
-
-  private static func genericPayload(_ level: ReasoningLevel) -> ReasoningRequestPayload {
-    ReasoningRequestPayload(reasoningEffort: openAIEffort(for: level))
-  }
-
-  private static func openRouterPayload(_ level: ReasoningLevel) -> ReasoningRequestPayload {
-    let disabled = level == .disabled
-    return ReasoningRequestPayload(
-      reasoning: OpenAIReasoningConfig(
-        effort: disabled ? "none" : openAIEffort(for: level),
-        enabled: disabled ? false : true,
-        exclude: disabled ? true : false
-      ))
-  }
-
-  private static func deepSeekPayload(_ level: ReasoningLevel) -> ReasoningRequestPayload {
-    let disabled = level == .disabled
-    return ReasoningRequestPayload(
-      reasoningEffort: disabled ? nil : "high",
-      thinking: OpenAIThinkingConfig(type: disabled ? "disabled" : "enabled")
-    )
-  }
-
-  private static func qwenPayload(_ level: ReasoningLevel) -> ReasoningRequestPayload {
-    let enabled = level != .disabled
-    return ReasoningRequestPayload(
-      enableThinking: enabled,
-      thinkingBudget: enabled ? thinkingBudget(for: level) : nil,
-      chatTemplateKwargs: OpenAIChatTemplateKwargs(enableThinking: enabled)
-    )
-  }
-
-  private static func ollamaPayload(
-    _ level: ReasoningLevel, model: String
-  ) -> ReasoningRequestPayload {
-    let text = model.lowercased()
-    if text.contains("gpt-oss") {
-      let effort = level == .disabled ? "low" : ollamaEffort(for: level)
-      return ReasoningRequestPayload(
-        reasoningEffort: effort,
-        think: .string(effort)
-      )
-    }
-    if level == .disabled {
-      return ReasoningRequestPayload(
-        reasoningEffort: "none",
-        chatTemplateKwargs: OpenAIChatTemplateKwargs(enableThinking: false),
-        think: .bool(false)
-      )
-    }
-    return ReasoningRequestPayload(
-      reasoningEffort: ollamaEffort(for: level),
-      chatTemplateKwargs: OpenAIChatTemplateKwargs(enableThinking: true),
-      think: .bool(true)
-    )
-  }
-
-  private static func openAIEffort(for level: ReasoningLevel) -> String? {
-    switch level {
-    case .automatic: nil
-    case .disabled: "none"
-    case .minimal: "minimal"
-    case .low: "low"
-    case .medium: "medium"
-    case .high, .xhigh: "high"
-    }
-  }
-
-  private static func isKnownOpenAIReasoningModel(_ model: String) -> Bool {
-    let text = model.lowercased()
-    if text.hasPrefix("gpt-5") { return true }
-    if text.count >= 2, text.first == "o", text.dropFirst().first?.isNumber == true {
-      return true
-    }
-    return false
-  }
-
-  private static func supportsOpenAINone(_ model: String) -> Bool {
-    model.lowercased().hasPrefix("gpt-5.1")
-  }
-
-  private static func ollamaEffort(for level: ReasoningLevel) -> String {
-    switch level {
-    case .automatic, .medium: "medium"
-    case .disabled, .minimal, .low: "low"
-    case .high, .xhigh: "high"
-    }
-  }
-
-  private static func thinkingBudget(for level: ReasoningLevel) -> Int? {
-    switch level {
-    case .automatic, .disabled: nil
-    case .minimal: 256
-    case .low: 1024
-    case .medium: 4096
-    case .high: 8192
-    case .xhigh: 32768
-    }
-  }
-}
-
 enum OpenAICompatibleProvider {
   static func fetchModels(endpoint: OpenAIEndpoint) async throws -> [String] {
     let provider = try await coreProvider(endpoint: endpoint)
@@ -1512,10 +1291,8 @@ enum OpenAICompatibleProvider {
       )
       let coreMessages = messages
       let coreTools = request.nativeTools ?? []
-      let coreOptions = try coreGenerationOptions(
-        level: request.conversation.reasoningLevel,
-        model: model,
-        endpoint: endpoint,
+      let coreOptions = MaiCore.GenerationOptions(
+        reasoningEffort: request.conversation.reasoningLevel.optionValue,
         includeStreamUsage: includeStreamUsage)
       let provider = try await coreProvider(
         endpoint: endpoint,
@@ -1558,15 +1335,8 @@ enum OpenAICompatibleProvider {
           rawArguments: call.arguments.compactJSONString
         ).textBlock
       }.filter { !$0.isEmpty }.joined(separator: "\n")
-      let visibleText: String
-      if toolCallText.isEmpty {
-        visibleText = response.message.text
-      } else if response.message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        visibleText = toolCallText
-      } else {
-        visibleText = "\(response.message.text)\n\n\(toolCallText)"
-      }
-      let content = responseText(content: visibleText, reasoning: response.reasoning)
+      let body = ReasoningText.render(response.message.content)
+      let content = toolCallText.isEmpty ? body : "\(body)\n\n\(toolCallText)"
       guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
         throw ChatProviderError.emptyResponse
       }
@@ -1604,21 +1374,6 @@ enum OpenAICompatibleProvider {
     try await PocketMaiPluginHost.shared.makeOpenAIProvider(
       endpoint: endpoint,
       requestTimeout: requestTimeout)
-  }
-
-  private static func coreGenerationOptions(
-    level: ReasoningLevel,
-    model: String,
-    endpoint: OpenAIEndpoint,
-    includeStreamUsage: Bool
-  ) throws -> MaiCore.GenerationOptions {
-    let encoded = try JSONEncoder().encode(
-      ReasoningCompatibility.payload(level: level, model: model, endpoint: endpoint))
-    let additional =
-      try JSONDecoder().decode(MaiCore.JSONValue.self, from: encoded).objectValue ?? [:]
-    return MaiCore.GenerationOptions(
-      includeStreamUsage: includeStreamUsage,
-      additional: additional)
   }
 
   private static func mapCoreError(_ error: Error) -> ChatProviderError {
@@ -1667,10 +1422,7 @@ enum OpenAICompatibleProvider {
     endpoint: OpenAIEndpoint,
     settings: AppSettings
   ) -> Bool {
-    guard settings.includeReasoningContentInContext else { return false }
-    let text = "\(model) \(endpoint.name) \(endpoint.baseURL)".lowercased()
-    guard text.contains("deepseek") else { return false }
-    return !text.contains("deepseek-reasoner")
+    ReasoningEffort.requiresReasoningHistory(model: model, provider: endpoint.name, baseURL: endpoint.baseURL)
   }
 
   private static func selectedEndpoint(for request: ChatCompletionRequest) -> OpenAIEndpoint? {
@@ -1689,8 +1441,7 @@ enum OpenAICompatibleProvider {
   @MainActor
   private final class CoreProviderEventAccumulator {
     private let onUpdate: @MainActor (String) -> Void
-    private var content = ""
-    private var reasoning = ""
+    private var output = ReasoningText()
     private var timing = StreamTimingObservation(requestStart: Date())
     private var lastEmit = Date(timeIntervalSince1970: 0)
     private var dirty = false
@@ -1702,11 +1453,11 @@ enum OpenAICompatibleProvider {
     func consume(_ event: MaiCore.ProviderEvent) {
       switch event {
       case .textDelta(let delta):
-        content += delta
+        output.append(.text(delta))
         dirty = true
         timing.noteTokenChunk()
       case .reasoningDelta(let delta):
-        reasoning += delta
+        output.append(.reasoning(delta))
         dirty = true
         timing.noteTokenChunk()
       case .toolCallDelta:
@@ -1718,13 +1469,13 @@ enum OpenAICompatibleProvider {
       if dirty, now.timeIntervalSince(lastEmit) >= 0.04 {
         dirty = false
         lastEmit = now
-        onUpdate(OpenAICompatibleProvider.responseText(content: content, reasoning: reasoning))
+        onUpdate(output.rendered)
       }
     }
 
     func finish(with finalContent: String) -> StreamTimingObservation {
       if dirty
-        || OpenAICompatibleProvider.responseText(content: content, reasoning: reasoning)
+        || output.rendered
           != finalContent
       {
         onUpdate(finalContent)
@@ -1754,18 +1505,6 @@ enum OpenAICompatibleProvider {
       userInputTokens: context.userInputTokens,
       imageInputs: context.imageInputCount)
     await UsageStatsStore.record(stats, assistantMessageID: context.assistantMessageID)
-  }
-
-  private static func responseText(content: String, reasoning: String) -> String {
-    let visible = content.trimmingCharacters(in: .whitespacesAndNewlines)
-    let hidden = reasoning.trimmingCharacters(in: .whitespacesAndNewlines)
-    if hidden.isEmpty {
-      return visible
-    }
-    if visible.isEmpty {
-      return "<think>\n\(hidden)\n</think>"
-    }
-    return "<think>\n\(hidden)\n</think>\n\n\(visible)"
   }
 
 }

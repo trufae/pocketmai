@@ -2825,3 +2825,60 @@ private actor ChildLogProvider: ChatProvider {
       stopReason: .toolCall)
   }
 }
+
+@Test(
+  "Provider keeps native and inline reasoning in response order for streaming and buffered replies")
+func openAIOrderedReasoning() async throws {
+  StubURLProtocol.install(forHost: "ordered-reasoning.example.test") { request in
+    let body = try JSONDecoder().decode(JSONValue.self, from: requestBodyData(request))
+    if body.objectValue?["stream"] == .bool(true) {
+      return try httpResponse(
+        request, contentType: "text/event-stream",
+        body: """
+          data: {"choices":[{"delta":{"reasoning_content":"first"}}]}
+
+          data: {"choices":[{"delta":{"content":"answer<thi"}}]}
+
+          data: {"choices":[{"delta":{"content":"nk>second</think>done"}}]}
+
+          data: [DONE]
+
+          """)
+    }
+    return try httpResponse(
+      request, contentType: "application/json",
+      body: """
+        {"choices":[{"message":{"role":"assistant","reasoning_content":"first","content":"answer<think>second</think>done"},"finish_reason":"stop"}]}
+        """)
+  }
+  defer { StubURLProtocol.reset(host: "ordered-reasoning.example.test") }
+  let provider = OpenAICompatibleProvider(
+    configuration: .init(
+      baseURL: try #require(URL(string: "https://ordered-reasoning.example.test/v1"))),
+    session: stubSession())
+  let expected: [ContentPart] = [
+    .reasoning("first"), .text("answer"), .reasoning("second"), .text("done"),
+  ]
+  for stream in [false, true] {
+    let events = OrderedReasoningEvents()
+    let response = try await provider.complete(
+      ProviderRequest(model: "test", messages: [.user("hi")], stream: stream)
+    ) {
+      await events.append($0)
+    }
+    #expect(response.message.content == expected)
+    #expect(await events.text == ReasoningText.render(expected))
+  }
+}
+
+private actor OrderedReasoningEvents {
+  var output = ReasoningText()
+  var text: String { output.rendered }
+  func append(_ event: ProviderEvent) {
+    switch event {
+    case .textDelta(let text): output.append(.text(text))
+    case .reasoningDelta(let text): output.append(.reasoning(text))
+    default: break
+    }
+  }
+}

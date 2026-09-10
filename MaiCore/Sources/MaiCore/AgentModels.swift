@@ -650,7 +650,7 @@ public enum ResponseFormat: Codable, Equatable, Sendable {
 public struct GenerationOptions: Codable, Equatable, Sendable {
   public var temperature: Double?
   public var maxOutputTokens: Int?
-  /// A `ReasoningEffort` name (`low` … `max`), which the runtime turns into a
+  /// A `ReasoningEffort` name (`automatic`, `disabled`, `minimal` … `max`), which the runtime turns into a
   /// system prompt section and a provider into the fields its API family
   /// understands; or a provider's own value, sent as `reasoning_effort` as it
   /// is.

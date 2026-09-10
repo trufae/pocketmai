@@ -1062,6 +1062,7 @@ struct MaiCLI {
           enabled: options.markdown ?? configuration?.ui.markdown ?? true,
           forced: options.markdown == true,
           environment: environment))
+      await terminal.configureThinking(configuration?.ui.thinking ?? .status)
       await terminal.configureToolResultLines(
         configuration?.ui.toolResultLines ?? ConfiguredTerminalUI().toolResultLines)
       await terminal.configureToolResultColor(
@@ -1659,6 +1660,7 @@ struct MaiCLI {
       let ui = tintedUI(configuration?.ui ?? .init(), project: project)
       editor.configure(ui: ui)
       screen?.configure(ui: ui)
+      await terminal.configureThinking(ui.thinking)
       await terminal.configureToolResultLines(ui.toolResultLines)
       await terminal.configureToolResultColor(ui.toolResultForeground)
       await terminal.configureSubagentOutput(ui.subagentOutput)
@@ -2932,6 +2934,10 @@ struct MaiCLI {
       await terminal.line(FileManager.default.currentDirectoryPath)
     case "/cd":
       await changeWorkingDirectory(argument, terminal: terminal)
+    case "/nothink":
+      await handleEffortCommand(
+        "off", session: &session, runtime: runtime, configuration: &configuration,
+        configurationPath: visual.configurationPath, terminal: terminal)
     case "/set":
       await handleSetCommand(
         argument,
@@ -6203,7 +6209,7 @@ struct MaiCLI {
   // MARK: Effort
 
   /// `/set effort` shows the reasoning level and guidance of the current
-  /// agent; `/set effort LEVEL [TEXT]` sets them and `/set effort off` clears
+  /// agent; `/set effort LEVEL [TEXT]` sets them and `/set effort auto` clears
   /// them. The level
   /// reaches the provider as the field its API family takes and, with the
   /// guidance, the system prompt; both persist on the agent like /set does.
@@ -6222,7 +6228,7 @@ struct MaiCLI {
       return
     }
     let guidance = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-    if ["off", "none", "auto", "default", "clear"].contains(first) {
+    if ["auto", "automatic", "default", "clear"].contains(first) {
       session.profile.options.reasoningEffort = nil
       session.profile.options.reasoningGuidance = nil
     } else if let effort = ReasoningEffort(name: first) {
@@ -6234,6 +6240,15 @@ struct MaiCLI {
     }
     session.touch()
     let summary = effortDescription(session.profile.options)
+    let endpoint = configuration?.providers.first { $0.id == session.profile.provider.rawValue }
+    if let effort = session.profile.options.reasoningEffort.flatMap(ReasoningEffort.init(name:)),
+      let note = effort.limitation(
+        model: session.profile.model,
+        provider: session.profile.provider.rawValue,
+        baseURL: endpoint?.baseURL?.absoluteString ?? "")
+    {
+      await terminal.line(note)
+    }
     guard configuration != nil, configurationPath != nil else {
       await terminal.line("Set \(summary) for this chat.")
       return
@@ -6253,7 +6268,7 @@ struct MaiCLI {
   private static func effortDescription(_ options: GenerationOptions) -> String {
     let level = options.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     let guidance = options.reasoningGuidance?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    var text = "effort = \(level.isEmpty ? "off" : level)"
+    var text = "effort = \(level.isEmpty ? "auto" : level)"
     if !guidance.isEmpty { text += " — \(guidance)" }
     return text
   }
@@ -6753,7 +6768,7 @@ struct MaiCLI {
     ]
     let booleanKeys = ["ui.bold", "ui.markdown"]
     let countKeys = ["ui.toolresultlines"]
-    let levelKeys = ["ui.subagents"]
+    let levelKeys = ["ui.subagents", "ui.thinking"]
     let textKeys = ["ui.title", "ui.editor"]
     guard
       colorKeys.contains(key) || booleanKeys.contains(key) || countKeys.contains(key)
@@ -6795,6 +6810,13 @@ struct MaiCLI {
       }
       ui.toolResultLines = value
       await terminal.configureToolResultLines(value)
+    } else if key == "ui.thinking" {
+      guard let mode = ThinkingDisplay(rawValue: parts[1].lowercased()) else {
+        await terminal.line("Usage: /set ui.thinking <status|line|three|full>")
+        return
+      }
+      ui.thinking = mode
+      await terminal.configureThinking(mode)
     } else if levelKeys.contains(key) {
       guard let level = SubagentOutputLevel(rawValue: parts[1].lowercased()) else {
         await terminal.line(
@@ -7480,7 +7502,7 @@ struct MaiCLI {
     for key in [
       "ui.title", "ui.editor", "ui.bgline", "ui.fgcolor", "ui.bgcolor", "ui.fgprompt",
       "ui.bgprompt", "ui.bold",
-      "ui.fgtoolresult", "ui.markdown", "ui.toolResultLines", "ui.subagents",
+      "ui.fgtoolresult", "ui.markdown", "ui.toolResultLines", "ui.subagents", "ui.thinking",
     ] {
       await terminal.line("\(key) = \(uiSetting(key, in: ui))")
     }
@@ -7503,6 +7525,7 @@ struct MaiCLI {
     case "ui.bold": return ui.bold ? "on" : "off"
     case "ui.markdown": return ui.markdown ? "on" : "off"
     case "ui.toolresultlines": return ui.toolResultLines < 0 ? "all" : String(ui.toolResultLines)
+    case "ui.thinking": return ui.thinking.rawValue
     case "ui.subagents": return ui.subagentOutput.rawValue
     default: return "-"
     }
@@ -9380,7 +9403,9 @@ struct MaiCLI {
   ) -> [String] {
     var values = [
       "/help", "/help set", "/exit", "/quit", "/set yolo on", "/set yolo off",
-      "/set ui.", "/set effort", "/set effort off",
+      "/set ui.", "/set effort", "/set effort off", "/set effort auto", "/nothink",
+      "/set ui.thinking status", "/set ui.thinking line", "/set ui.thinking three",
+      "/set ui.thinking full",
       "/btw ",
       "/help memory", "/help agents", "/help chat", "/help edit", "/help tools",
       "/agent acp list", "/agent acp add ", "/agents acp list",
@@ -9765,11 +9790,12 @@ struct MaiCLI {
   private static let effortHelp = """
     Reasoning effort:
       /set effort                Show the current agent's reasoning effort and guidance
-      /set effort LEVEL          Set it: low, medium, high, xhigh, or max. The provider gets the
+      /set effort LEVEL          Set it: off, minimal, low, medium, high, xhigh, or max. The provider gets the
                                  field its API takes (reasoning_effort, think, enable_thinking,
                                  thinking…) and the system prompt says how much care to take
       /set effort LEVEL TEXT     The level plus TEXT, added to the system prompt as guidance
-      /set effort off            Back to the provider's default, with no guidance
+      /set effort auto           Back to the provider's default, with no guidance
+      /set effort off            Disable thinking where supported (also /nothink)
 
     Examples:
       /set effort high
@@ -9809,6 +9835,7 @@ struct MaiCLI {
       /set ui.bold BOOL            Render input in bold (on/off)
       /set ui.markdown BOOL        Render replies as styled markdown (on/off)
       /set ui.toolResultLines <all|N>  Show all or the first N result lines (0 hides them)
+      /set ui.thinking MODE        Thinking display: status, line, three, or full
       /set ui.subagents LEVEL      What child agents print: all, tools, stats, or none
       /set use.agentsmd BOOL       Put the working tree's AGENTS.md files — this directory up to
                                    the repository root — into every run's system prompt (on/off)
