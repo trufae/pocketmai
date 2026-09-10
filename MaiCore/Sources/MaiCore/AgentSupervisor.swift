@@ -330,10 +330,13 @@ public actor AgentSupervisor {
   /// Takes everything queued for a process, for the run to append to its
   /// transcript. Hosts that start a turn themselves use this to fold queued
   /// messages into the request.
-  public func drainInbox(_ pid: AgentPID) -> [AgentMessage] {
-    guard let queue = inboxes.removeValue(forKey: pid), !queue.isEmpty else { return [] }
+  public func drainInbox(_ pid: AgentPID, excluding held: Set<UUID> = []) -> [AgentMessage] {
+    // Cancellation can arrive while the caller is waiting to enter this actor.
+    guard !Task.isCancelled, let queue = inboxes[pid], !queue.isEmpty else { return [] }
+    let delivered = queue.filter { !held.contains($0.id) }
+    inboxes[pid] = queue.filter { held.contains($0.id) }
     noteInboxChanged(pid)
-    return queue.map(\.message)
+    return delivered.map(\.message)
   }
 
   // MARK: - Context edits

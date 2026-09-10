@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Exercise queue choices and Ctrl+C in a real REPL PTY against a local provider."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import queue
+import select
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+requests = queue.Queue()
+release = threading.Event()
+
+
+class Provider(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        requests.put(request)
+        texts = [m.get('content') for m in request['messages'] if m['role'] == 'user']
+        if texts == ['slow'] and not release.is_set():
+            release.wait(30)
+        body = json.dumps({'choices': [{'message': {'role': 'assistant', 'content': 'answer'},
+                                       'finish_reason': 'stop'}]}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+def main():
+    binary = str(Path(sys.argv[1]).resolve())
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        for choice in ('continue', 'submit', 'ignore', 'clear'):
+            release.clear()
+            with tempfile.TemporaryDirectory(prefix='pmai-queue-') as directory:
+                root = Path(directory)
+                config = root / 'config.json'
+                config.write_text(json.dumps({
+                    'version': 1, 'defaultAgent': 'smoke',
+                    'providers': [{'id': 'smoke', 'kind': 'openAICompatible',
+                                   'baseURL': f'http://127.0.0.1:{server.server_port}/v1',
+                                   'apiKey': 'smoke', 'timeout': 60}],
+                    'agents': [{'id': 'smoke', 'provider': 'smoke', 'model': 'smoke',
+                                'toolGroupNames': [], 'enabled': True,
+                                'retry': {'attempts': 0}}],
+                    'memory': {'enabled': False, 'scope': 'project'}, 'use': {'plan': False},
+                }))
+                master, slave = pty.openpty()
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 200, 0, 0))
+                env = {k: v for k, v in os.environ.items()
+                       if not k.startswith(('PMAI_', 'MAI_', 'OPENAI_'))
+                       and k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
+                env.update(TERM='xterm-256color', NO_PROXY='127.0.0.1,localhost')
+                process = subprocess.Popen(
+                    [binary, '--config', str(config), '--home', str(root / 'home'),
+                     '--no-stream', '--no-markdown'], cwd=root, env=env,
+                    stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+                os.close(slave)
+                output = bytearray()
+
+                def send(text):
+                    os.write(master, text.encode())
+
+                def wait_for(text):
+                    deadline = time.monotonic() + 20
+                    needle = text.encode()
+                    while needle not in output:
+                        assert time.monotonic() < deadline, (choice, text, output.decode(errors='replace'))
+                        assert process.poll() is None, (process.returncode, output)
+                        if select.select([master], [], [], .1)[0]:
+                            output.extend(os.read(master, 65536))
+                    output.clear()
+
+                def user_texts():
+                    request = requests.get(timeout=20)
+                    return [m['content'] for m in request['messages'] if m['role'] == 'user']
+
+                try:
+                    wait_for('pmai>')
+                    send('slow\n')
+                    assert user_texts() == ['slow']
+                    send('queued note\n')
+                    wait_for('queued (1 waiting)')
+                    send('\x03')
+                    wait_for('still waiting:')
+                    release.set()
+                    if choice == 'continue':
+                        send('/continue\n')
+                        assert user_texts() == ['slow', 'queued note']
+                    else:
+                        send('new message\n')
+                        wait_for('Submit them before this message')
+                        assert requests.empty(), 'New message sent before queue decision'
+                        send(choice + '\n')
+                        expected = ['slow', 'queued note', 'new message'] if choice == 'submit' else ['slow', 'new message']
+                        assert user_texts() == expected
+                    wait_for('took ')
+                    send('/queue\n')
+                    if choice == 'ignore':
+                        wait_for('Queued messages (1)')
+                        assert requests.empty(), 'Ignored queue was automatically submitted'
+                        send('/continue\n')
+                        assert user_texts() == ['slow', 'new message', 'queued note']
+                        wait_for('took ')
+                    else:
+                        wait_for('Nothing is queued')
+                    send('/exit\n')
+                    process.wait(timeout=10)
+                    assert process.returncode == 0
+                    print(f'PASS Ctrl+C, queue {choice}')
+                finally:
+                    release.set()
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    os.close(master)
+    finally:
+        release.set()
+        server.shutdown()
+
+
+if __name__ == '__main__':
+    main()

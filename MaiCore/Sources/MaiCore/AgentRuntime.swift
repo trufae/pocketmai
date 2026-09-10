@@ -469,7 +469,7 @@ public actor AgentRuntime {
       // Anything a person queued for this process since the last turn joins
       // the conversation here, after the tool results the model is about to
       // read, so a running agent can be steered without stopping it.
-      let injected = await supervisor.drainInbox(pid)
+      let injected = await supervisor.drainInbox(pid, excluding: request.ignoredQueuedMessageIDs)
       if !injected.isEmpty {
         for message in injected {
           transcript.append(message)
@@ -693,7 +693,8 @@ public actor AgentRuntime {
         // messages queued for its host.
         if localModelTurns < request.limits.maxModelTurns,
           await budget.canClaimModelTurn(),
-          try await AgentProcessTools.awaitChildren(of: pid, supervisor: supervisor)
+          try await AgentProcessTools.awaitChildren(
+            of: pid, supervisor: supervisor, excluding: request.ignoredQueuedMessageIDs)
         {
           continue
         }
@@ -1099,6 +1100,17 @@ public actor AgentRuntime {
       ?? AgentToolNameResolver(tools: definitions).canonicalName(for: definitionName)
       .flatMap { canonical in definitions.first(where: { $0.name == canonical }) }
     guard let definition else {
+      if definitionName == Self.agentStartToolName,
+        definitions.contains(where: { $0.name == Self.agentStatusToolName })
+      {
+        await emit(.toolStarted(context, resolvedCall))
+        return await fail(
+          resolvedCall,
+          request.limits.maxSubagents == 0
+            ? "this agent may not start children (limits.maxSubagents is 0)."
+            : "the subagent depth limit for this run is reached.",
+          parent: context, emit: emit)
+      }
       // A call that never runs is still shown, so the person sees what the
       // model tried rather than an error out of nowhere.
       await emit(.toolStarted(context, resolvedCall))
@@ -1254,7 +1266,7 @@ public actor AgentRuntime {
       }
       named.toolNames = start.narrowed(named.toolNames)
       definition = named
-    } else if request.toolDelegation.delegatesTools {
+    } else if Self.canDeriveWorker(for: request) {
       // A parent that narrowed the child's tools and left the agent family
       // out said what the child may use: that child is a leaf and pays for
       // no agent schemas. Otherwise the worker is a peer.
@@ -1434,7 +1446,9 @@ public actor AgentRuntime {
       provider: request.provider,
       model: request.model,
       toolNames: delegates ? toolNames.union(Self.agentToolNames) : toolNames,
-      toolGroupNames: request.toolGroupNames ?? [],
+      toolGroupNames: delegates
+        ? (request.toolGroupNames ?? [])
+        : (request.toolGroupNames ?? []).subtracting([Self.agentToolGroup.id]),
       subagentNames: delegates ? request.subagentNames : [],
       stream: request.stream,
       limits: request.limits,
@@ -1459,9 +1473,13 @@ public actor AgentRuntime {
     return result
   }
 
-  /// What the model of a run at `depth` may call. The agent tools are left
-  /// out at the depth limit: a child there could not start anything, so the
-  /// four schemas would be paid on every call for nothing.
+  private static func canDeriveWorker(for request: AgentRequest) -> Bool {
+    request.toolDelegation.delegatesTools
+      || request.toolGroupNames?.contains(agentToolGroup.id) == true
+      || agentToolNames.isSubset(of: request.toolNames)
+  }
+
+  /// Hide start at the depth limit, but keep tools for existing children.
   private func visibleDefinitions(
     for request: AgentRequest,
     depth: Int = 0
@@ -1480,7 +1498,7 @@ public actor AgentRuntime {
     // in the tree. Delegation adds a way to hand work to a child that has the
     // same tools; it never takes the tools away. It only takes effect where
     // children are actually permitted.
-    let delegating = request.toolDelegation.delegatesTools && request.limits.maxSubagents > 0
+    let delegating = Self.canDeriveWorker(for: request)
     var definitions: [ToolDefinition] = []
     for name in concreteNames.sorted() {
       if let tool = tools[name] { definitions.append(tool.definition) }
@@ -1493,12 +1511,13 @@ public actor AgentRuntime {
         $0.contains(Self.agentToolGroup.id)
           || Self.agentToolNames.isSubset(of: request.toolNames)
       } ?? true
-    if agentToolsEnabled, request.limits.maxSubagents > 0,
-      depth < request.limits.maxSubagentDepth,
-      delegating || !offeredAgents.isEmpty
-    {
-      definitions.append(
-        contentsOf: agentToolDefinitions(allowedAgentNames: offeredAgents, delegating: delegating))
+    if agentToolsEnabled, delegating || !offeredAgents.isEmpty {
+      let canStart = request.limits.maxSubagents > 0
+        && depth < request.limits.maxSubagentDepth
+        && (delegating || !offeredAgents.isEmpty)
+      definitions.append(contentsOf:
+        agentToolDefinitions(allowedAgentNames: offeredAgents, delegating: delegating)
+          .filter { canStart || $0.name != Self.agentStartToolName })
     }
     return definitions
   }

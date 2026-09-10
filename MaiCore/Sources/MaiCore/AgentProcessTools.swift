@@ -511,10 +511,12 @@ public enum AgentProcessTools {
   /// means nothing is on its way and the run may end.
   public static func awaitChildren(
     of pid: AgentPID,
-    supervisor: AgentSupervisor
+    supervisor: AgentSupervisor,
+    excluding held: Set<UUID> = []
   ) async throws -> Bool {
     while true {
-      let queued = await supervisor.queuedMessages(for: pid)
+      try Task.checkCancellation()
+      let queued = await supervisor.queuedMessages(for: pid).filter { !held.contains($0.id) }
       if queued.contains(where: { deliveredChildPID(of: $0.message) == nil }) { return true }
       let working = await supervisor.tree().children(of: pid).contains { !$0.state.isTerminal }
       guard working else { return !queued.isEmpty }

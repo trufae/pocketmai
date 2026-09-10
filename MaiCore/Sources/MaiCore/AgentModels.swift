@@ -1034,6 +1034,8 @@ public struct AgentDefinition: Codable, Equatable, Identifiable, Sendable {
 }
 
 public struct AgentRequest: Sendable {
+  /// Inbox entries held for a later run. New messages still steer this run.
+  public var ignoredQueuedMessageIDs: Set<UUID> = []
   public var agentID: String
   public var provider: ProviderID
   public var model: String

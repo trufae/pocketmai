@@ -459,3 +459,83 @@ private func inboxObjectSchema(required: [String]) -> JSONValue {
     "required": .array(required.map(JSONValue.string)),
   ])
 }
+
+@Test("Cancelling a long tool preserves each agent's inbox and continuing consumes only its own")
+func cancelledToolPreservesAgentQueues() async throws {
+  let runtime = AgentRuntime()
+  let supervisor = runtime.supervisor
+  let pid = await runtime.allocateProcess(agentID: "main")
+  let other = await runtime.allocateProcess(agentID: "other")
+  let provider = InboxScriptedProvider(responses: [
+    ProviderResponse(message: AgentMessage(role: .assistant, content: [
+      .toolCall(ToolCall(id: "slow", name: "slow", arguments: .object([:])))
+    ]), stopReason: .toolCall),
+    ProviderResponse(message: .assistant("Continued."), stopReason: .stop),
+  ])
+  try await runtime.register(provider)
+  try await runtime.register(tool: ClosureTool(definition: ToolDefinition(
+    name: "slow", description: "Wait", annotations: ToolAnnotations(approval: .automatic)
+  )) { _, _ in
+    await supervisor.post(.user("keep main"), to: pid)
+    await supervisor.post(.user("keep other"), to: other)
+    try await Task.sleep(for: .seconds(60))
+    return ToolOutput(text: "done")
+  })
+  let run = Task {
+    try await runtime.run(AgentRequest(
+      provider: "inbox-scripted", model: "fixture", messages: [.user("start")],
+      toolNames: ["slow"]), process: pid)
+  }
+  try await inboxWaitUntil { await supervisor.hasQueuedMessages(pid) }
+  run.cancel()
+  await #expect(throws: CancellationError.self) { try await run.value }
+  #expect(await supervisor.queuedMessages(for: pid).map(\.message.text) == ["keep main"])
+  #expect(await supervisor.queuedMessages(for: other).map(\.message.text) == ["keep other"])
+  let partial = AgentTranscriptEditor.answeringUnansweredToolCalls(
+    in: await supervisor.transcript(pid), reason: "Cancelled")
+  let resumed = try await runtime.run(AgentRequest(
+    provider: "inbox-scripted", model: "fixture", messages: partial), process: pid)
+  #expect(resumed.transcript.filter { $0.text == "keep main" }.count == 1)
+  #expect(await supervisor.queuedMessages(for: pid).isEmpty)
+  #expect(await supervisor.queuedMessages(for: other).map(\.message.text) == ["keep other"])
+}
+
+@Test("Ignoring a queue holds only existing entries and does not spend extra model turns")
+func ignoredInboxSurvivesRun() async throws {
+  let runtime = AgentRuntime()
+  let supervisor = runtime.supervisor
+  let pid = await runtime.allocateProcess(agentID: "main")
+  let held = try #require(await supervisor.post(.user("later"), to: pid))
+  let provider = InboxScriptedProvider(responses: [
+    ProviderResponse(message: .assistant("First"), stopReason: .stop),
+    ProviderResponse(message: .assistant("Steered"), stopReason: .stop),
+    ProviderResponse(message: .assistant("Resumed"), stopReason: .stop),
+  ], onRequest: { index in
+    if index == 0 { await supervisor.post(.user("new steering"), to: pid) }
+  })
+  try await runtime.register(provider)
+  var request = AgentRequest(provider: "inbox-scripted", model: "fixture", messages: [.user("now")])
+  request.ignoredQueuedMessageIDs = [held.id]
+  let result = try await runtime.run(request, process: pid)
+  #expect(result.modelTurns == 2)
+  #expect(!result.transcript.contains { $0.text == "later" })
+  #expect(result.transcript.filter { $0.text == "new steering" }.count == 1)
+  #expect(await supervisor.queuedMessages(for: pid).map(\.id) == [held.id])
+  let continued = try await runtime.run(AgentRequest(
+    provider: "inbox-scripted", model: "fixture", messages: result.transcript), process: pid)
+  #expect(continued.transcript.filter { $0.text == "later" }.count == 1)
+  #expect(await supervisor.queuedMessages(for: pid).isEmpty)
+}
+
+@Test("Cancellation while waiting to drain an inbox leaves its entries untouched")
+func cancelledInboxDrainKeepsMessages() async throws {
+  let runtime = AgentRuntime()
+  let pid = await runtime.allocateProcess(agentID: "main")
+  await runtime.supervisor.post(.user("keep"), to: pid)
+  let task = Task {
+    withUnsafeCurrentTask { $0?.cancel() }
+    return await runtime.supervisor.drainInbox(pid)
+  }
+  #expect(await task.value.isEmpty)
+  #expect(await runtime.supervisor.queuedMessages(for: pid).map(\.message.text) == ["keep"])
+}
