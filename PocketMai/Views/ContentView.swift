@@ -90,10 +90,12 @@ struct ContentView: View {
         .environmentObject(store)
     }
     .sheet(item: pendingConversationImportFileBinding) { file in
-      ConversationCollectionImportView(file: file) {
-        store.finishConversationImportFile(id: file.id)
+      NavigationStack {
+        SettingsImportView(initialFile: file) {
+          store.finishConversationImportFile(id: file.id)
+        }
       }
-        .environmentObject(store)
+      .environmentObject(store)
     }
     .onChange(of: showingSettings) { _, isShowing in
       // The chat view keeps rendering behind the sheet; pausing streamed-text

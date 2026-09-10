@@ -321,6 +321,13 @@ without sending, `/queue pop` drops the newest, and `/queue drop` drops all.
 `/export markdown|json|debug|epub|docx [PATH]` saves the chat as a file, with
 the same writers PocketMai uses (`MaiDocuments`): `debug` is the JSON envelope
 plus the tools and settings the chat runs with.
+`/export archive [PATH]` writes a portable `.pocketmai.json` archive containing
+the configured providers, prompts, MCP servers, agents, visible skills, and the
+current chat together with every nested subagent chat and transcript.
+`/import PATH` merges those settings, installs skills, and adds
+chats without overwriting an existing chat. The same archive is understood by
+PocketMai; its existing conversation packs and older pmai JSON chat exports
+also remain importable.
 `@PID TEXT` sends one message to a running child agent, and `/agents focus PID`
 sends everything typed to it until `/agents focus main`. When a tool asks for
 approval the question is printed above the prompt and answered with `y`, `a`,

@@ -1468,6 +1468,10 @@ struct Conversation: Identifiable, Codable, Equatable, Sendable {
   /// when the conversation is created and kept in its file; a child agent's
   /// transient conversation carries its parent's. See `ChatSession`.
   var sessionID: String = ChatSession.newID()
+  /// Durable child-agent process trees, including every child transcript.
+  /// Runtime pids are restored under a fresh conversation process on load;
+  /// `runID` and `parentRunID` preserve identity and nesting across sessions.
+  var subagents: [AgentProcessRecord] = []
 
   var isArchived: Bool {
     get { folderID == ConversationFolder.archivedID }
@@ -1505,6 +1509,7 @@ struct Conversation: Identifiable, Codable, Equatable, Sendable {
     case languageOverrideIdentifier
     case workingFolder
     case sessionID
+    case subagents
   }
 
   init(from decoder: Decoder) throws {
@@ -1550,6 +1555,8 @@ struct Conversation: Identifiable, Codable, Equatable, Sendable {
     languageOverrideIdentifier = Self.normalizedLanguageOverride(decodedLanguageOverride)
     workingFolder =
       (try? container.decodeIfPresent(WorkingFolderReference.self, forKey: .workingFolder)) ?? nil
+    subagents =
+      (try? container.decodeIfPresent([AgentProcessRecord].self, forKey: .subagents)) ?? []
   }
 
   func encode(to encoder: Encoder) throws {
@@ -1583,6 +1590,9 @@ struct Conversation: Identifiable, Codable, Equatable, Sendable {
       forKey: .languageOverrideIdentifier)
     try container.encodeIfPresent(workingFolder, forKey: .workingFolder)
     try container.encode(sessionID, forKey: .sessionID)
+    if !subagents.isEmpty {
+      try container.encode(subagents, forKey: .subagents)
+    }
   }
 
   var displayTitle: String {
@@ -1911,6 +1921,9 @@ struct ConversationExportEnvelope: Codable, Equatable, Sendable {
   /// A packed export. `conversation` remains the first item so older PocketMai
   /// versions can still import a useful, single conversation from this file.
   var conversations: [Conversation]?
+  /// The cross-host representation consumed by MaiCore and pmai. Older
+  /// PocketMai releases ignore this key and keep importing `conversation`.
+  var portable: MaiArchive?
   var toolCallingDebug: ConversationToolCallingDebug?
 
   init(
@@ -1928,6 +1941,7 @@ struct ConversationExportEnvelope: Codable, Equatable, Sendable {
     self.pocketMaiVersion = pocketMaiVersion
     self.conversation = conversation
     self.conversations = nil
+    self.portable = nil
     self.toolCallingDebug = toolCallingDebug
   }
 
@@ -1950,6 +1964,7 @@ struct ConversationExportEnvelope: Codable, Equatable, Sendable {
     self.pocketMaiVersion = pocketMaiVersion
     self.conversation = first
     self.conversations = conversations.count == 1 ? nil : conversations
+    self.portable = nil
     self.toolCallingDebug = nil
   }
 
@@ -2287,6 +2302,10 @@ struct SettingsBackupEnvelope: Codable, Sendable {
   var conversationFolders: [ConversationFolder]?
   var conversationFolderDefaults: [String: ConversationFolderDefaults]?
   var voiceRecordings: [SettingsVoiceRecordingAttachment]?
+  /// Canonical providers, prompts, MCPs, chats and skills for other Mai
+  /// hosts. The legacy fields above remain the source of truth for older iOS
+  /// versions and retain PocketMai-only settings without loss.
+  var portable: MaiArchive?
 
   init(
     providers: SettingsProvidersBackup? = nil,
@@ -2296,6 +2315,7 @@ struct SettingsBackupEnvelope: Codable, Sendable {
     conversationFolders: [ConversationFolder]? = nil,
     conversationFolderDefaults: [String: ConversationFolderDefaults]? = nil,
     voiceRecordings: [SettingsVoiceRecordingAttachment]? = nil,
+    portable: MaiArchive? = nil,
     exportedAt: Date = Date(),
     pocketMaiVersion: String = ConversationExportEnvelope.currentPocketMaiVersion
   ) {
@@ -2310,12 +2330,14 @@ struct SettingsBackupEnvelope: Codable, Sendable {
     self.conversationFolders = conversationFolders
     self.conversationFolderDefaults = conversationFolderDefaults
     self.voiceRecordings = voiceRecordings
+    self.portable = portable
   }
 }
 
 enum SettingsImportFileKind: Sendable {
   case backup(SettingsBackupEnvelope)
   case conversation(ConversationExportEnvelope)
+  case portable(MaiArchive)
 }
 
 struct SettingsImportFilePreview: Identifiable, Sendable {
@@ -2334,6 +2356,12 @@ struct SettingsImportFilePreview: Identifiable, Sendable {
         conversations: envelope.conversations != nil)
     case .conversation:
       SettingsBackupSelection(conversations: true)
+    case .portable(let archive):
+      SettingsBackupSelection(
+        providers: archive.settings?.providers != nil,
+        prompts: archive.settings?.prompts != nil,
+        tools: archive.settings?.mcpServers != nil,
+        conversations: archive.chats != nil)
     }
   }
 
@@ -2343,6 +2371,8 @@ struct SettingsImportFilePreview: Identifiable, Sendable {
       envelope.pocketMaiVersion
     case .conversation(let envelope):
       envelope.pocketMaiVersion
+    case .portable(let archive):
+      archive.generator
     }
   }
 
@@ -2352,6 +2382,8 @@ struct SettingsImportFilePreview: Identifiable, Sendable {
       envelope.exportedAt
     case .conversation(let envelope):
       envelope.exportedAt
+    case .portable(let archive):
+      archive.exportedAt
     }
   }
 }
