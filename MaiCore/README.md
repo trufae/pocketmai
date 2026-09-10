@@ -444,7 +444,7 @@ cache covers every earlier turn and each call pays only for what is new. The
 REPL prints `✂ context: rewrote 1 message (12.3k → 2.1k chars)` when it prunes.
 
 `/set effort LEVEL [TEXT]` sets how hard the model thinks, with one scale for every
-provider: `low`, `medium`, `high`, `xhigh`, or `max` (the REPL completes them).
+provider: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` (the REPL completes them).
 The level is stored as the agent's `options.reasoningEffort` and
 `ReasoningEffort` (in `MaiCore`) turns it into whatever the endpoint's API
 family takes — `reasoning_effort` for OpenAI (only on models that reason, with
@@ -452,11 +452,53 @@ family takes — `reasoning_effort` for OpenAI (only on models that reason, with
 `medium`, `high` on gpt-oss, `true` elsewhere), `enable_thinking` and a
 `thinking_budget` for Qwen, `thinking: enabled` for DeepSeek, and the
 `reasoning` object for OpenRouter; a field set in `options.additional` is never
-overridden, and a value that is not one of the levels (`minimal`, say) is sent
+overridden, and a value that is not one of the levels (`custom`, say) is sent
 as `reasoning_effort` unchanged. The runtime also adds a system prompt section
 that says how much care the task deserves, followed by `TEXT` when given, so a
 model without a reasoning control hears it too. `/set effort` shows the current
-setting, `/set effort off` clears it, and both persist on the agent.
+setting; `/set effort auto` restores provider defaults. `/set effort off` (or
+`/nothink`) explicitly disables thinking where supported; models such as GPT-OSS
+only allow lowering effort. These settings persist on the agent. iOS uses the
+same MaiCore enum and request mapping, including `xhigh` and `max`.
+
+`/set ui.thinking status|line|three|full` controls presentation independently:
+`status` shows “Thinking…”, `line` keeps the newest line, `three` keeps three
+scrolling rows with a grey gradient, and `full` prints all reasoning in grey
+italics. Compact previews occupy transient rows above the REPL prompt and clear
+at text/tool boundaries, cancellation and errors. Pipes and captured output use
+a plain status instead of cursor controls; `full` retains plain reasoning there.
+`NO_COLOR` disables styling. The complete reasoning stays in the transcript in
+every mode. iOS offers the same display modes in Settings, keeps completed
+reasoning in separate disclosure blocks, and preserves their order between
+responses and tool calls.
+
+Provider mapping references: [OpenAI](https://developers.openai.com/api/docs/guides/latest-model),
+[Ollama](https://docs.ollama.com/capabilities/thinking),
+[DeepSeek](https://api-docs.deepseek.com/guides/thinking_mode/),
+[Kimi](https://platform.kimi.ai/docs/api/models-overview),
+[MiniMax](https://platform.minimax.io/docs/api-reference/text-openai-api),
+[Gemma](https://huggingface.co/google/gemma-4-31B-it),
+[Gemini](https://ai.google.dev/gemini-api/docs/openai).
+
+| Backend/model | Shared effort mapping |
+| --- | --- |
+| DeepSeek | `thinking.type` plus `reasoning_effort` low/high/max |
+| Kimi K2.5/K2.6 API | `thinking.type` enabled/disabled |
+| Kimi K2.5/K2.6 local | `chat_template_kwargs.thinking`; MLX template context |
+| Kimi K3 | low/high/max; off requests low |
+| Kimi K2 Thinking/K2.7 | Always thinking; no unsupported toggle sent |
+| MiniMax M2.x | Always thinking; effort is prompt guidance |
+| MiniMax M3 | `thinking.type` adaptive/disabled |
+| Gemma 4 | `chat_template_kwargs.enable_thinking`; MLX template context |
+| Older Gemma | Prompt guidance; no unsupported reasoning parameter |
+| Gemini 2.5/3 OpenAI API | `reasoning_effort`; off is available only on 2.5 non-Pro |
+| Ollama/OpenRouter | The host's API takes precedence over model-specific fields |
+
+MiniMax reasoning is returned in tagged assistant content when continuing tool
+calls. DeepSeek and Kimi retain `reasoning_content` for continuation regardless
+of the display choice. Gemma's `<|channel>thought` / `<channel|>` delimiters are
+normalized alongside `<think>` by the same stream parser. Unknown providers can
+still use explicit `options.additional` fields without frontend changes.
 
 Native tools are presented as plugin-defined capability groups instead of one
 checkbox per provider-visible function. `/tools` lists the groups, `/tools

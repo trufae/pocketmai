@@ -10,11 +10,14 @@ import Testing
 
 @Test("Levels parse from the names people type and map to each API family's fields")
 func effortMapsToProviderFields() {
-  #expect(ReasoningEffort.names == ["low", "medium", "high", "xhigh", "max"])
+  #expect(
+    ReasoningEffort.names == [
+      "automatic", "disabled", "minimal", "low", "medium", "high", "xhigh", "max",
+    ])
   #expect(ReasoningEffort(name: "X-High") == .xhigh)
   #expect(ReasoningEffort(name: "maximum") == .max)
   #expect(ReasoningEffort(name: "h") == .high)
-  #expect(ReasoningEffort(name: "minimal") == nil)
+  #expect(ReasoningEffort(name: "minimal") == .minimal)
 
   let openAI = "https://api.openai.com/v1"
   #expect(
@@ -72,8 +75,8 @@ func effortPromptSection() {
   #expect(ReasoningEffort.promptSection(effort: nil, guidance: " ") == nil)
   #expect(
     ReasoningEffort.promptSection(
-      for: GenerationOptions(reasoningEffort: "minimal", reasoningGuidance: "Be terse."))
-      == "Be terse.")
+      for: GenerationOptions(reasoningEffort: "minimal", reasoningGuidance: "Be terse."))?
+      .hasSuffix("Be terse.") == true)
   #expect(
     ReasoningEffort.promptSection(for: GenerationOptions(reasoningEffort: "low"))?
       .hasPrefix("Reasoning effort: low.") == true)
@@ -108,8 +111,8 @@ func openAIRequestCarriesEffort() throws {
       options: GenerationOptions(reasoningEffort: "minimal"), stream: false),
     model: "gpt-oss:20b")
   let rawBody = try JSONDecoder().decode(JSONValue.self, from: try #require(raw.httpBody))
-  #expect(rawBody.objectValue?["reasoning_effort"] == .string("minimal"))
-  #expect(rawBody.objectValue?["think"] == nil)
+  #expect(rawBody.objectValue?["reasoning_effort"] == .string("low"))
+  #expect(rawBody.objectValue?["think"] == .string("low"))
 }
 
 @Test("A run at an effort level tells the model in the system prompt, after the instructions")
@@ -147,5 +150,157 @@ private actor EffortScriptedProvider: ChatProvider {
   {
     requests.append(request)
     return ProviderResponse(message: .assistant("Hello."), stopReason: .stop)
+  }
+}
+
+@Test("Off is distinct from automatic and uses each provider's supported controls")
+func effortOffAndAuto() throws {
+  for family: ReasoningEffort.APIFamily in [
+    .openAI, .openRouter, .deepSeek, .qwen, .ollama, .generic,
+  ] {
+    #expect(ReasoningEffort.automatic.requestFields(family: family, model: "qwen3").isEmpty)
+  }
+  #expect(ReasoningEffort(name: "off") == .disabled)
+  #expect(
+    ReasoningEffort.disabled.requestFields(family: .qwen, model: "qwen3") == [
+      "enable_thinking": .bool(false),
+      "chat_template_kwargs": .object(["enable_thinking": .bool(false)]),
+    ])
+  #expect(
+    ReasoningEffort.disabled.requestFields(family: .ollama, model: "qwen3")["think"] == .bool(false)
+  )
+  #expect(
+    ReasoningEffort.disabled.requestFields(family: .deepSeek, model: "deepseek-chat") == [
+      "thinking": .object(["type": .string("disabled")])
+    ])
+  #expect(
+    ReasoningEffort.max.requestFields(family: .deepSeek, model: "deepseek-flash")[
+      "reasoning_effort"] == .string("max"))
+  for model in ["gpt-5.1", "gpt-5.2", "gpt-5.4"] {
+    #expect(
+      ReasoningEffort.disabled.requestFields(family: .openAI, model: model)["reasoning_effort"]
+        == .string("none"))
+  }
+  #expect(
+    ReasoningEffort.disabled.requestFields(family: .openAI, model: "o3")["reasoning_effort"]
+      == .string("low"))
+  #expect(
+    ReasoningEffort.disabled.requestFields(family: .openAI, model: "gpt-5")["reasoning_effort"]
+      == .string("minimal"))
+  #expect(
+    ReasoningEffort.disabled.requestFields(family: .ollama, model: "gpt-oss")["think"]
+      == .string("low"))
+  #expect(ReasoningEffort.disabled.limitation(model: "gpt-oss") != nil)
+  #expect(ReasoningEffort.disabled.limitation(model: "qwen3") == nil)
+  let options = GenerationOptions(reasoningEffort: "off")
+  let messages = ReasoningEffort.messages(
+    [.system("Be useful."), .user("Hi")], options: options, model: "qwen3")
+  #expect(messages.last?.text.hasSuffix("/no_think") == true)
+  #expect(messages.first?.text == "Be useful.")
+  let provider = OpenAICompatibleProvider(
+    configuration: .init(
+      id: "local", displayName: "local",
+      baseURL: URL(string: "http://localhost:11434/v1")!))
+  let request = try provider.makeURLRequest(
+    ProviderRequest(
+      model: "qwen3", messages: [.user("Hi")],
+      options: options, stream: false), model: "qwen3")
+  let body = try JSONDecoder().decode(JSONValue.self, from: try #require(request.httpBody))
+  #expect(body.objectValue?["think"] == .bool(false))
+  #expect(
+    body.objectValue?["messages"]?.arrayValue?.last?.objectValue?["content"]?.stringValue?
+      .hasSuffix("/no_think") == true)
+}
+
+@Test("Thinking presentation survives old configurations and leaves generation independent")
+func thinkingConfiguration() throws {
+  let legacy = try JSONDecoder().decode(ConfiguredTerminalUI.self, from: Data("{}".utf8))
+  #expect(legacy.thinking == .status)
+  for mode in ThinkingDisplay.allCases {
+    let ui = ConfiguredTerminalUI(thinking: mode)
+    #expect(
+      try JSONDecoder().decode(ConfiguredTerminalUI.self, from: JSONEncoder().encode(ui)) == ui)
+  }
+  #expect(
+    try JSONDecoder().decode(ReasoningEffort.self, from: Data("\"disabled\"".utf8)) == .disabled)
+}
+
+@Test("Vendor controls distinguish Kimi versions, MiniMax, Gemma and Gemini")
+func effortVendorMatrix() {
+  let off = ReasoningEffort.disabled
+  let high = ReasoningEffort.high
+  #expect(
+    off.requestFields(model: "kimi-k2.5", baseURL: "https://api.moonshot.ai/v1") == [
+      "thinking": .object(["type": .string("disabled")])
+    ])
+  #expect(
+    high.requestFields(model: "kimi-k2.6", baseURL: "https://api.kimi.ai/v1") == [
+      "thinking": .object(["type": .string("enabled")])
+    ])
+  #expect(
+    off.requestFields(model: "moonshotai/Kimi-K2.5", baseURL: "http://localhost:8000/v1") == [
+      "chat_template_kwargs": .object(["thinking": .bool(false)])
+    ])
+  #expect(off.requestFields(family: .kimi, model: "kimi-k2.7-code").isEmpty)
+  #expect(off.requestFields(family: .kimi, model: "kimi-k3")["reasoning_effort"] == .string("low"))
+  #expect(
+    ReasoningEffort.max.requestFields(family: .kimi, model: "kimi-k3")["reasoning_effort"]
+      == .string("max"))
+  #expect(off.requestFields(family: .minimax, model: "MiniMax-M2.5").isEmpty)
+  #expect(
+    off.requestFields(family: .minimax, model: "MiniMax-M3")["thinking"]
+      == .object(["type": .string("disabled")]))
+  #expect(
+    high.requestFields(family: .minimax, model: "MiniMax-M3")["thinking"]
+      == .object(["type": .string("adaptive")]))
+  #expect(off.requestFields(family: .gemma, model: "gemma-3-4b-it").isEmpty)
+  #expect(
+    off.requestFields(family: .gemma, model: "google/gemma-4-31B-it")["chat_template_kwargs"]
+      == .object(["enable_thinking": .bool(false)]))
+  #expect(off.templateContext(model: "gemma-4-31b-it")?["enable_thinking"] as? Bool == false)
+  #expect(off.templateContext(model: "Kimi-K2.5")?["thinking"] as? Bool == false)
+  #expect(
+    off.requestFields(family: .gemini, model: "gemini-2.5-flash")["reasoning_effort"]
+      == .string("none"))
+  #expect(
+    off.requestFields(family: .gemini, model: "gemini-2.5-pro")["reasoning_effort"]
+      == .string("low"))
+  #expect(
+    off.requestFields(family: .gemini, model: "gemini-3-flash")["reasoning_effort"]
+      == .string("low"))
+  for model in ["kimi-k3", "kimi-k2.7-code", "MiniMax-M2.5"] {
+    #expect(off.limitation(model: model) != nil)
+    #expect(ReasoningEffort.requiresReasoningHistory(model: model))
+  }
+  #expect(
+    high.requestFields(model: "gemma4", baseURL: "http://localhost:11434/v1")["think"]
+      == .bool(true))
+  #expect(
+    off.requestFields(model: "kimi-k2.5", baseURL: "https://openrouter.ai/api/v1")["reasoning"]
+      != nil)
+}
+
+@Test("MiniMax continuation carries tagged reasoning while Kimi carries reasoning_content")
+func reasoningContinuationBodies() throws {
+  let message = AgentMessage(
+    role: .assistant,
+    content: [
+      .reasoning("first"), .text("answer"), .reasoning("second"),
+      .toolCall(ToolCall(id: "call", name: "echo", arguments: .object([:]))),
+    ])
+  for (host, model) in [("api.minimax.io", "MiniMax-M2.5"), ("api.moonshot.ai", "kimi-k2.6")] {
+    let provider = OpenAICompatibleProvider(
+      configuration: .init(baseURL: URL(string: "https://\(host)/v1")!))
+    let request = try provider.makeURLRequest(
+      ProviderRequest(model: model, messages: [message], stream: false), model: model)
+    let body = try JSONDecoder().decode(JSONValue.self, from: try #require(request.httpBody))
+    let sent = try #require(body.objectValue?["messages"]?.arrayValue?.first?.objectValue)
+    #expect(sent["tool_calls"]?.arrayValue?.count == 1)
+    if host.contains("minimax") {
+      #expect(sent["content"] == .string(ReasoningText.render(message.content)))
+      #expect(sent["reasoning_content"] == nil)
+    } else {
+      #expect(sent["reasoning_content"] == .string(message.reasoning))
+    }
   }
 }

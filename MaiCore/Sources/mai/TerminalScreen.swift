@@ -43,6 +43,7 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
   private var columns = 80
   private var ui = ConfiguredTerminalUI()
   private var statusText = ""
+  private var thinkingRows: [String] = []
   /// The input as drawn, one styled string per row below the status line.
   private var inputRows = [""]
   private var caretRow = 0
@@ -199,6 +200,21 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
     lock.withLock { write(sequence) }
   }
 
+  /// A transient reasoning window above the status and editable prompt.
+  func setThinking(_ lines: [String]) {
+    lock.withLock {
+      let oldCount = thinkingRows.count
+      thinkingRows = Array(lines.suffix(min(3, max(1, rows / 4))))
+      guard active else { return }
+      resizeRegion(
+        inputRows: inputRows.count + oldCount,
+        to: inputRows.count + thinkingRows.count)
+      drawStatusRow()
+      drawInputRows()
+      placeCaret()
+    }
+  }
+
   // MARK: - LineEditorSurface
 
   /// Up to half the screen, so the output keeps room of its own.
@@ -218,7 +234,8 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
       self.caretColumn = caretColumn
       guard active else { return }
       if inputRows.count != previousCount {
-        resizeRegion(inputRows: previousCount, to: inputRows.count)
+        resizeRegion(
+          inputRows: previousCount + thinkingRows.count, to: inputRows.count + thinkingRows.count)
         drawStatusRow()
       }
       drawInputRows()
@@ -239,7 +256,7 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
       write(out)
       outputEndedLine = true
       if previousCount != 1 {
-        resizeRegion(inputRows: previousCount, to: 1)
+        resizeRegion(inputRows: previousCount + thinkingRows.count, to: 1 + thinkingRows.count)
         drawStatusRow()
       }
       drawInputRows()
@@ -283,7 +300,7 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
   // MARK: - Drawing
 
   /// The status row and the input rows.
-  private var reservedRows: Int { 1 + inputRows.count }
+  private var reservedRows: Int { 1 + thinkingRows.count + inputRows.count }
 
   private var regionBottom: Int { max(1, rows - reservedRows) }
 
@@ -325,7 +342,14 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
     let width = max(1, columns - 1)
     let content = Self.truncated(" \(statusText) ", width: width)
     let padding = String(repeating: " ", count: max(0, width - Self.displayWidth(content)))
-    var out = move(row: regionBottom + 1, column: 1) + Self.clearLine
+    var out = ""
+    let colors = ProcessInfo.processInfo.environment["NO_COLOR"] == nil
+    for (index, line) in thinkingRows.enumerated() {
+      out += move(row: regionBottom + index + 1, column: 1) + Self.clearLine
+      if colors { out += "\u{1B}[3;38;5;\(244 + index * 3)m" }
+      out += Self.truncated(line, width: width) + Self.reset
+    }
+    out += move(row: regionBottom + thinkingRows.count + 1, column: 1) + Self.clearLine
     if let background = TerminalLineEditor.backgroundColorCode(ui.backgroundLine) {
       out += "\u{1B}[\(background)m" + content + padding + Self.reset
     } else {

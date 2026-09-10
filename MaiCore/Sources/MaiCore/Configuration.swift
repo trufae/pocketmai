@@ -456,6 +456,7 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
   public var subagentOutput: SubagentOutputLevel
   /// Command the REPL hands the terminal to for `/edit` and the rest. Empty
   /// falls back to `$EDITOR`, then `$VISUAL`, then vim.
+  public var thinking: ThinkingDisplay
   public var editor: String
 
   public init(
@@ -470,6 +471,7 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
     markdown: Bool = true,
     toolResultLines: Int = -1,
     subagentOutput: SubagentOutputLevel = .all,
+    thinking: ThinkingDisplay = .status,
     editor: String = ""
   ) {
     self.title = title
@@ -483,6 +485,7 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
     self.markdown = markdown
     self.toolResultLines = max(-1, toolResultLines)
     self.subagentOutput = subagentOutput
+    self.thinking = thinking
     self.editor = editor
   }
 
@@ -498,6 +501,7 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
     case markdown
     case toolResultLines
     case subagentOutput = "subagents"
+    case thinking
     case editor
   }
 
@@ -519,6 +523,7 @@ public struct ConfiguredTerminalUI: Codable, Equatable, Sendable {
       toolResultLines: try container.decodeIfPresent(Int.self, forKey: .toolResultLines) ?? -1,
       subagentOutput: try container.decodeIfPresent(
         SubagentOutputLevel.self, forKey: .subagentOutput) ?? .all,
+      thinking: try container.decodeIfPresent(ThinkingDisplay.self, forKey: .thinking) ?? .status,
       editor: try container.decodeIfPresent(String.self, forKey: .editor) ?? "")
   }
 }

@@ -1,8 +1,36 @@
+import MaiCore
 import XCTest
 
 @testable import PocketMai
 
 final class ReasoningResponseFilteringTests: XCTestCase {
+  func testEffortLevelsUseSharedProviderMappingAndKeepSavedNames() throws {
+    XCTAssertEqual(ReasoningLevel.xhigh.optionValue, "xhigh")
+    XCTAssertEqual(ReasoningLevel.max.optionValue, "max")
+    XCTAssertNil(ReasoningLevel.automatic.optionValue)
+    XCTAssertEqual(
+      ReasoningLevel.disabled.requestFields(family: .qwen, model: "qwen3")["enable_thinking"],
+      .bool(false))
+    XCTAssertEqual(
+      ReasoningLevel.xhigh.requestFields(family: .openAI, model: "gpt-5.2")["reasoning_effort"],
+      .string("xhigh"))
+    XCTAssertEqual(
+      try JSONDecoder().decode(ReasoningLevel.self, from: Data("\"disabled\"".utf8)), .disabled)
+    XCTAssertEqual(
+      ReasoningLevel.disabled.templateContext(model: "mlx-community/Qwen3-4B")?["enable_thinking"]
+        as? Bool, false)
+  }
+
+  func testOrderedReasoningStaysInSeparateCollapsedSections() {
+    let parts: [MaiCore.ContentPart] = [
+      .reasoning("first"), .text("answer"), .reasoning("second"), .text("done"),
+    ]
+    let rendered = MessageContentFilter.render(ReasoningText.render(parts))
+    XCTAssertEqual(rendered.hiddenSections.map(\.content), ["first", "second"])
+    XCTAssertTrue(rendered.visibleText.contains("answer"))
+    XCTAssertTrue(rendered.visibleText.contains("done"))
+  }
+
   func testRemovingReasoningPreservesToolCallEnvelopeExactly() {
     let toolCall = """
       <tool_call name="search">

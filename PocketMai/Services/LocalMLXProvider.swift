@@ -1,4 +1,5 @@
 import Foundation
+import MaiCore
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -183,7 +184,9 @@ actor LocalMLXProvider {
     // MLX state on its owner.
     let (stream, generationTask, promptTokenCount) = try await container.perform(
       nonSendable: UserInput(
-        chat: messages, tools: Self.mlxToolSpecs(from: request.nativeTools))
+        chat: messages, tools: Self.mlxToolSpecs(from: request.nativeTools),
+        additionalContext: request.conversation.reasoningLevel.templateContext(
+          model: modelID))
     ) { context, userInput in
       let input = try await context.processor.prepare(input: userInput)
       let promptTokenCount = input.text.tokens.size
@@ -203,33 +206,32 @@ actor LocalMLXProvider {
     }
 
     let requestStart = Date()
-    var output = ""
+    var reasoning = ReasoningStream()
+    var rendered = ReasoningText()
     var completionInfo: GenerateCompletionInfo?
     for await generation in stream {
       try Task.checkCancellation()
       switch generation {
       case .chunk(let text):
-        output += text
+        for part in reasoning.append(text) { rendered.append(part) }
         if request.conversation.usesStreaming {
-          await onUpdate(output)
+          await onUpdate(rendered.rendered)
         }
       case .info(let info):
         completionInfo = info
       case .toolCall(let toolCall):
-        let block = Self.toolCallTextBlock(toolCall)
-        if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-          output = block
-        } else {
-          output += "\n\n\(block)"
-        }
+        for part in reasoning.flush() { rendered.append(part) }
+        rendered.append(.text("\n\n" + Self.toolCallTextBlock(toolCall)))
         if request.conversation.usesStreaming {
-          await onUpdate(output)
+          await onUpdate(rendered.rendered)
         }
       }
     }
     // In particular, wait if iteration was stopped by cancellation or a stream
     // consumer change before the producer completed its MLX work.
     await generationTask.value
+    for part in reasoning.flush() { rendered.append(part) }
+    let output = rendered.rendered
 
     if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       throw ChatProviderError.emptyResponse
