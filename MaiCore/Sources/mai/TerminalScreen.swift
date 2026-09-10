@@ -284,7 +284,9 @@ final class TerminalScreen: LineEditorSurface, @unchecked Sendable {
     // The Windows console has no job control, so Ctrl+Z is simply ignored.
     #if !os(Windows)
       suspendTerminal {
-        _ = kill(getpid(), SIGTSTP)
+        // raise targets the input thread, so activation cannot race ahead
+        // of the stop and leave the shell saving/restoring raw tty settings.
+        _ = raise(SIGTSTP)
       }
     #endif
   }
