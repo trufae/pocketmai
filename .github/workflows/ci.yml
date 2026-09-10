@@ -266,7 +266,7 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        shell: bash
+        shell: pwsh
     env:
       # swift-tui only builds against Darwin and Glibc, so like the musl and
       # Android builds the Windows CLI leaves out the /visual workspace.
@@ -292,8 +292,7 @@ jobs:
 
       - name: Verify the binary runs
         run: |
-          set -eu
-          MaiCore/.build/release/pmai.exe --help
+          ./MaiCore/.build/release/pmai.exe --help
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v7

@@ -406,7 +406,7 @@ actor LocalMLXProvider {
     }
   }
 
-  private static func toolCallTextBlock(_ toolCall: ToolCall) -> String {
+  private static func toolCallTextBlock(_ toolCall: MLXLMCommon.ToolCall) -> String {
     let argsObject = toolCall.function.arguments.mapValues { $0.anyValue }
     let rawArguments = jsonString(from: argsObject)
     return AgentTooling.makeNativeToolCall(
