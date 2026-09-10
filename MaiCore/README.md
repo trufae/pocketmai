@@ -395,10 +395,14 @@ Reaching a limit no longer ends a task with an error. A run that spends
 120k`), or `limits.maxSeconds` (`/set limits.maxSeconds 10m`; a long model call
 is cut short at the deadline) pauses at a turn boundary: everything it did is
 kept in the chat, the REPL prints `⏸ took 4m2s · model turn limit (50) reached`,
-and `/continue` (or `/retry`) runs the conversation again with a fresh budget
+and `/continue` runs the conversation again with a fresh budget
 from exactly that point. A cancelled or failed turn is kept the same way, with
 any tool call it never answered marked as not executed, so Ctrl+C is no longer
-the end of the work. With `yolo` on, a spent turn budget is treated as a
+the end of the work. `/stop` is the command equivalent of Ctrl+C: it interrupts
+the current turn and preserves undelivered messages. A new message with a
+nonempty queue asks whether to submit it first, ignore it for that turn, or
+clear it. `/retry` has been removed; `/continue` is the single resume command.
+With `yolo` on, a spent turn budget is treated as a
 checkpoint and the task continues on its own; the token and time caps always
 stop, since they exist to bound the spend. A model call that fails — a dropped
 connection, a 5xx — is repeated after `retry.delay` seconds up to
