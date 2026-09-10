@@ -141,9 +141,7 @@ jobs:
 
       # The Static Linux SDK must exactly match the host Swift toolchain.
       - name: Set up Swift 6.3.3
-        uses: swift-actions/setup-swift@v3
-        with:
-          swift-version: "6.3.3"
+        run: bash .github/scripts/setup-swift.sh 6.3.3
 
       - name: Install Swift Static Linux SDK
         run: |
@@ -200,9 +198,7 @@ jobs:
 
       # The Android Swift SDK must exactly match the host Swift toolchain.
       - name: Set up Swift 6.3.3
-        uses: swift-actions/setup-swift@v3
-        with:
-          swift-version: "6.3.3"
+        run: bash .github/scripts/setup-swift.sh 6.3.3
 
       - name: Install Android NDK and Swift SDK
         run: |
@@ -303,8 +299,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # swift-actions/setup-swift has no Windows support, so this job uses the
-      # installer-based action that the Swift project itself runs on Windows.
+      # The Linux Swiftly bootstrap is intentionally Linux-only, so this job
+      # uses the installer-based action that the Swift project runs on Windows.
       - name: Set up Swift 6.3.3
         uses: compnerd/gha-setup-swift@v0.4.1
         with:
