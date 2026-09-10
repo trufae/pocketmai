@@ -44,6 +44,10 @@ jobs:
           path: MaiCore/.build/release/pmai
           if-no-files-found: error
 
+      - name: Exercise release HTTP error handling
+        if: runner.os == 'Linux'
+        run: python3 test/linux-network-smoke.py MaiCore/.build/release/pmai
+
   static-cli:
     name: CLI (Linux static ${{ matrix.name }})
     strategy:
@@ -162,6 +166,16 @@ jobs:
           name: ${{ matrix.artifact }}
           path: pmai
           if-no-files-found: error
+
+      # Nehalem has SSE4.2 but no AVX, like the N4120's relevant ISA ceiling.
+      # Test the linked SDK/runtime too, not just instructions emitted by pmai.
+      - name: Verify release networking without AVX
+        if: matrix.arch == 'x86_64'
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+          python3 test/linux-network-smoke.py qemu-x86_64 -cpu Nehalem ./pmai
 
   android-cli:
     name: CLI (Android arm64)

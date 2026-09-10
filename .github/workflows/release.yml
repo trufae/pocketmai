@@ -61,6 +61,10 @@ jobs:
             strip -x MaiCore/.build/release/pmai
           fi
 
+      - name: Exercise Linux release HTTP error handling
+        if: runner.os == 'Linux'
+        run: python3 test/linux-network-smoke.py MaiCore/.build/release/pmai
+
       - name: Package CLI
         run: |
           asset="pmai-${{ matrix.target }}.zip"
@@ -120,6 +124,14 @@ jobs:
           file pmai
           file pmai | grep -q 'statically linked'
           ./pmai --help >/dev/null
+
+      - name: Verify release networking without AVX
+        if: matrix.arch == 'x86_64'
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+          python3 test/linux-network-smoke.py qemu-x86_64 -cpu Nehalem ./pmai
 
       - name: Package CLI
         run: |
