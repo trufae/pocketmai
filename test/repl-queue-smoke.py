@@ -77,7 +77,7 @@ def main():
                 output = bytearray()
 
                 def send(text):
-                    os.write(master, text.encode())
+                    os.write(master, text.replace("\n", "\r").encode())
 
                 def wait_for(text):
                     deadline = time.monotonic() + 20
@@ -86,7 +86,10 @@ def main():
                         assert time.monotonic() < deadline, (choice, text, output.decode(errors='replace'))
                         assert process.poll() is None, (process.returncode, output)
                         if select.select([master], [], [], .1)[0]:
-                            output.extend(os.read(master, 65536))
+                            try:
+                                output.extend(os.read(master, 65536))
+                            except OSError as error:
+                                raise AssertionError((process.poll(), output.decode(errors='replace'))) from error
                     output.clear()
 
                 def user_texts():
