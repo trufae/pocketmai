@@ -5799,6 +5799,7 @@ final class AppStore: ObservableObject {
     for var endpoint in imported {
       let match = settings.openAIEndpoints.firstIndex {
         $0.id == endpoint.id
+          || ($0.portableID != nil && $0.portableID == endpoint.portableID)
           || ($0.name.caseInsensitiveCompare(endpoint.name) == .orderedSame
             && $0.baseURL == endpoint.baseURL)
       }
@@ -5897,6 +5898,7 @@ final class AppStore: ObservableObject {
     for var server in imported {
       let match = settings.mcpServers.firstIndex {
         $0.id == server.id
+          || ($0.portableID != nil && $0.portableID == server.portableID)
           || ($0.name.caseInsensitiveCompare(server.name) == .orderedSame
             && $0.baseURL == server.baseURL)
       }

@@ -7769,7 +7769,7 @@ struct MaiCLI {
       (summary.agents, "agent"),
     ].compactMap { item in
       let (count, name) = item
-      count == 0 ? nil : "\(count) \(name)\(count == 1 ? "" : "s")"
+      return count == 0 ? nil : "\(count) \(name)\(count == 1 ? "" : "s")"
     }
   }
 

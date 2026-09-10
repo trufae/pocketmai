@@ -31,7 +31,7 @@ extension ConfiguredProvider {
         Date.ISO8601FormatStyle(includingFractionalSeconds: true).format(expiry))
     }
     self.init(
-      id: endpoint.id.uuidString.lowercased(),
+      id: endpoint.portableID ?? endpoint.id.uuidString.lowercased(),
       kind: .openAICompatible,
       displayName: endpoint.name,
       baseURL: URL(string: endpoint.baseURL),
@@ -45,7 +45,8 @@ extension OpenAIEndpoint {
   init?(archive provider: ConfiguredProvider) {
     guard provider.kind == .openAICompatible, let baseURL = provider.baseURL else { return nil }
     let options = provider.options
-    let identifier = UUID(uuidString: provider.id) ?? UUID()
+    let portableIdentifier = UUID(uuidString: provider.id)
+    let identifier = portableIdentifier ?? UUID()
     self.init(
       id: identifier,
       name: provider.displayName ?? provider.id,
@@ -66,7 +67,8 @@ extension OpenAIEndpoint {
       oauthAccessTokenExpiresAt: options.archiveDate("oauthAccessTokenExpiresAt"),
       oauthAuthorizeURL: options.archiveString("oauthAuthorizeURL"),
       oauthTokenURL: options.archiveString("oauthTokenURL"),
-      headers: provider.headers)
+      headers: provider.headers,
+      portableID: portableIdentifier == nil ? provider.id : nil)
   }
 }
 
@@ -88,7 +90,7 @@ extension ConfiguredMCPServer {
         Date.ISO8601FormatStyle(includingFractionalSeconds: true).format(expiry))
     }
     self.init(
-      id: server.id.uuidString.lowercased(),
+      id: server.portableID ?? server.id.uuidString.lowercased(),
       kind: "streamable-http",
       enabled: server.isEnabled,
       displayName: server.name,
@@ -122,7 +124,8 @@ extension MCPServer {
       baseURL: url.absoluteString,
       isEnabled: server.enabled,
       transport: .streamableHTTP,
-      authentication: authentication)
+      authentication: authentication,
+      portableID: UUID(uuidString: server.id) == nil ? server.id : nil)
   }
 }
 
@@ -311,9 +314,10 @@ extension ChatMessage {
       case .resource(let resource):
         if let value = resource.text { text.append(value) }
       case .toolCall(let call):
-        let value = JSONValue.object(
-          "name", .string(call.name),
-          "arguments", call.arguments)
+        let value = JSONValue.object([
+          "name": .string(call.name),
+          "arguments": call.arguments,
+        ])
         text.append("<tool_call id=\"\(call.id)\">\(value.compactJSONString)</tool_call>")
       case .toolResult(let result):
         text.append(
