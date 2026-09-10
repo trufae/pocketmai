@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import pty
 import queue
+import re
 import select
 import struct
 import subprocess
@@ -48,7 +49,7 @@ def main():
     server = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        for choice in ('continue', 'submit', 'ignore', 'clear'):
+        for choice in ('continue', 'submit', 'ignore', 'clear', 'stop'):
             release.clear()
             with tempfile.TemporaryDirectory(prefix='pmai-queue-') as directory:
                 root = Path(directory)
@@ -90,7 +91,9 @@ def main():
                                 output.extend(os.read(master, 65536))
                             except OSError as error:
                                 raise AssertionError((process.poll(), output.decode(errors='replace'))) from error
+                    captured = bytes(output).decode(errors='replace')
                     output.clear()
+                    return captured
 
                 def user_texts():
                     request = requests.get(timeout=20)
@@ -98,14 +101,21 @@ def main():
 
                 try:
                     wait_for('pmai>')
+                    if choice == 'continue':
+                        send('/help\n')
+                        help_text = wait_for('Input:')
+                        help_text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', help_text).replace('\r', '')
+                        names = re.findall(r'(?m)^(/[a-z]+)\b', help_text)
+                        assert len(names) > 20 and names == sorted(names), names
+                        assert '/stop' in names and '/retry' not in names, names
                     send('slow\n')
                     assert user_texts() == ['slow']
                     send('queued note\n')
                     wait_for('queued (1 waiting)')
-                    send('\x03')
+                    send('/stop\n' if choice == 'stop' else '\x03')
                     wait_for('still waiting:')
                     release.set()
-                    if choice == 'continue':
+                    if choice in ('continue', 'stop'):
                         send('/continue\n')
                         assert user_texts() == ['slow', 'queued note']
                     else:
@@ -128,7 +138,7 @@ def main():
                     send('/exit\n')
                     process.wait(timeout=10)
                     assert process.returncode == 0
-                    print(f'PASS Ctrl+C, queue {choice}')
+                    print(f'PASS queue {choice}')
                 finally:
                     release.set()
                     if process.poll() is None:

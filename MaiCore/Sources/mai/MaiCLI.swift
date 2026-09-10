@@ -2177,6 +2177,11 @@ struct MaiCLI {
           await releaseIfIdle(workspace: workspace)
           continue
         }
+        if !heredoc, text == "/stop" {
+          // Use the same event as Ctrl+C, including pending queue decisions.
+          continuation.yield(.interrupt)
+          continue
+        }
         if let pending = loop.pendingQueueMessage {
           switch text.lowercased() {
           case "submit", "s":
@@ -2191,7 +2196,7 @@ struct MaiCLI {
             await runtime.supervisor.clearQueuedMessages(for: pid)
             await startTurn([pending])
           default:
-            await terminal.line("Choose submit, ignore, or clear. Ctrl+C cancels this new message and keeps the queue.")
+            await terminal.line("Choose submit, ignore, or clear. Ctrl+C or /stop cancels this new message and keeps the queue.")
           }
           await releaseIfIdle(workspace: workspace)
           continue
@@ -2273,7 +2278,7 @@ struct MaiCLI {
             }
             break events
           }
-          if name == "/continue" || name == "/retry" {
+          if name == "/continue" {
             if loop.activeTurn != nil {
               await terminal.note("A turn is already running; Ctrl+C cancels it.")
             } else {
@@ -3235,7 +3240,9 @@ struct MaiCLI {
     case "/reply":
       await terminal.line(
         "Use /reply at the chat prompt; it opens the last reply quoted in $EDITOR.")
-    case "/continue", "/retry":
+    case "/stop":
+      await terminal.line("Use /stop at the chat prompt to interrupt the running turn and keep its queue.")
+    case "/continue":
       await terminal.line(
         "Use /continue at the chat prompt; in visual mode, send \"continue\" as a message.")
     default:
@@ -9454,7 +9461,7 @@ struct MaiCLI {
       "/set limits.maxSubagents ", "/set limits.maxSeconds ", "/set limits.maxTotalTokens ",
       "/set retry.attempts ", "/set retry.delay ", "/set ctx.strategy ", "/set ctx.compact ",
       "/set ctx.compact off",
-      "/continue", "/retry",
+      "/continue", "/stop",
       "/set tool.", "/set tool.calling automatic", "/set tool.calling native",
       "/set tool.calling text", "/set tool.calling xml", "/set tool.calling json",
       "/set tool.proxy on", "/set tool.proxy off",
@@ -9765,49 +9772,52 @@ struct MaiCLI {
 
   private static let visualHelp: String = {
     #if PMAI_HAS_VISUAL
-      "/visual             Open the terminal workspace: split chats, providers, MCPs, tools\n"
+      "/visual                Open the terminal workspace: split chats, providers, MCPs, tools\n"
     #else
       ""
     #endif
   }()
 
   private static let replHelp = """
-    /set [SETTING VALUE]   Show or change settings; /help set lists them
-    /cwd                  Print the current working directory
-    /cd PATH              Change the current working directory
-    /plugins            List statically and dynamically loaded plugins
-    /providers          List registered providers
-    /models [PROVIDER]  List models from the current or named provider
-    /provider ID       Select a provider
-    /baseurl URL       Change the current provider endpoint
-    /model NAME         Select a model
-    /btw PROMPT         Ask in a fresh context without changing this chat
-    /continue           Pick a paused or interrupted task up where it stopped (/retry is the same)
-    /memory             Show, edit, learn, or scope this project's durable memory
-    /todo               Show, add to, tick off, or edit this project's todo list
-    /prompts            List every prompt and skill; $NAME [TEXT] sends one (/help prompt)
-    /prompt             Manage named system prompts; /help prompt lists commands
-    /chat               List, switch, archive, rename, or edit this project's chats
-    /project            Show, list, rename, or tint the project (the start directory)
-    /edit TARGET        Edit a prompt, agent, config, MCP list, or message in $EDITOR
-    /edit input         Write the next message in $EDITOR instead of at the prompt
-    /agents             Manage agent definitions and running agents; /help agents lists commands
-    /queue              List, push, pop, or drop messages waiting for an agent
-    /agent              Select or edit this chat's agent; /help agent lists commands
-    /tools              List logical tool groups for the current agent
-    /skills             List, enable, disable, or send skills (/help skills)
-    /mcp                Manage MCP servers; /help mcp lists commands
-    /image MODE PATH    Attach at tiny/small/medium/big/full size, or OCR to Markdown
-    /attach PATH        Attach a Word, EPUB, PDF, JSON, or text file as Markdown/plain text
-    /attach clear       Drop the attachments queued for the next message
-    /copy [N] [PATH]    Copy the last reply, or N messages, to the clipboard or a file
-    /reply [WIDTH]      Answer the last reply in $EDITOR with it quoted above (/help reply)
+    /agent                 Select or edit this chat's agent; /help agent lists commands
+    /agents                Manage agent definitions and running agents; /help agents lists commands
+    /attach PATH           Attach a Word, EPUB, PDF, JSON, or text file as Markdown/plain text
+    /attach clear          Drop the attachments queued for the next message
+    /baseurl URL           Change the current provider endpoint
+    /btw PROMPT            Ask in a fresh context without changing this chat
+    /cd PATH               Change the current working directory
+    /chat                  List, switch, archive, rename, or edit this project's chats
+    /clear                 Clear conversation history
+    /continue              Resume a stopped or interrupted task, including queued messages
+    /copy [N] [PATH]       Copy the last reply, or N messages, to the clipboard or a file
+    /cwd                   Print the current working directory
+    /edit TARGET           Edit a prompt, agent, config, MCP list, or message in $EDITOR
+    /edit input            Write the next message in $EDITOR instead of at the prompt
+    /exit                  Exit the REPL
     /export FORMAT [PATH]  Save a portable archive, or this chat as markdown, json, debug, epub, or docx
+    /help [COMMAND]        Show commands or help for one command
+    /image MODE PATH       Attach at tiny/small/medium/big/full size, or OCR to Markdown
     /import PATH           Merge a PocketMai/pmai archive into settings, skills, and chats
-    /stats              Combined ranking, tokens/s, time in use, and efficiency per provider:model, as bars
-    \(visualHelp)/clear              Clear conversation history
-    /exit               Exit the REPL
-
+    /mcp                   Manage MCP servers; /help mcp lists commands
+    /memory                Show, edit, learn, or scope this project's durable memory
+    /model NAME            Select a model
+    /models [PROVIDER]     List models from the current or named provider
+    /nothink               Disable reasoning where the model supports it
+    /plugins               List statically and dynamically loaded plugins
+    /project               Show, list, rename, or tint the project (the start directory)
+    /prompt                Manage named system prompts; /help prompt lists commands
+    /prompts               List every prompt and skill; $NAME [TEXT] sends one (/help prompt)
+    /provider ID           Select a provider
+    /providers             List registered providers
+    /queue                 List, push, pop, or drop messages waiting for an agent
+    /reply [WIDTH]         Answer the last reply in $EDITOR with it quoted above (/help reply)
+    /set [SETTING VALUE]   Show or change settings; /help set lists them
+    /skills                List, enable, disable, or send skills (/help skills)
+    /stats                 Combined ranking, tokens/s, time in use, and efficiency per provider:model, as bars
+    /stop                  Interrupt the current turn and keep its queue; /continue resumes it
+    /todo                  Show, add to, tick off, or edit this project's todo list
+    /tools                 List logical tool groups for the current agent
+    \(visualHelp)
     Input: Shift+Enter adds a line (Alt+Enter or Ctrl+J where the terminal sends Enter for it)
            A paste keeps its lines · Enter sends the whole text
            <<WORD starts a multiline message ending at WORD alone
@@ -9816,7 +9826,7 @@ struct MaiCLI {
            Up/Down or Ctrl+P/N move between lines, then history · Ctrl+R reverse search
            Ctrl+A/E or Home/End beginning/end of the line
            Ctrl+B/F move left/right like the arrow keys
-           Ctrl+W delete word · Ctrl+C cancel run · Ctrl+Z suspend
+           Ctrl+W delete word · Ctrl+C or /stop interrupt the run · Ctrl+Z suspend
            The prompt stays open while a turn runs: a message typed then is queued and
            joins the conversation at the next model turn. @PID TEXT reaches one agent.
            Commands run right away too; a setting changed then reaches the next turn.
