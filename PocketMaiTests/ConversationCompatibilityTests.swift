@@ -188,8 +188,11 @@ final class ConversationCompatibilityTests: XCTestCase {
     let quarantinedURL = sourceURL.appendingPathExtension("corrupt")
     XCTAssertFalse(FileManager.default.fileExists(atPath: sourceURL.path))
     XCTAssertEqual(try Data(contentsOf: quarantinedURL), original)
-    XCTAssertEqual(try Data(contentsOf: validURL), validBytes)
+    // The first unindexed load upgrades valid legacy JSON to the current schema.
+    let migratedBytes = try Data(contentsOf: validURL)
+    XCTAssertEqual(try makeDecoder().decode(Conversation.self, from: migratedBytes), expected)
     XCTAssertEqual(PersistenceStore(localBaseURL: baseURL).loadConversations(), [expected])
+    XCTAssertEqual(try Data(contentsOf: validURL), migratedBytes)
     XCTAssertEqual(try Data(contentsOf: quarantinedURL), original)
   }
 
