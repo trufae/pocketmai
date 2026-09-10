@@ -162,7 +162,7 @@ public enum JSONValue: Codable, Equatable, Sendable {
   public var intValue: Int? {
     switch self {
     case .integer(let value): value
-    case .number(let value) where value.rounded() == value: Int(value)
+    case .number(let value): Int(exactly: value)
     default: nil
     }
   }

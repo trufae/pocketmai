@@ -323,7 +323,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
             name: call.name,
             argumentsFragment: call.arguments.compactJSONString)))
     }
-    let usage = tokenUsage(root["usage"])
+    let usage = try tokenUsage(root["usage"])
     if let usage { await emit(.usage(usage)) }
     return ProviderResponse(
       message: message,
@@ -396,7 +396,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       }
       // Some servers attach usage to every chunk, zero or cumulative until
       // the last one. Only the final figures count, announced once below.
-      if let value = tokenUsage(root["usage"]) { usage = value }
+      if let value = try tokenUsage(root["usage"]) { usage = value }
       guard let choice = root["choices"]?.arrayValue?.first?.objectValue else { continue }
       let delta = choice["delta"]?.objectValue ?? choice["message"]?.objectValue ?? [:]
       var reasoningDelta = decodedReasoning(delta)
@@ -757,18 +757,29 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     }
   }
 
-  private func tokenUsage(_ value: JSONValue?) -> TokenUsage? {
+  private func tokenUsage(_ value: JSONValue?) throws -> TokenUsage? {
     guard let usage = value?.objectValue else { return nil }
-    let input = usage["prompt_tokens"]?.intValue ?? usage["input_tokens"]?.intValue ?? 0
-    let output = usage["completion_tokens"]?.intValue ?? usage["output_tokens"]?.intValue ?? 0
+    func count(_ value: JSONValue?) throws -> Int? {
+      guard let value, value != .null else { return nil }
+      guard let count = value.intValue, count >= 0 else {
+        throw OpenAICompatibleProviderError.invalidResponse(
+          "Token usage must contain nonnegative integers within the supported range.")
+      }
+      return count
+    }
+    let input = try count(usage["prompt_tokens"] ?? usage["input_tokens"]) ?? 0
+    let output = try count(usage["completion_tokens"] ?? usage["output_tokens"]) ?? 0
+    guard !input.addingReportingOverflow(output).overflow else {
+      throw OpenAICompatibleProviderError.invalidResponse("Token usage total exceeds the supported range.")
+    }
     let promptDetails = usage["prompt_tokens_details"]?.objectValue
     let completionDetails = usage["completion_tokens_details"]?.objectValue
-    return TokenUsage(
+    return try TokenUsage(
       inputTokens: input,
       outputTokens: output,
-      totalTokens: usage["total_tokens"]?.intValue,
-      cachedTokens: promptDetails?["cached_tokens"]?.intValue,
-      reasoningTokens: completionDetails?["reasoning_tokens"]?.intValue)
+      totalTokens: count(usage["total_tokens"]),
+      cachedTokens: count(promptDetails?["cached_tokens"]),
+      reasoningTokens: count(completionDetails?["reasoning_tokens"]))
   }
 
   private func validate(response: URLResponse, data: Data) throws {
