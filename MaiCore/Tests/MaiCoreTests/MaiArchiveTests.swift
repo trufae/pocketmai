@@ -138,7 +138,7 @@ func archiveSkillCaptureAndInstall() throws {
     to: source.appendingPathComponent(AgentSkill.filename))
   let script = source.appendingPathComponent("scripts/run.sh")
   try Data("#!/bin/sh\necho review\n".utf8).write(to: script)
-  try files.setAttributes([.posixPermissions: 0o755], atPath: script.path)
+  try files.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
   let loaded = try #require(AgentSkill.load(directory: source, rootURL: sourceRoot))
   let archived = try MaiArchiveSkill(skill: loaded)
