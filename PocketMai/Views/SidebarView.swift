@@ -650,6 +650,16 @@ struct SidebarView: View {
     .disabled(!hasSelection)
     .opacity(hasSelection ? 1 : 0.5)
     FloatingActionIcon(
+      systemImage: "square.and.arrow.up",
+      accessibilityLabel: "Export selected",
+      compact: compact
+    ) {
+      let ids = selectedIDs
+      Task { await exportCoordinator.share(conversationIDs: ids, store: store) }
+    }
+    .disabled(!hasSelection)
+    .opacity(hasSelection ? 1 : 0.5)
+    FloatingActionIcon(
       systemImage: "trash",
       accessibilityLabel: "Delete selected",
       destructive: true,

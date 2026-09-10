@@ -41,6 +41,9 @@ enum EndpointConnectionState: Equatable, Sendable {
 private enum ConversationImportError: LocalizedError {
   case unreadableFile
   case invalidJSON
+  case folderNameRequired
+  case folderAlreadyExists(String)
+  case missingFolder
   case titleRequired
   case titleAlreadyExists(String)
   case missingExistingConversation
@@ -52,6 +55,12 @@ private enum ConversationImportError: LocalizedError {
       return "Could not read the selected file."
     case .invalidJSON:
       return "The selected file is not a valid PocketMai conversation export."
+    case .folderNameRequired:
+      return "Specify a folder name for the imported conversations."
+    case .folderAlreadyExists(let name):
+      return "A folder named \"\(name)\" already exists."
+    case .missingFolder:
+      return "The selected destination folder is no longer available."
     case .titleRequired:
       return "Specify a title for the imported conversation."
     case .titleAlreadyExists(let title):
@@ -427,6 +436,9 @@ final class AppStore: ObservableObject {
   /// for the composer to import.
   @Published private(set) var sharedImportRequestID = 0
   private var queuedSharedItems: [SharedInboxItem] = []
+  /// Conversation export files opened by iOS or handed over by the share
+  /// extension. ContentView presents them one at a time.
+  @Published private(set) var pendingConversationImportFiles: [PendingConversationImportFile] = []
   /// Bumped to ask the composer to take keyboard focus (e.g. after a widget tap).
   @Published private(set) var composerFocusRequestID = 0
   @Published private(set) var composerDraftReplacement: ComposerDraftReplacement?
@@ -3193,12 +3205,16 @@ final class AppStore: ObservableObject {
     if let envelope = try? decoder.decode(SettingsBackupEnvelope.self, from: data),
       envelope.format == SettingsBackupEnvelope.format
     {
-      return SettingsImportFilePreview(filename: url.lastPathComponent, kind: .backup(envelope))
+      return SettingsImportFilePreview(
+        filename: url.lastPathComponent,
+        kind: .backup(envelope),
+        sourceData: data)
     }
     if let envelope = try? Self.decodeConversationImportEnvelope(from: data) {
       return SettingsImportFilePreview(
         filename: url.lastPathComponent,
-        kind: .conversation(envelope))
+        kind: .conversation(envelope),
+        sourceData: data)
     }
     throw SettingsBackupError.invalidJSON
   }
@@ -3235,6 +3251,89 @@ final class AppStore: ObservableObject {
       conflict: conversationImportConflict(for: envelope.conversation),
       existingTitles: existingConversationImportTitles()
     )
+  }
+
+  func previewConversationCollectionImport(
+    _ file: PendingConversationImportFile
+  ) throws -> ConversationCollectionImportPreview {
+    let envelope = try Self.decodeConversationImportEnvelope(from: file.data)
+    return ConversationCollectionImportPreview(file: file, envelope: envelope)
+  }
+
+  func suggestedConversationImportFolderName(conversationCount: Int) -> String {
+    let base = conversationCount == 1 ? "Imported Conversation" : "Imported Conversations"
+    let existing = Set(conversationFolders.map {
+      normalizedConversationFolderName($0.displayName)
+    })
+    if !existing.contains(normalizedConversationFolderName(base)) { return base }
+    var index = 2
+    while existing.contains(normalizedConversationFolderName("\(base) \(index)")) {
+      index += 1
+    }
+    return "\(base) \(index)"
+  }
+
+  @discardableResult
+  func importConversationCollection(
+    _ preview: ConversationCollectionImportPreview,
+    destination: ConversationCollectionImportDestination
+  ) async throws -> Int {
+    await loadStoredConversationsForSearch()
+    let importedConversations = preview.conversations
+    guard !importedConversations.isEmpty else { throw ConversationImportError.invalidJSON }
+
+    let folderID: String
+    switch destination {
+    case .newFolder(let rawName):
+      let name = ConversationFolder.normalizedCustomName(rawName)
+      guard !name.isEmpty else { throw ConversationImportError.folderNameRequired }
+      let normalizedName = normalizedConversationFolderName(name)
+      guard !conversationFolders.contains(where: {
+        normalizedConversationFolderName($0.displayName) == normalizedName
+      }) else {
+        throw ConversationImportError.folderAlreadyExists(name)
+      }
+      let folder = ConversationFolder(name: name)
+      settings.conversationFolders.append(folder)
+      folderID = folder.id
+    case .existingFolder(let id):
+      let normalized = Conversation.normalizedFolderID(id)
+      guard conversationFolders.contains(where: { $0.id == normalized }),
+        conversationFolderIsAvailable(normalized)
+      else {
+        throw ConversationImportError.missingFolder
+      }
+      folderID = normalized
+    }
+
+    discardSelectedDisposableConversation()
+    var usedIDs = Set(conversations.map(\.id))
+    var inserted: [Conversation] = []
+    inserted.reserveCapacity(importedConversations.count)
+    let now = Date()
+    for source in importedConversations {
+      var conversation = source
+      while usedIDs.contains(conversation.id) {
+        conversation.id = UUID()
+      }
+      usedIDs.insert(conversation.id)
+      conversation.folderID = folderID
+      conversation.isPinned = false
+      conversation.updatedAt = now
+      inserted.append(conversation)
+    }
+
+    conversations.insert(contentsOf: inserted, at: 0)
+    sortConversations()
+    rebuildConversationIndexes()
+    conversationSummaries = Self.sortedSummaries(conversations.map(ConversationSummary.init))
+    refreshRecentConversationSummaries()
+    settings.selectedConversationFolderID = folderID
+    setSelectedConversationID(inserted[0].id)
+    selectedConversationIDs.removeAll()
+    saveSettings()
+    saveConversations()
+    return inserted.count
   }
 
   func importConversation(
@@ -3380,6 +3479,35 @@ final class AppStore: ObservableObject {
     case .docx:
       return await exportConversationDOCX(conversation, imageSize: imageSize)
     case .audio:
+      return nil
+    }
+  }
+
+  func exportConversationCollectionFile(ids: Set<UUID>) async -> URL? {
+    guard !ids.isEmpty else { return nil }
+    await loadStoredConversationsForSearch()
+    let selected = conversationSummaries.compactMap { summary in
+      ids.contains(summary.id) ? conversation(withID: summary.id) : nil
+    }
+    guard !selected.isEmpty else { return nil }
+
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    encoder.dateEncodingStrategy = .iso8601
+    let envelope = ConversationExportEnvelope(conversations: selected)
+    do {
+      let data = try encoder.encode(envelope)
+      let filename =
+        selected.count == 1
+        ? ConversationExportFiles.filename(for: selected[0])
+        : "PocketMai-\(selected.count)-Conversations"
+      let url = try ConversationExportFiles.url(
+        filename: filename,
+        fileExtension: ConversationExportFiles.fileExtension)
+      try data.write(to: url, options: .atomic)
+      return url
+    } catch {
+      errorMessage = "Could not export conversations: \(error.localizedDescription)"
       return nil
     }
   }
@@ -4569,8 +4697,50 @@ final class AppStore: ObservableObject {
   func drainSharedInbox() {
     let items = SharedInbox.takeAll()
     guard !items.isEmpty else { return }
-    queuedSharedItems += items
+    var composerItems: [SharedInboxItem] = []
+    for item in items {
+      guard ConversationExportFiles.isConversationExport(filename: item.filename) else {
+        composerItems.append(item)
+        continue
+      }
+      defer { SharedInbox.discard(item) }
+      guard let url = SharedInbox.fileURL(for: item),
+        let data = try? Data(contentsOf: url)
+      else {
+        errorMessage = "Could not read \(item.filename)."
+        continue
+      }
+      enqueueConversationImport(filename: item.filename, data: data)
+    }
+    guard !composerItems.isEmpty else { return }
+    queuedSharedItems += composerItems
     sharedImportRequestID &+= 1
+  }
+
+  /// Queues a registered `.pocketmai.json` document opened from Files, AirDrop,
+  /// Mail, or another application.
+  func openConversationImportFile(at url: URL) {
+    guard url.isFileURL,
+      ConversationExportFiles.isConversationExport(filename: url.lastPathComponent)
+    else { return }
+    let access = url.startAccessingSecurityScopedResource()
+    defer {
+      if access { url.stopAccessingSecurityScopedResource() }
+    }
+    guard let data = try? Data(contentsOf: url) else {
+      errorMessage = "Could not read \(url.lastPathComponent)."
+      return
+    }
+    enqueueConversationImport(filename: url.lastPathComponent, data: data)
+  }
+
+  func finishConversationImportFile(id: UUID) {
+    pendingConversationImportFiles.removeAll { $0.id == id }
+  }
+
+  private func enqueueConversationImport(filename: String, data: Data) {
+    pendingConversationImportFiles.append(
+      PendingConversationImportFile(filename: filename, data: data))
   }
 
   var hasQueuedSharedItems: Bool {
@@ -5769,6 +5939,7 @@ final class AppStoreViewObservation: ObservableObject {
       observe(store.$openAPIServerState)
       observe(store.$pendingLaunchAction)
       observe(store.$sharedImportRequestID)
+      observe(store.$pendingConversationImportFiles)
       observe(store.$composerFocusRequestID)
       observe(store.$pendingMessageNavigation)
       observe(store.$browserSession)
@@ -5828,6 +5999,12 @@ final class AppStoreViewObservation: ObservableObject {
 }
 
 enum ConversationExportFiles {
+  static let fileExtension = "pocketmai.json"
+
+  static func isConversationExport(filename: String) -> Bool {
+    filename.lowercased().hasSuffix(".\(fileExtension)")
+  }
+
   static func url(
     for conversation: Conversation,
     format: ConversationExportFormat,
@@ -5846,7 +6023,7 @@ enum ConversationExportFiles {
     return directory.appendingPathComponent(filename).appendingPathExtension(fileExtension)
   }
 
-  private static func filename(for conversation: Conversation) -> String {
+  static func filename(for conversation: Conversation) -> String {
     let invalid = CharacterSet(charactersIn: "/\\?%*|\"<>:")
       .union(.newlines)
       .union(.controlCharacters)

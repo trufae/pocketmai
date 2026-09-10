@@ -89,6 +89,12 @@ struct ContentView: View {
       SettingsView(store: store, storeObservation: settingsStoreObservation)
         .environmentObject(store)
     }
+    .sheet(item: pendingConversationImportFileBinding) { file in
+      ConversationCollectionImportView(file: file) {
+        store.finishConversationImportFile(id: file.id)
+      }
+        .environmentObject(store)
+    }
     .onChange(of: showingSettings) { _, isShowing in
       // The chat view keeps rendering behind the sheet; pausing streamed-text
       // publications while Settings is open stops the message list from doing
@@ -182,6 +188,17 @@ struct ContentView: View {
         guard sidebarSelectionGeneration == selectionGeneration else { return }
         await store.selectConversation(id: id)
       }
+    }
+  }
+
+  private var pendingConversationImportFileBinding: Binding<PendingConversationImportFile?> {
+    Binding {
+      store.pendingConversationImportFiles.first
+    } set: { file in
+      guard case .none = file,
+        let current = store.pendingConversationImportFiles.first
+      else { return }
+      store.finishConversationImportFile(id: current.id)
     }
   }
 

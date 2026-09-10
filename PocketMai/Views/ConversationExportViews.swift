@@ -43,6 +43,13 @@ final class ConversationExportCoordinator: ObservableObject {
     exportShareFile = ExportedFile(url: url)
   }
 
+  func share(conversationIDs: Set<UUID>, store: AppStore) async {
+    guard let url = await store.exportConversationCollectionFile(ids: conversationIDs) else {
+      return
+    }
+    exportShareFile = ExportedFile(url: url)
+  }
+
   func shareDocument(format: ConversationExportFormat, conversationID: UUID, store: AppStore) {
     Task { @MainActor in
       guard let conversation = await store.conversationForExport(id: conversationID) else {

@@ -14,7 +14,9 @@ struct PocketMaiApp: App {
     WindowGroup {
       PocketMaiRootView(store: store, ttsPlayer: ttsPlayer)
         .onOpenURL { url in
-          if let command = PocketMaiDeepLink.command(from: url) {
+          if url.isFileURL {
+            store.openConversationImportFile(at: url)
+          } else if let command = PocketMaiDeepLink.command(from: url) {
             store.handleLaunchCommand(command)
           }
         }

@@ -1353,10 +1353,10 @@ struct ChatView: View {
     case .openConversation(let id):
       await store.selectConversation(id: id)
     case .importSharedContent:
-      if store.currentConversation == nil {
+      store.drainSharedInbox()
+      if store.hasQueuedSharedItems, store.currentConversation == nil {
         store.newConversation()
       }
-      store.drainSharedInbox()
     }
   }
 

@@ -91,7 +91,8 @@ enum ConversationExportFormat: String, CaseIterable, Identifiable, Sendable {
   var fileExtension: String {
     switch self {
     case .markdown: "md"
-    case .json, .debug: "json"
+    case .json: ConversationExportFiles.fileExtension
+    case .debug: "json"
     case .epub: "epub"
     case .docx: "docx"
     case .audio: "m4a"
@@ -1907,6 +1908,9 @@ struct ConversationExportEnvelope: Codable, Equatable, Sendable {
   var createdAt: Date
   var pocketMaiVersion: String
   var conversation: Conversation
+  /// A packed export. `conversation` remains the first item so older PocketMai
+  /// versions can still import a useful, single conversation from this file.
+  var conversations: [Conversation]?
   var toolCallingDebug: ConversationToolCallingDebug?
 
   init(
@@ -1923,7 +1927,35 @@ struct ConversationExportEnvelope: Codable, Equatable, Sendable {
     self.createdAt = conversation.createdAt
     self.pocketMaiVersion = pocketMaiVersion
     self.conversation = conversation
+    self.conversations = nil
     self.toolCallingDebug = toolCallingDebug
+  }
+
+  init(
+    conversations: [Conversation],
+    exportedAt: Date = Date(),
+    pocketMaiVersion: String = Self.currentPocketMaiVersion
+  ) {
+    precondition(!conversations.isEmpty, "A conversation export cannot be empty")
+    let first = conversations[0]
+    self.format = Self.format
+    self.title =
+      conversations.count == 1
+      ? first.displayTitle
+      : "\(conversations.count) Conversations"
+    self.model = first.modelID
+    self.provider = first.provider.rawValue
+    self.exportedAt = exportedAt
+    self.createdAt = conversations.map(\.createdAt).min() ?? first.createdAt
+    self.pocketMaiVersion = pocketMaiVersion
+    self.conversation = first
+    self.conversations = conversations.count == 1 ? nil : conversations
+    self.toolCallingDebug = nil
+  }
+
+  var exportedConversations: [Conversation] {
+    guard let conversations, !conversations.isEmpty else { return [conversation] }
+    return conversations
   }
 
   var providerDisplayName: String {
@@ -2095,6 +2127,27 @@ struct ConversationImportPreview: Identifiable, Sendable {
     guard conflict != nil else { return base }
     return "\(base) (Imported)"
   }
+}
+
+struct PendingConversationImportFile: Identifiable, Sendable {
+  let id = UUID()
+  var filename: String
+  var data: Data
+}
+
+struct ConversationCollectionImportPreview: Identifiable, Sendable {
+  var id: UUID { file.id }
+  var file: PendingConversationImportFile
+  var envelope: ConversationExportEnvelope
+
+  var conversations: [Conversation] {
+    envelope.exportedConversations
+  }
+}
+
+enum ConversationCollectionImportDestination: Sendable {
+  case newFolder(name: String)
+  case existingFolder(id: String)
 }
 
 enum ConversationImportResolution: Sendable {
@@ -2269,6 +2322,7 @@ struct SettingsImportFilePreview: Identifiable, Sendable {
   let id = UUID()
   var filename: String
   var kind: SettingsImportFileKind
+  var sourceData: Data? = nil
 
   var availableSelection: SettingsBackupSelection {
     switch kind {
