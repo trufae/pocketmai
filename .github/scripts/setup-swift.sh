@@ -39,7 +39,8 @@ export PATH="$SWIFTLY_BIN_DIR:$PATH"
 "$SWIFTLY_BIN_DIR/swiftly" install --use "$version" --assume-yes \
   --post-install-file "$workdir/post-install.sh"
 if [ -f "$workdir/post-install.sh" ]; then
-  bash "$workdir/post-install.sh"
+  # Swiftly emits apt-get commands; hosted runners execute this script as runner.
+  sudo -n bash -e "$workdir/post-install.sh"
 fi
 
 toolchain_dir=$("$SWIFTLY_BIN_DIR/swiftly" use --print-location)
