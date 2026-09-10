@@ -130,11 +130,14 @@ final class ConversationCompatibilityTests: XCTestCase {
   }
 
   func testLegacyEnvelopeAndArrayFilesMigrateWithoutDataLoss() throws {
-    let expected = try decodeFixture(named: "conversation-v1.1")
-    let object = try JSONSerialization.jsonObject(with: fixtureData(named: "conversation-v1.1"))
+    // A real store can contain several schema generations, not just one chat.
+    let names = fixtures.keys.sorted()
+    let expected = try names.map { try decodeFixture(named: $0) }
+      .sorted { $0.id.uuidString < $1.id.uuidString }
+    let objects = try names.map { try JSONSerialization.jsonObject(with: fixtureData(named: $0)) }
     let legacyDocuments: [(String, Any)] = [
-      ("envelope", ["conversations": [object]]),
-      ("array", [object]),
+      ("envelope", ["conversations": objects]),
+      ("array", objects),
     ]
 
     for (name, legacyObject) in legacyDocuments {
@@ -146,13 +149,21 @@ final class ConversationCompatibilityTests: XCTestCase {
         try data.write(to: legacyURL, options: .atomic)
 
         let loaded = PersistenceStore(localBaseURL: baseURL).loadConversations()
-        XCTAssertEqual(loaded, [expected])
+          .sorted { $0.id.uuidString < $1.id.uuidString }
+        XCTAssertEqual(loaded, expected)
         XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
-        XCTAssertTrue(
-          FileManager.default.fileExists(
-            atPath: baseURL.appendingPathComponent(
-              "conversations/\(expected.id.uuidString).json"
-            ).path))
+        let migratedURLs = expected.map {
+          baseURL.appendingPathComponent("conversations/\($0.id.uuidString).json")
+        }
+        let migratedBytes = try migratedURLs.map { try Data(contentsOf: $0) }
+        for (conversation, bytes) in zip(expected, migratedBytes) {
+          XCTAssertEqual(try makeDecoder().decode(Conversation.self, from: bytes), conversation)
+        }
+        // Reopening must not duplicate chats or rewrite the migrated documents.
+        XCTAssertEqual(
+          PersistenceStore(localBaseURL: baseURL).loadConversations()
+            .sorted { $0.id.uuidString < $1.id.uuidString }, expected)
+        XCTAssertEqual(try migratedURLs.map { try Data(contentsOf: $0) }, migratedBytes)
       }
     }
   }
@@ -167,10 +178,18 @@ final class ConversationCompatibilityTests: XCTestCase {
     let original = Data(#"{"validJSON":true,"but":"not a conversation"}"#.utf8)
     try original.write(to: sourceURL, options: .atomic)
 
-    XCTAssertEqual(PersistenceStore(localBaseURL: baseURL).loadConversations(), [])
+    let validBytes = try fixtureData(named: "conversation-v1.6.2")
+    let expected = try decodeFixture(named: "conversation-v1.6.2")
+    let validURL = conversationsURL.appendingPathComponent("\(expected.id.uuidString).json")
+    try validBytes.write(to: validURL, options: .atomic)
+
+    XCTAssertEqual(PersistenceStore(localBaseURL: baseURL).loadConversations(), [expected])
 
     let quarantinedURL = sourceURL.appendingPathExtension("corrupt")
     XCTAssertFalse(FileManager.default.fileExists(atPath: sourceURL.path))
+    XCTAssertEqual(try Data(contentsOf: quarantinedURL), original)
+    XCTAssertEqual(try Data(contentsOf: validURL), validBytes)
+    XCTAssertEqual(PersistenceStore(localBaseURL: baseURL).loadConversations(), [expected])
     XCTAssertEqual(try Data(contentsOf: quarantinedURL), original)
   }
 
