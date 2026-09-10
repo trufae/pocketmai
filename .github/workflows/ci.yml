@@ -145,9 +145,9 @@ jobs:
 
       - name: Install Swift Static Linux SDK
         run: |
-          swift sdk install \
+          bash .github/scripts/install-swift-sdk.sh \
             https://download.swift.org/swift-6.3.3-release/static-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz \
-            --checksum 87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
+            87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
           swift sdk list
 
       # Fully static: no glibc, libstdc++, libcurl or libxml2 dependency, so
@@ -209,9 +209,9 @@ jobs:
           unzip -q "$RUNNER_TEMP/android-ndk.zip" -d "$RUNNER_TEMP"
           test -d "$ndk"
 
-          swift sdk install \
+          bash .github/scripts/install-swift-sdk.sh \
             https://download.swift.org/swift-6.3.3-release/android-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_android.artifactbundle.tar.gz \
-            --checksum d160cc3206dd1886dae3fef2337af5e25ec034692cd0ec225721c56cc69da7f5
+            d160cc3206dd1886dae3fef2337af5e25ec034692cd0ec225721c56cc69da7f5
           swift_sdk_root="${XDG_CONFIG_HOME:-$HOME/.config}/swiftpm/swift-sdks"
           android_sdk="$swift_sdk_root/swift-6.3.3-RELEASE_android.artifactbundle/swift-android"
           setup_script="$android_sdk/scripts/setup-android-sdk.sh"

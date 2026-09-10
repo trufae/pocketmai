@@ -35,17 +35,20 @@ export SWIFTLY_BIN_DIR="${RUNNER_TEMP:-/tmp}/swiftly-bin"
 export PATH="$SWIFTLY_BIN_DIR:$PATH"
 
 "$workdir/swiftly" init --skip-install --quiet-shell-followup --assume-yes --no-modify-profile
-"$workdir/swiftly" install --use "$version" --assume-yes \
+# init moves the bootstrap executable into SWIFTLY_BIN_DIR.
+"$SWIFTLY_BIN_DIR/swiftly" install --use "$version" --assume-yes \
   --post-install-file "$workdir/post-install.sh"
 if [ -f "$workdir/post-install.sh" ]; then
   bash "$workdir/post-install.sh"
 fi
 
-toolchain_dir=$("$workdir/swiftly" use --print-location)
-export PATH="$toolchain_dir:$PATH"
+toolchain_dir=$("$SWIFTLY_BIN_DIR/swiftly" use --print-location)
+toolchain_bin="$toolchain_dir/usr/bin"
+test -x "$toolchain_bin/swift"
+export PATH="$toolchain_bin:$PATH"
 swift --version
 
 echo "SWIFTLY_HOME_DIR=$SWIFTLY_HOME_DIR" >> "$GITHUB_ENV"
 echo "SWIFTLY_BIN_DIR=$SWIFTLY_BIN_DIR" >> "$GITHUB_ENV"
 echo "$SWIFTLY_BIN_DIR" >> "$GITHUB_PATH"
-echo "$toolchain_dir" >> "$GITHUB_PATH"
+echo "$toolchain_bin" >> "$GITHUB_PATH"
