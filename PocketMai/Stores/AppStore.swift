@@ -4341,6 +4341,28 @@ final class AppStore: ObservableObject {
     saveConversations()
   }
 
+  /// Removes durable agent records rooted at the given run identities,
+  /// including descendants no longer retained by the live supervisor.
+  func removeAgentProcessRecordSubtrees(
+    rootedAt rootRunIDs: Set<UUID>,
+    from conversationID: UUID
+  ) {
+    guard let index = indexedConversationIndex(for: conversationID) else { return }
+    var deletedRunIDs = rootRunIDs
+    var foundDescendant = true
+    while foundDescendant {
+      foundDescendant = false
+      for record in conversations[index].subagents
+      where record.parentRunID.map(deletedRunIDs.contains) == true {
+        if deletedRunIDs.insert(record.runID).inserted { foundDescendant = true }
+      }
+    }
+    let previousCount = conversations[index].subagents.count
+    conversations[index].subagents.removeAll { deletedRunIDs.contains($0.runID) }
+    guard conversations[index].subagents.count != previousCount else { return }
+    saveConversations()
+  }
+
   /// Placeholders worth a file even though nothing was said yet: a draft is
   /// waiting in them, or a reply is on its way. The store drops every other
   /// untouched placeholder, as pmai does.

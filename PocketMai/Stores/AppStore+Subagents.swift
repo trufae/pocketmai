@@ -234,24 +234,8 @@ extension AppStore {
       }
       await refreshAgentProcesses()
 
-      guard let index = conversations.firstIndex(where: { $0.id == conversationID }) else {
-        return
-      }
-      // Include saved descendants that may already have fallen out of the
-      // supervisor's in-memory retention window.
-      var foundDescendant = true
-      while foundDescendant {
-        foundDescendant = false
-        for record in conversations[index].subagents
-        where record.parentRunID.map(deletedRunIDs.contains) == true {
-          if deletedRunIDs.insert(record.runID).inserted { foundDescendant = true }
-        }
-      }
-      let previousCount = conversations[index].subagents.count
-      conversations[index].subagents.removeAll { deletedRunIDs.contains($0.runID) }
-      if conversations[index].subagents.count != previousCount {
-        saveConversations()
-      }
+      removeAgentProcessRecordSubtrees(
+        rootedAt: deletedRunIDs, from: conversationID)
     }
   }
 
