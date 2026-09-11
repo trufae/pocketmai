@@ -95,7 +95,11 @@ def main():
                 # Editing and Enter must work, with the original draft retained.
                 send(b'x\x7f-ok\r')
                 wait_for(f'Hello from MaiCore: {prefix}-ok')
-                wait_for(PROMPT)
+                # The persistent prompt is redrawn as soon as Enter is accepted,
+                # before the response arrives. Waiting for it after the response
+                # races with that redraw and times out even though the editor is
+                # ready. Synchronize on the turn-completion note instead.
+                wait_for('✓ took')
 
             send(b'/exit\r')
             wait_for('SHELL_READY> ')
