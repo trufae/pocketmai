@@ -84,6 +84,50 @@ func jsonRPCPeerRoundTrip() async throws {
   await server.close()
 }
 
+@Test("A stdio transport closed before reading returns a finished stream")
+func closedStdioTransportFinishesMessages() async {
+  let input = Pipe()
+  let output = Pipe()
+  let transport = StdioJSONRPCTransport(
+    input: input.fileHandleForReading,
+    output: output.fileHandleForWriting)
+
+  transport.close()
+  var messages = transport.messages().makeAsyncIterator()
+
+  #expect(await messages.next() == nil)
+}
+
+@Test("A JSON-RPC request without a reply times out")
+func jsonRPCRequestTimeout() async {
+  let (clientTransport, serverTransport) = PipeTransport.pair()
+  let client = JSONRPCPeer(transport: clientTransport)
+  await client.start()
+
+  await #expect(throws: JSONRPCTransportError.timedOut("never")) {
+    _ = try await client.request("never", timeout: 0.01)
+  }
+
+  await client.close()
+  serverTransport.close()
+}
+
+@Test("Cancellation cannot overtake JSON-RPC request registration")
+func jsonRPCRequestCancellation() async {
+  let (clientTransport, serverTransport) = PipeTransport.pair()
+  let client = JSONRPCPeer(transport: clientTransport)
+  await client.start()
+  let request = Task { try await client.request("never") }
+
+  request.cancel()
+  await #expect(throws: CancellationError.self) {
+    _ = try await request.value
+  }
+
+  await client.close()
+  serverTransport.close()
+}
+
 @Test("ACP content blocks flatten a prompt and read agent updates")
 func acpContentBlocks() {
   let prompt: JSONValue = .array([

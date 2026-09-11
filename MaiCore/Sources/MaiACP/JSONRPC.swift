@@ -182,15 +182,24 @@ public final class StdioJSONRPCTransport: JSONRPCTransport, @unchecked Sendable 
   }
 
   public func messages() -> AsyncStream<JSONRPCMessage> {
-    stateLock.withLock {
-      if let stream { return stream }
+    let state: (
+      stream: AsyncStream<JSONRPCMessage>,
+      created: AsyncStream<JSONRPCMessage>.Continuation?,
+      shouldStart: Bool
+    ) = stateLock.withLock {
+      if let stream { return (stream, nil, false) }
       let (stream, continuation) = AsyncStream<JSONRPCMessage>.makeStream(
         bufferingPolicy: .unbounded)
       self.stream = stream
       self.continuation = continuation
-      startReading()
-      return stream
+      return (stream, continuation, !isClosed)
     }
+    if state.shouldStart {
+      startReading()
+    } else {
+      state.created?.finish()
+    }
+    return state.stream
   }
 
   public func send(_ message: JSONRPCMessage) throws {
@@ -203,13 +212,20 @@ public final class StdioJSONRPCTransport: JSONRPCTransport, @unchecked Sendable 
   }
 
   public func close() {
-    let wasClosed = stateLock.withLock { () -> Bool in
-      defer { isClosed = true }
-      return isClosed
-    }
-    guard !wasClosed else { return }
-    continuation?.finish()
-    try? output.close()
+    let state: (shouldClose: Bool, pending: AsyncStream<JSONRPCMessage>.Continuation?) =
+      stateLock.withLock {
+        guard !isClosed else { return (false, nil) }
+        isClosed = true
+        let pending = continuation
+        continuation = nil
+        return (true, pending)
+      }
+    guard state.shouldClose else { return }
+    state.pending?.finish()
+    try? input.close()
+    // A sender holds this lock from the closed-state check through its write.
+    // Closing the handle under the same lock prevents close/write races.
+    writeLock.withLock { try? output.close() }
     if let process, process.isRunning {
       process.terminate()
       // Give a well-behaved agent a moment to exit before pulling the plug.
@@ -239,7 +255,7 @@ public final class StdioJSONRPCTransport: JSONRPCTransport, @unchecked Sendable 
         }
       }
       if !buffer.isEmpty { self.deliver(buffer) }
-      self.continuation?.finish()
+      self.finishMessages()
     }
     thread.name = "mai.jsonrpc.reader"
     thread.start()
@@ -251,7 +267,16 @@ public final class StdioJSONRPCTransport: JSONRPCTransport, @unchecked Sendable 
     guard let message = try? JSONDecoder().decode(JSONRPCMessage.self, from: trimmed) else {
       return
     }
-    continuation?.yield(message)
+    stateLock.withLock { continuation }?.yield(message)
+  }
+
+  private func finishMessages() {
+    let pending = stateLock.withLock { () -> AsyncStream<JSONRPCMessage>.Continuation? in
+      let pending = continuation
+      continuation = nil
+      return pending
+    }
+    pending?.finish()
   }
 
   private func drainErrors(from handle: FileHandle) {
@@ -296,7 +321,12 @@ public actor JSONRPCPeer {
   private let onRequest: RequestHandler
   private let onNotification: NotificationHandler
   private var nextID = 1
-  private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
+  private struct PendingRequest {
+    let continuation: CheckedContinuation<JSONValue, Error>
+    var timeout: Task<Void, Never>?
+  }
+
+  private var pending: [Int: PendingRequest] = [:]
   private var reader: Task<Void, Never>?
   private var closed = false
 
@@ -339,30 +369,15 @@ public actor JSONRPCPeer {
     guard !closed else { throw JSONRPCTransportError.closed }
     let id = nextID
     nextID += 1
-    let response: JSONValue = try await withTaskCancellationHandler {
-      try await withThrowingTaskGroup(of: JSONValue.self) { group in
-        group.addTask { [self] in
-          try await withCheckedThrowingContinuation { continuation in
-            Task {
-              await self.register(
-                id: id, continuation: continuation, method: method, params: params)
-            }
-          }
-        }
-        if let timeout, timeout > 0 {
-          group.addTask {
-            try await Task.sleep(for: .seconds(timeout))
-            throw JSONRPCTransportError.timedOut(method)
-          }
-        }
-        let first = try await group.next()!
-        group.cancelAll()
-        return first
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        register(
+          id: id, continuation: continuation, method: method, params: params,
+          timeout: timeout)
       }
     } onCancel: {
       Task { await self.cancelPending(id: id) }
     }
-    return response
   }
 
   public nonisolated func notify(_ method: String, params: JSONValue? = nil) throws {
@@ -378,28 +393,46 @@ public actor JSONRPCPeer {
     id: Int,
     continuation: CheckedContinuation<JSONValue, Error>,
     method: String,
-    params: JSONValue?
+    params: JSONValue?,
+    timeout: TimeInterval?
   ) {
-    pending[id] = continuation
+    pending[id] = PendingRequest(continuation: continuation)
     do {
       try transport.send(.request(id: id, method: method, params: params))
     } catch {
       pending[id] = nil
       continuation.resume(throwing: error)
+      return
+    }
+    if let timeout, timeout > 0 {
+      let timer = Task { [weak self] in
+        try? await Task.sleep(for: .seconds(timeout))
+        guard !Task.isCancelled else { return }
+        await self?.timeoutPending(id: id, method: method)
+      }
+      pending[id]?.timeout = timer
     }
   }
 
   private func cancelPending(id: Int) {
-    pending.removeValue(forKey: id)?.resume(throwing: CancellationError())
+    guard let request = pending.removeValue(forKey: id) else { return }
+    request.timeout?.cancel()
+    request.continuation.resume(throwing: CancellationError())
+  }
+
+  private func timeoutPending(id: Int, method: String) {
+    guard let request = pending.removeValue(forKey: id) else { return }
+    request.continuation.resume(throwing: JSONRPCTransportError.timedOut(method))
   }
 
   private func resolve(_ message: JSONRPCMessage) {
-    guard let id = message.id?.intValue, let continuation = pending.removeValue(forKey: id)
+    guard let id = message.id?.intValue, let request = pending.removeValue(forKey: id)
     else { return }
+    request.timeout?.cancel()
     if let error = message.error {
-      continuation.resume(throwing: error)
+      request.continuation.resume(throwing: error)
     } else {
-      continuation.resume(returning: message.result ?? .null)
+      request.continuation.resume(returning: message.result ?? .null)
     }
   }
 
@@ -427,8 +460,9 @@ public actor JSONRPCPeer {
     guard !closed else { return }
     closed = true
     reader?.cancel()
-    for continuation in pending.values {
-      continuation.resume(throwing: JSONRPCTransportError.closed)
+    for request in pending.values {
+      request.timeout?.cancel()
+      request.continuation.resume(throwing: JSONRPCTransportError.closed)
     }
     pending.removeAll()
   }
