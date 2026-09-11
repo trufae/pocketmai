@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shlex
 import signal
@@ -13,6 +14,8 @@ import sys
 import tempfile
 import termios
 import time
+
+PROMPT = re.compile(rb'pmai(?:#[0-9]+)?>')
 
 
 def main():
@@ -46,13 +49,13 @@ def main():
             os.write(master, data)
 
         def wait_for(text):
-            needle = text.encode()
+            needle = re.compile(re.escape(text.encode())) if isinstance(text, str) else text
             deadline = time.monotonic() + 15
-            while needle not in output:
+            while (match := needle.search(output)) is None:
                 assert time.monotonic() < deadline, (text, output.decode(errors='replace'))
                 if select.select([master], [], [], .1)[0]:
                     output.extend(os.read(master, 65536))
-            end = output.index(needle) + len(needle)
+            end = match.end()
             captured = bytes(output[:end])
             del output[:end]
             return captured
@@ -67,7 +70,7 @@ def main():
             command = shlex.join([binary, '--config', str(config), '--home',
                                   str(root / 'home'), '--no-stream', '--no-markdown'])
             send(command.encode() + b'\n')
-            wait_for('pmai>')
+            wait_for(PROMPT)
             job_pid = os.tcgetpgrp(master)
             assert job_pid != pid, 'pmai must have its own foreground process group'
 
@@ -85,14 +88,14 @@ def main():
                 fcntl.ioctl(master, termios.TIOCSWINSZ,
                             struct.pack('HHHH', 32 + cycle, 90 + cycle, 0, 0))
                 send(b'fg\n')
-                wait_for('pmai>')
+                wait_for(PROMPT)
                 raw = termios.tcgetattr(master)
                 assert not raw[3] & (termios.ICANON | termios.ECHO | termios.ISIG), raw
                 assert not raw[0] & (termios.ICRNL | termios.IXON), raw
                 # Editing and Enter must work, with the original draft retained.
                 send(b'x\x7f-ok\r')
                 wait_for(f'Hello from MaiCore: {prefix}-ok')
-                wait_for('pmai>')
+                wait_for(PROMPT)
 
             send(b'/exit\r')
             wait_for('SHELL_READY> ')
