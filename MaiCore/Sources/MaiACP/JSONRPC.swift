@@ -182,7 +182,11 @@ public final class StdioJSONRPCTransport: JSONRPCTransport, @unchecked Sendable 
   }
 
   public func messages() -> AsyncStream<JSONRPCMessage> {
-    let (result, created, shouldStart) = stateLock.withLock {
+    let state: (
+      stream: AsyncStream<JSONRPCMessage>,
+      created: AsyncStream<JSONRPCMessage>.Continuation?,
+      shouldStart: Bool
+    ) = stateLock.withLock {
       if let stream { return (stream, nil, false) }
       let (stream, continuation) = AsyncStream<JSONRPCMessage>.makeStream(
         bufferingPolicy: .unbounded)
@@ -190,12 +194,12 @@ public final class StdioJSONRPCTransport: JSONRPCTransport, @unchecked Sendable 
       self.continuation = continuation
       return (stream, continuation, !isClosed)
     }
-    if shouldStart {
+    if state.shouldStart {
       startReading()
     } else {
-      created?.finish()
+      state.created?.finish()
     }
-    return result
+    return state.stream
   }
 
   public func send(_ message: JSONRPCMessage) throws {
@@ -208,15 +212,16 @@ public final class StdioJSONRPCTransport: JSONRPCTransport, @unchecked Sendable 
   }
 
   public func close() {
-    let (shouldClose, pending) = stateLock.withLock {
-      guard !isClosed else { return (false, nil) }
-      isClosed = true
-      let pending = continuation
-      continuation = nil
-      return (true, pending)
-    }
-    guard shouldClose else { return }
-    pending?.finish()
+    let state: (shouldClose: Bool, pending: AsyncStream<JSONRPCMessage>.Continuation?) =
+      stateLock.withLock {
+        guard !isClosed else { return (false, nil) }
+        isClosed = true
+        let pending = continuation
+        continuation = nil
+        return (true, pending)
+      }
+    guard state.shouldClose else { return }
+    state.pending?.finish()
     try? input.close()
     // A sender holds this lock from the closed-state check through its write.
     // Closing the handle under the same lock prevents close/write races.
