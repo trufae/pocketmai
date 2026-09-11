@@ -123,7 +123,7 @@ struct MessageBubble: View {
   var renderImages: Bool = true
   var searchHighlight: MessageSearchMatch? = nil
   var isBookmarked: Bool = false
-  let onDelete: () -> Void
+  var onDelete: (() -> Void)? = nil
   var onToggleBookmark: (() -> Void)? = nil
   var onBeginSelection: (() -> Void)? = nil
   var onEdit: ((String) -> Void)? = nil
@@ -185,7 +185,7 @@ private struct StreamingMessageBubble: View {
   var renderImages: Bool = true
   var searchHighlight: MessageSearchMatch? = nil
   var isBookmarked: Bool = false
-  let onDelete: () -> Void
+  var onDelete: (() -> Void)? = nil
   var onToggleBookmark: (() -> Void)? = nil
   var onBeginSelection: (() -> Void)? = nil
   var onEdit: ((String) -> Void)? = nil
@@ -254,7 +254,7 @@ private struct MessageBubbleContent: View, Equatable {
   var renderImages: Bool = true
   var searchHighlight: MessageSearchMatch? = nil
   var isBookmarked: Bool = false
-  let onDelete: () -> Void
+  var onDelete: (() -> Void)? = nil
   var onToggleBookmark: (() -> Void)? = nil
   var onBeginSelection: (() -> Void)? = nil
   var onEdit: ((String) -> Void)? = nil
@@ -330,10 +330,12 @@ private struct MessageBubbleContent: View, Equatable {
             actionText: prepared.visibleText,
             includeMessageExtras: index == prepared.firstVisiblePartIndex
           )
-        case .tool(_, let entry):
+        case .tool(let partID, let entry, let section):
           ToolCallRow(
             entry: entry,
-            onEdit: toolEditAction(for: entry, partID: part.id, in: prepared))
+            onEdit: toolEditAction(for: entry, partID: partID, in: prepared),
+            onDelete: toolDeleteAction(
+              for: entry, section: section, partID: partID, in: prepared))
         case .reasoning(_, let section):
           if isStreaming && index == prepared.parts.count - 1
             && thinkingDisplay != .full && showThinking
@@ -374,7 +376,9 @@ private struct MessageBubbleContent: View, Equatable {
               initiallyExpanded: showThinking && thinkingDisplay == .full,
               italicContent: true,
               markdownAppearance: canRenderMarkdown ? appearance : nil,
-              renderImages: renderImages
+              renderImages: renderImages,
+              onDelete: hiddenSectionDeleteAction(
+                for: section, partID: part.id, in: prepared)
             )
           }
         case .transcript(_, let section):
@@ -620,7 +624,7 @@ private struct MessageBubbleContent: View, Equatable {
     // was built from rather than the first textual match.
     var occurrence = 0
     for part in prepared.parts {
-      guard case .tool(let id, let other) = part else { continue }
+      guard case .tool(let id, let other, _) = part else { continue }
       if id == partID { break }
       if other.rawBlock == entry.rawBlock { occurrence += 1 }
     }
@@ -631,6 +635,79 @@ private struct MessageBubbleContent: View, Equatable {
     return { edited in
       onEdit(rawText.replacingCharacters(in: range, with: edited))
     }
+  }
+
+  /// Deletes the selected tool row. A one-row wrapper is removed as a whole;
+  /// when a legacy wrapper contains several rows, only the exact row pressed
+  /// is removed and its siblings stay intact.
+  private func toolDeleteAction(
+    for entry: ToolEntry,
+    section: HiddenMessageSection,
+    partID: Int,
+    in prepared: PreparedMessageContent
+  ) -> (() -> Void)? {
+    guard let onEdit, !isLiveAssistantResponse, !entry.rawBlock.isEmpty else { return nil }
+    let rawText = displayText
+    let entries = ToolCallParser.parse(section.content)
+    if entries.count == 1,
+      let edited = removingHiddenSection(
+        section, partID: partID, in: prepared, rawText: rawText)
+    {
+      return { onEdit(edited) }
+    }
+
+    var occurrence = 0
+    for part in prepared.parts {
+      guard case .tool(let id, let other, _) = part else { continue }
+      if id == partID { break }
+      if other.rawBlock == entry.rawBlock { occurrence += 1 }
+    }
+    guard let range = Self.range(ofOccurrence: occurrence, of: entry.rawBlock, in: rawText)
+    else { return nil }
+    return { onEdit(rawText.replacingCharacters(in: range, with: "")) }
+  }
+
+  private func hiddenSectionDeleteAction(
+    for section: HiddenMessageSection,
+    partID: Int,
+    in prepared: PreparedMessageContent
+  ) -> (() -> Void)? {
+    guard let onEdit, !isLiveAssistantResponse,
+      let edited = removingHiddenSection(
+        section, partID: partID, in: prepared, rawText: displayText)
+    else { return nil }
+    return { onEdit(edited) }
+  }
+
+  private func removingHiddenSection(
+    _ section: HiddenMessageSection,
+    partID: Int,
+    in prepared: PreparedMessageContent,
+    rawText: String
+  ) -> String? {
+    var occurrence = 0
+    for part in prepared.parts {
+      let id: Int
+      let other: HiddenMessageSection
+      switch part {
+      case .tool(let candidateID, _, let candidate):
+        id = candidateID
+        other = candidate
+      case .reasoning(let candidateID, let candidate),
+        .transcript(let candidateID, let candidate):
+        id = candidateID
+        other = candidate
+      case .visible:
+        continue
+      }
+      if id == partID { break }
+      if other.tag == section.tag && other.content == section.content { occurrence += 1 }
+    }
+    return MessageContentFilter.removingHiddenSection(
+      tag: section.tag,
+      content: section.content,
+      occurrence: occurrence,
+      from: rawText)
   }
 
   private static func range(
@@ -757,10 +834,11 @@ private struct MessageBubbleContent: View, Equatable {
       }
     }
 
-    Divider()
-
-    Button(role: .destructive, action: onDelete) {
-      Label("Delete Message", systemImage: "trash")
+    if let onDelete {
+      Divider()
+      Button(role: .destructive, action: onDelete) {
+        Label("Delete Message", systemImage: "trash")
+      }
     }
   }
 
@@ -2179,13 +2257,14 @@ private struct PreparedMessageContent {
 
 private enum MessageRenderPart: Identifiable {
   case visible(id: Int, text: String)
-  case tool(id: Int, entry: ToolEntry)
+  case tool(id: Int, entry: ToolEntry, section: HiddenMessageSection)
   case reasoning(id: Int, section: HiddenMessageSection)
   case transcript(id: Int, section: HiddenMessageSection)
 
   var id: Int {
     switch self {
-    case .visible(let id, _), .tool(let id, _), .reasoning(let id, _), .transcript(let id, _):
+    case .visible(let id, _), .tool(let id, _, _), .reasoning(let id, _),
+      .transcript(let id, _):
       return id
     }
   }
@@ -2288,7 +2367,8 @@ private enum MessageRenderCache {
         switch section.tag {
         case "context", "tool_context", "tool_run":
           for entry in ToolCallParser.parse(section.content) {
-            parts.append(.tool(id: partIDOffset + parts.count, entry: entry))
+            parts.append(
+              .tool(id: partIDOffset + parts.count, entry: entry, section: section))
           }
         case "think":
           parts.append(.reasoning(id: partIDOffset + parts.count, section: section))
@@ -2549,6 +2629,7 @@ private struct FoldableMetaSection: View {
   var italicContent: Bool = false
   var markdownAppearance: AppearanceSettings? = nil
   var renderImages: Bool = true
+  var onDelete: (() -> Void)? = nil
 
   @State private var expanded: Bool = false
 
@@ -2561,7 +2642,8 @@ private struct FoldableMetaSection: View {
     initiallyExpanded: Bool = false,
     italicContent: Bool = false,
     markdownAppearance: AppearanceSettings? = nil,
-    renderImages: Bool = true
+    renderImages: Bool = true,
+    onDelete: (() -> Void)? = nil
   ) {
     self.title = title
     self.systemImage = systemImage
@@ -2572,6 +2654,7 @@ private struct FoldableMetaSection: View {
     self.italicContent = italicContent
     self.markdownAppearance = markdownAppearance
     self.renderImages = renderImages
+    self.onDelete = onDelete
     self._expanded = State(initialValue: initiallyExpanded)
   }
 
@@ -2629,6 +2712,24 @@ private struct FoldableMetaSection: View {
       RoundedRectangle(cornerRadius: 10, style: .continuous)
         .stroke(.secondary.opacity(0.18), lineWidth: 0.5)
     )
+    .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    .contextMenu {
+      Button {
+        UIPasteboard.general.string = content
+      } label: {
+        Label("Copy \(title)", systemImage: "doc.on.doc")
+      }
+      if let onDelete {
+        Divider()
+        Button(role: .destructive, action: onDelete) {
+          Label("Delete \(title)", systemImage: "trash")
+        }
+      }
+    } preview: {
+      Color.clear
+        .frame(width: 1, height: 1)
+        .accessibilityHidden(true)
+    }
     .onChange(of: initiallyExpanded) { _, expandedByDefault in
       expanded = expandedByDefault
     }
@@ -2684,6 +2785,7 @@ private struct ToolCallRow: View {
   /// Applies an edited tool block back onto the message. Nil while the response
   /// is still streaming, or when the message itself is not editable.
   var onEdit: ((String) -> Void)? = nil
+  var onDelete: (() -> Void)? = nil
   @State private var expanded = false
   @State private var previewDocument: ToolPreviewDocument?
 
@@ -2792,6 +2894,12 @@ private struct ToolCallRow: View {
         previewDocument = ToolPreviewDocument(title: "Output", text: entry.body)
       } label: {
         Label("View Output", systemImage: "doc.text.magnifyingglass")
+      }
+    }
+    if let onDelete {
+      Divider()
+      Button(role: .destructive, action: onDelete) {
+        Label("Delete Tool Call", systemImage: "trash")
       }
     }
   }

@@ -231,7 +231,7 @@ extension Conversation {
     self.init()
     id = chat.id
     title = chat.title
-    messages = chat.messages.map { ChatMessage(archive: $0) }
+    messages = ChatMessage.conversationMessages(from: chat.messages)
     createdAt = chat.createdAt
     updatedAt = chat.updatedAt
     modelID = chat.primaryAgent.model
@@ -278,7 +278,30 @@ extension Conversation {
 }
 
 extension ChatMessage {
-  init(archive message: AgentMessage) {
+  /// Adapts MaiCore's structured transcript to the tagged representation used
+  /// by PocketMai's regular conversation renderer. Native calls and their
+  /// results are paired so they appear as the same tool rows as calls made by
+  /// the foreground chat.
+  static func conversationMessages(from messages: [AgentMessage]) -> [ChatMessage] {
+    let callsByID = Dictionary(
+      messages.flatMap(\.toolCalls).map { ($0.id, $0) },
+      uniquingKeysWith: { _, latest in latest })
+    let completedCallIDs = Set(messages.flatMap(\.toolResults).map(\.callID))
+    return messages.compactMap { message in
+      let converted = ChatMessage(
+        agentMessage: message,
+        callsByID: callsByID,
+        completedCallIDs: completedCallIDs)
+      let hasText = !converted.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      return hasText || !converted.attachments.isEmpty ? converted : nil
+    }
+  }
+
+  private init(
+    agentMessage message: AgentMessage,
+    callsByID: [String: ToolCall],
+    completedCallIDs: Set<String>
+  ) {
     let role: ChatRole =
       switch message.role {
       case .user: .user
@@ -314,17 +337,24 @@ extension ChatMessage {
       case .resource(let resource):
         if let value = resource.text { text.append(value) }
       case .toolCall(let call):
-        let value = JSONValue.object([
-          "name": .string(call.name),
-          "arguments": call.arguments,
-        ])
-        text.append("<tool_call id=\"\(call.id)\">\(value.compactJSONString)</tool_call>")
+        if !completedCallIDs.contains(call.id) {
+          text.append(
+            AgentTooling.makeRunBlock(
+              toolName: call.name,
+              argumentsJSON: call.arguments.compactJSONString,
+              result: ""))
+        }
       case .toolResult(let result):
+        let call = callsByID[result.callID]
+        let output = result.text.isEmpty
+          ? result.structuredContent?.compactJSONString ?? ""
+          : result.text
         text.append(
           AgentTooling.makeRunBlock(
-            toolName: "tool",
-            argumentsJSON: "{\"callID\":\"\(result.callID)\"}",
-            result: result.text))
+            toolName: call?.name ?? "tool",
+            argumentsJSON: call?.arguments.compactJSONString
+              ?? "{\"callID\":\"\(result.callID)\"}",
+            result: output))
       }
     }
     self.init(

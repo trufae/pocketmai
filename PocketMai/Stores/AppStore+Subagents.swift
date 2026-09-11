@@ -217,6 +217,44 @@ extension AppStore {
     Task { await agentSupervisor.resume(pid) }
   }
 
+  /// Stops and removes one child subtree from both the live supervisor and
+  /// the conversation's durable records. Interrupting alone deliberately
+  /// keeps the transcript; deletion is the explicit destructive operation.
+  func deleteAgentProcess(_ pid: AgentPID, from conversationID: UUID?) {
+    guard let conversationID,
+      let selected = agentProcesses.first(where: { $0.pid == pid })
+    else { return }
+    Task {
+      let subtree = await agentSupervisor.tree().subtree(of: pid)
+      var deletedRunIDs = Set(subtree.map(\.runID))
+      deletedRunIDs.insert(selected.runID)
+      let stopped = await agentSupervisor.stop(pid, reason: "Deleted from the chat")
+      for victim in stopped.reversed() {
+        await agentSupervisor.forget(victim)
+      }
+      await refreshAgentProcesses()
+
+      guard let index = conversations.firstIndex(where: { $0.id == conversationID }) else {
+        return
+      }
+      // Include saved descendants that may already have fallen out of the
+      // supervisor's in-memory retention window.
+      var foundDescendant = true
+      while foundDescendant {
+        foundDescendant = false
+        for record in conversations[index].subagents
+        where record.parentRunID.map(deletedRunIDs.contains) == true {
+          if deletedRunIDs.insert(record.runID).inserted { foundDescendant = true }
+        }
+      }
+      let previousCount = conversations[index].subagents.count
+      conversations[index].subagents.removeAll { deletedRunIDs.contains($0.runID) }
+      if conversations[index].subagents.count != previousCount {
+        saveConversations()
+      }
+    }
+  }
+
   /// Queues a message a running child reads before its next model turn.
   func sendMessageToAgentProcess(_ pid: AgentPID, text: String) {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
