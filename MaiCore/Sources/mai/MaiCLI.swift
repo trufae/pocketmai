@@ -2203,7 +2203,7 @@ struct MaiCLI {
       }
       if !pending.isEmpty {
         await terminal.note(
-          "approved (pending.count) waiting tool call\(pending.count == 1 ? "" : "s"); YOLO mode is on")
+          "approved \(pending.count) waiting tool call\(pending.count == 1 ? "" : "s"); YOLO mode is on")
       }
     }
 
