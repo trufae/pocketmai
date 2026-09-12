@@ -20,6 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 requests = queue.Queue()
 release = threading.Event()
+model_requests = queue.Queue()
+models_release = threading.Event()
 
 
 class Provider(BaseHTTPRequestHandler):
@@ -42,6 +44,22 @@ class Provider(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def do_GET(self):
+        if self.path.endswith('/models'):
+            model_requests.put(self.path)
+            models_release.wait(30)
+            body = json.dumps({'data': [{'id': 'smoke', 'owned_by': 'test'}]}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        self.send_error(404)
 
 
 def main():
@@ -108,6 +126,17 @@ def main():
                         names = re.findall(r'(?m)^(/[a-z]+)\b', help_text)
                         assert len(names) > 20 and names == sorted(names), names
                         assert '/stop' in names and '/retry' not in names, names
+                        # Slash commands used to run inside the event loop, so
+                        # a stalled catalog request also stopped Ctrl+C and all
+                        # subsequent input. It must be a normal cancellable job.
+                        models_release.clear()
+                        send('/models\n')
+                        assert model_requests.get(timeout=20).endswith('/models')
+                        send('\x03')
+                        wait_for('cancelled /models')
+                        send('/help\n')
+                        wait_for('Input:')
+                        models_release.set()
                     send('slow\n')
                     assert user_texts() == ['slow']
                     send('queued note\n')
@@ -147,6 +176,7 @@ def main():
                     os.close(master)
     finally:
         release.set()
+        models_release.set()
         server.shutdown()
 
 

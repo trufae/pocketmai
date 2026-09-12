@@ -5,13 +5,19 @@ import MaiCore
 /// from turns ending, tools asking for approval, and the process table.
 enum REPLEvent: Sendable {
   case line(String, heredoc: Bool)
-  case interrupt
+  /// A non-nil ID means the signal/input path already cancelled that exact
+  /// operation. `endedInput` distinguishes a raw Ctrl+C byte from SIGINT.
+  case interrupt(REPLInterruptID?, endedInput: Bool)
   case endOfFile
   case turnFinished(Result<AgentResult, any Error>)
   case approval(ApprovalRequest, REPLApprovalReply)
   case supervisor(AgentSupervisorEvent)
   /// One-second UI refresh while the input reader is blocked on the terminal.
   case activityPulse
+}
+
+struct REPLInterruptID: Equatable, Hashable, Sendable {
+  let rawValue: UInt
 }
 
 /// Answers one approval a tool call is waiting on, exactly once.
@@ -55,14 +61,20 @@ final class REPLInputReader: @unchecked Sendable {
 
   private let editor: TerminalLineEditor
   private let continuation: AsyncStream<REPLEvent>.Continuation
+  private let interrupt: @Sendable () -> Void
   private let gate = DispatchSemaphore(value: 0)
   private let lock = NSLock()
   private var next = Prompt(text: "pmai> ", completions: [], separator: nil)
   private var stopped = false
 
-  init(editor: TerminalLineEditor, continuation: AsyncStream<REPLEvent>.Continuation) {
+  init(
+    editor: TerminalLineEditor,
+    continuation: AsyncStream<REPLEvent>.Continuation,
+    interrupt: @escaping @Sendable () -> Void
+  ) {
     self.editor = editor
     self.continuation = continuation
+    self.interrupt = interrupt
   }
 
   func start() {
@@ -95,7 +107,7 @@ final class REPLInputReader: @unchecked Sendable {
         return
       }
       if editor.wasInterrupted {
-        continuation.yield(.interrupt)
+        interrupt()
         continue
       }
       guard let delimiter = Self.heredocDelimiter(in: line) else {
@@ -110,7 +122,7 @@ final class REPLInputReader: @unchecked Sendable {
           return
         }
         if editor.wasInterrupted {
-          continuation.yield(.interrupt)
+          interrupt()
           break
         }
         if more == delimiter {
