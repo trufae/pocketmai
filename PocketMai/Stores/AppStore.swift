@@ -3435,6 +3435,21 @@ final class AppStore: ObservableObject {
     }
   }
 
+  func exportConversationHTML(
+    _ conversation: Conversation,
+    imageSize: AttachmentImageSize = .full
+  ) async -> URL? {
+    do {
+      let data = HTMLExport.data(for: try await exportDocument(conversation, imageSize: imageSize))
+      let url = try ConversationExportFiles.url(for: conversation, format: .html)
+      try data.write(to: url, options: .atomic)
+      return url
+    } catch {
+      errorMessage = "Could not export HTML: \(error.localizedDescription)"
+      return nil
+    }
+  }
+
   /// The shared export document, with every image the conversation shows
   /// fetched, rendered, and sized as requested.
   private func exportDocument(
@@ -3494,6 +3509,8 @@ final class AppStore: ObservableObject {
         conversation: exportable,
         format: format,
         content: export(conversation: exportable, format: format))
+    case .html:
+      return await exportConversationHTML(conversation, imageSize: imageSize)
     case .epub:
       return await exportConversationEPUB(conversation, imageSize: imageSize)
     case .docx:
@@ -5105,7 +5122,7 @@ final class AppStore: ObservableObject {
         return "{}"
       }
       return json
-    case .epub, .docx, .audio:
+    case .html, .epub, .docx, .audio:
       return ""
     }
   }

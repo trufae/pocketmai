@@ -290,6 +290,33 @@ enum FileWorkspaceService {
   private static let maxEditableFileBytes = 10_000_000
   private static let modelsFolderName = "Models"
 
+  /// Copies a user-picked file into the active workspace without replacing an
+  /// existing file. The caller already owns the picked file's bytes, so this
+  /// also works after its temporary security-scoped access has ended.
+  static func importFile(
+    data: Data,
+    filename: String,
+    in context: FileWorkspaceContext
+  ) throws -> URL {
+    let name = (filename as NSString).lastPathComponent
+    guard !name.isEmpty, name != ".", name != ".." else {
+      throw NSError.fileWorkspace("The imported file has no valid name.")
+    }
+    let copy: () throws -> URL = {
+      let fileManager = FileManager.default
+      var isDirectory: ObjCBool = false
+      guard fileManager.fileExists(atPath: context.rootURL.path, isDirectory: &isDirectory),
+        isDirectory.boolValue
+      else {
+        throw NSError.fileWorkspace("Working folder '\(context.displayName)' is not available.")
+      }
+      return try DocumentAttachmentImporter.copy(
+        data: data, filename: name, into: context.rootURL)
+    }
+    guard context.isSecurityScoped else { return try copy() }
+    return try WorkingFolderAccess.withAccess(to: context.rootURL, copy)
+  }
+
   /// Lists an index of a file with 1-based line numbers: function and type
   /// names for source code, headings for Markdown (including converted Word
   /// and PDF documents), and container keys for JSON.

@@ -50,7 +50,7 @@ func blockParserCoversCommonBlocks() {
   #expect(notes.map(\.text) == ["note"])
 }
 
-@Test("A chat exports to markdown, EPUB, DOCX and a JSON envelope that decodes back")
+@Test("A chat exports to markdown, HTML, EPUB, DOCX and a JSON envelope that decodes back")
 func chatExportsToEveryFormat() throws {
   let chat = sampleChat()
 
@@ -61,6 +61,15 @@ func chatExportsToEveryFormat() throws {
   #expect(markdown.contains("→ echo {\"text\":\"hi\"}"))
   #expect(markdown.contains("← result\nhi"))
   #expect(markdown.contains("*Attached image: dot.gif*"))
+
+  let html = String(
+    decoding: try ChatExport.data(for: chat, format: .html, generator: "pmai"),
+    as: UTF8.self)
+  #expect(html.hasPrefix("<!DOCTYPE html>"))
+  #expect(html.contains("<meta name=\"generator\" content=\"pmai\"/>"))
+  #expect(html.contains("<h1 class=\"role\">You</h1>"))
+  #expect(html.contains("<p>Hello <strong>there</strong></p>"))
+  #expect(html.contains("src=\"data:image/gif;base64,"))
 
   let epub = try ZipArchiveReader.entries(in: try ChatExport.data(for: chat, format: .epub, generator: "pmai"))
   #expect(epub.first?.path == "mimetype")
@@ -167,6 +176,7 @@ func exportNamesAndFormats() {
   chat.title = ""
   #expect(ChatExport.filename(for: chat, format: .epub) == "New chat.epub")
   #expect(ChatExportFormat(argument: "md") == .markdown)
+  #expect(ChatExportFormat(argument: "HTML") == .html)
   #expect(ChatExportFormat(argument: "Word") == .docx)
   #expect(ChatExportFormat(argument: "debug") == .debug)
   #expect(ChatExportFormat(argument: "pdf") == nil)

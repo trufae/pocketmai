@@ -150,8 +150,14 @@ public enum EPUBExport {
 
   // MARK: - Rendering
 
-  private struct HTMLRenderer {
+  struct HTMLRenderer {
     let catalog: ExportImageCatalog
+    let embedsImages: Bool
+
+    init(catalog: ExportImageCatalog, embedsImages: Bool = false) {
+      self.catalog = catalog
+      self.embedsImages = embedsImages
+    }
 
     func html(for entry: ExportEntry, entryIndex: Int, blocks: [MarkdownBlock]) -> String {
       var parts: [String] = []
@@ -259,7 +265,11 @@ public enum EPUBExport {
     }
 
     private func imageAttributes(_ resource: ExportResource, alt: String) -> String {
-      var attributes = "src=\"\(ExportXML.escaped(resource.href))\" alt=\"\(ExportXML.escaped(alt))\""
+      let source =
+        embedsImages
+        ? "data:\(resource.mediaType);base64,\(resource.data.base64EncodedString())"
+        : resource.href
+      var attributes = "src=\"\(ExportXML.escaped(source))\" alt=\"\(ExportXML.escaped(alt))\""
       if let width = resource.width, width > 0 { attributes += " width=\"\(width)\"" }
       if let height = resource.height, height > 0 { attributes += " height=\"\(height)\"" }
       return attributes
@@ -296,7 +306,7 @@ public enum EPUBExport {
     }
   }
 
-  private static let stylesCSS = """
+  static let stylesCSS = """
     body {
       color: #1f2328;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;

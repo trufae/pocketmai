@@ -65,7 +65,7 @@ public enum EPUBImporter {
     var chapters: [String] = []
     for path in manifest.readingOrder {
       guard let document = parts[path] else { continue }
-      let chapter = XHTMLParser().parse(document)
+      let chapter = HTMLToMarkdownParser().parse(document)
       guard !chapter.isEmpty else { continue }
       chapters.append(chapter)
     }
@@ -275,7 +275,7 @@ private final class PackageDelegate: NSObject, XMLParserDelegate {
 /// XMLParser reports balanced start/end pairs even for self-closing tags, so
 /// every element pushes its inline style and pops it again; unknown tags simply
 /// inherit the style around them.
-private final class XHTMLParser: NSObject, XMLParserDelegate {
+final class HTMLToMarkdownParser: NSObject, XMLParserDelegate {
   private struct RunStyle: Equatable {
     var bold = false
     var italic = false

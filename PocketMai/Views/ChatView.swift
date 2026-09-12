@@ -2582,7 +2582,9 @@ private struct ChatComposer: View {
   @State private var viewingPendingImageAttachment: ChatAttachment?
   @State private var pendingImageSizePrompt: PendingImageAttachmentImport?
   @State private var pendingPDFImport: PendingPDFImport?
+  @State private var pendingHTMLImport: PendingHTMLImport?
   @State private var attachmentConversionMessage: String?
+  @State private var attachmentNotice: String?
   @State private var attachmentError: String?
   @State private var promptAutocompleteSuppressedCommand: String?
   @State private var pendingPromptCompletion: String?
@@ -2707,6 +2709,21 @@ private struct ChatComposer: View {
         Button("Cancel", role: .cancel) { dismissPDFImport() }
       } message: { pending in
         Text("How should \(pending.name).pdf be attached?")
+      }
+      .confirmationDialog(
+        "Import HTML",
+        isPresented: htmlImportBinding,
+        titleVisibility: .visible,
+        presenting: pendingHTMLImport
+      ) { pending in
+        Button("Attach HTML Source") { attachHTML(pending, mode: .source) }
+        Button("Convert to Markdown") { attachHTML(pending, mode: .markdown) }
+        if store.currentConversation != nil {
+          Button("Copy to \(currentWorkspaceName)") { copyHTMLToWorkspace(pending) }
+        }
+        Button("Cancel", role: .cancel) { dismissHTMLImport() }
+      } message: { pending in
+        Text("Choose how to import \(pending.filename).")
       }
   }
 
@@ -2852,6 +2869,14 @@ private struct ChatComposer: View {
       })
   }
 
+  private var htmlImportBinding: Binding<Bool> {
+    Binding(
+      get: { pendingHTMLImport != nil },
+      set: { isPresented in
+        if !isPresented { dismissHTMLImport() }
+      })
+  }
+
   private func attachSharedImages(
     _ pending: PendingImageAttachmentImport,
     size: AttachmentImageSize
@@ -2885,6 +2910,60 @@ private struct ChatComposer: View {
     resumeSharedImportAfterAnswer()
   }
 
+  private func attachHTML(_ pending: PendingHTMLImport, mode: HTMLAttachmentMode) {
+    pendingHTMLImport = nil
+    if case .failed(let message) = appendDocumentAttachment(
+      data: pending.data,
+      filename: pending.filename,
+      mimeType: pending.mimeType,
+      htmlMode: mode)
+    {
+      attachmentError = message
+    }
+    resumeSharedImportAfterAnswer()
+  }
+
+  private func copyHTMLToWorkspace(_ pending: PendingHTMLImport) {
+    pendingHTMLImport = nil
+    defer { resumeSharedImportAfterAnswer() }
+    guard let conversation = store.currentConversation else {
+      attachmentError = "No chat is selected."
+      return
+    }
+    do {
+      let resolved = try FileWorkspaceTool.context(for: conversation, settings: store.settings)
+      if let bookmark = resolved.refreshedBookmarkData {
+        store.refreshWorkingFolderBookmark(
+          conversationID: conversation.id, bookmarkData: bookmark)
+      }
+      let destination = try FileWorkspaceService.importFile(
+        data: pending.data, filename: pending.filename, in: resolved.context)
+      showAttachmentNotice("Copied \(destination.lastPathComponent) to \(resolved.context.displayName).")
+    } catch {
+      attachmentError = error.localizedDescription
+    }
+  }
+
+  private func dismissHTMLImport() {
+    pendingHTMLImport = nil
+    resumeSharedImportAfterAnswer()
+  }
+
+  private var currentWorkspaceName: String {
+    guard let conversation = store.currentConversation else {
+      return FileWorkspaceService.defaultWorkspaceName
+    }
+    return store.workingFolderDisplayName(for: conversation)
+  }
+
+  private func showAttachmentNotice(_ message: String) {
+    attachmentNotice = message
+    Task { @MainActor in
+      try? await Task.sleep(for: .seconds(3))
+      if attachmentNotice == message { attachmentNotice = nil }
+    }
+  }
+
   private var textControls: some View {
     VStack(alignment: .leading, spacing: 6) {
       if let attachmentConversionMessage {
@@ -2896,6 +2975,12 @@ private struct ChatComposer: View {
             .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 34)
+      }
+      if let attachmentNotice {
+        Label(attachmentNotice, systemImage: "checkmark.circle.fill")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .padding(.horizontal, 34)
       }
       if !pendingAttachments.isEmpty {
         pendingAttachmentStrip
@@ -3691,23 +3776,10 @@ private struct ChatComposer: View {
 
   private static let textAttachmentByteLimit = 1_500_000
 
-  private static var documentAttachmentTypes: [UTType] {
-    var types: [UTType] = [.plainText, .text]
-    if let markdown = UTType(filenameExtension: "md") {
-      types.append(markdown)
-    }
-    if let word = UTType(filenameExtension: "docx")
-      ?? UTType("org.openxmlformats.wordprocessingml.document")
-    {
-      types.append(word)
-    }
-    types.append(.epub)
-    types.append(.json)
-    types.append(.pdf)
-    // A recording picked here is transcribed, then attached as its text.
-    types.append(contentsOf: AudioTranscriptionService.pickerContentTypes)
-    return types
-  }
+  /// Let Files offer any data file. MaiDocuments inspects its MIME type and
+  /// bytes after selection, accepting arbitrary UTF-8 source/text files and
+  /// rejecting unsupported binary data with a useful error.
+  private static let documentAttachmentTypes: [UTType] = [.data]
 
   private func importTextAttachment(_ result: Result<URL, Error>) {
     do {
@@ -3734,10 +3806,16 @@ private struct ChatComposer: View {
   /// reading either way, so it asks first and the caller waits for the answer.
   private func importDocument(at url: URL, filename: String) -> DocumentImportOutcome {
     do {
-      if (filename as NSString).pathExtension.lowercased() == "pdf" {
+      let data = try DocumentAttachmentImporter.data(at: url)
+      let mimeType = (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType)?
+        .preferredMIMEType
+      switch DocumentAttachmentImporter.kind(
+        for: data, filename: filename, mimeType: mimeType)
+      {
+      case .pdf:
         let pending = PendingPDFImport(
           name: (filename as NSString).deletingPathExtension,
-          data: try PDFImporter.data(at: url),
+          data: data,
           canAttachImages: canAttachImage)
         guard pending.canAttachImages else {
           convertPDFToMarkdown(pending)
@@ -3745,9 +3823,29 @@ private struct ChatComposer: View {
         }
         pendingPDFImport = pending
         return .awaitingAnswer
+      case .html:
+        pendingHTMLImport = PendingHTMLImport(
+          data: data, filename: filename, mimeType: mimeType)
+        return .awaitingAnswer
+      default:
+        break
       }
-      let data = try Data(contentsOf: url)
-      let imported = try DocumentAttachmentImporter.attachment(data: data, filename: filename)
+      return appendDocumentAttachment(data: data, filename: filename, mimeType: mimeType)
+    } catch {
+      return .failed(error.localizedDescription)
+    }
+  }
+
+  @discardableResult
+  private func appendDocumentAttachment(
+    data: Data,
+    filename: String,
+    mimeType: String?,
+    htmlMode: HTMLAttachmentMode = .source
+  ) -> DocumentImportOutcome {
+    do {
+      let imported = try DocumentAttachmentImporter.attachment(
+        data: data, filename: filename, mimeType: mimeType, htmlMode: htmlMode)
       guard case .file(let file) = imported.content, let text = file.text else {
         return .failed("\(filename) does not contain any text.")
       }
@@ -4254,6 +4352,12 @@ private struct PendingPDFImport {
   let name: String
   let data: Data
   let canAttachImages: Bool
+}
+
+private struct PendingHTMLImport {
+  let data: Data
+  let filename: String
+  let mimeType: String?
 }
 
 /// The importers run off the main actor, so their results travel as values.
