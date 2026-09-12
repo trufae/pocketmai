@@ -1032,6 +1032,7 @@ public actor AgentRuntime {
       } catch is ProviderEmptyResponseError where !retriesEmptyReply {
         throw ProviderEmptyReply()
       } catch {
+        let delayStarted = ContinuousClock.now
         let policy = liveRequests[pid]?.retry ?? retry
         guard attempt < policy.attempts else { throw error }
         attempt += 1
@@ -1040,11 +1041,39 @@ public actor AgentRuntime {
             context, attempt: attempt, limit: policy.attempts, delaySeconds: policy.delaySeconds,
             error: error.localizedDescription))
         await supervisor.note(pid, activity: "retrying")
-        if policy.delaySeconds > 0 {
-          try await Task.sleep(for: .seconds(policy.delaySeconds))
-        }
-        if await budget.deadlinePassed { throw RunDeadlineExceeded() }
+        let updatedPolicy = try await waitForRetry(
+          attempt: attempt,
+          started: delayStarted,
+          process: pid,
+          fallback: policy,
+          budget: budget)
+        // Lowering retry.attempts while the delay is in progress cancels the
+        // pending retry at once instead of making the run wait and call again.
+        guard attempt <= updatedPolicy.attempts else { throw error }
       }
+    }
+  }
+
+  /// Waits under the live retry policy. Changing retry.delay may shorten,
+  /// lengthen or remove a delay already in progress, and lowering the attempt
+  /// count stops a pending retry without an artificial wait.
+  private func waitForRetry(
+    attempt: Int,
+    started: ContinuousClock.Instant,
+    process pid: AgentPID,
+    fallback: AgentRetryPolicy,
+    budget: RunBudget
+  ) async throws -> AgentRetryPolicy {
+    while true {
+      let policy = liveRequests[pid]?.retry ?? fallback
+      if attempt > policy.attempts { return policy }
+      if await budget.deadlinePassed { throw RunDeadlineExceeded() }
+      if policy.delaySeconds <= 0
+        || ContinuousClock.now >= started + .seconds(policy.delaySeconds)
+      {
+        return policy
+      }
+      try await Task.sleep(for: .milliseconds(50))
     }
   }
 

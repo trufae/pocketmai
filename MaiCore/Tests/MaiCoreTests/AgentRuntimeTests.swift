@@ -2981,6 +2981,37 @@ func queuedRunningAgentReconfiguresWithoutRestarting() async throws {
   #expect(request.tools.map(\.name) == ["new-tool"])
 }
 
+@Test("Queued retry delay adopts live settings without waiting for the old delay")
+func queuedRetryDelayReconfiguresWithoutRestarting() async throws {
+  let provider = LiveSettingsProvider(
+    id: "live-retry",
+    responses: [ProviderResponse(message: .assistant("retried"), stopReason: .stop)],
+    failures: 1)
+  let runtime = AgentRuntime()
+  try await runtime.register(provider)
+  let pid = await runtime.allocateProcess(agentID: "main")
+  let initial = AgentRequest(
+    provider: "live-retry",
+    model: "fixture",
+    messages: [.user("retry")],
+    retry: AgentRetryPolicy(attempts: 1, delaySeconds: 30))
+  let task = Task { try await runtime.run(initial, process: pid) }
+  let watchdog = Task {
+    try? await Task.sleep(for: .seconds(2))
+    task.cancel()
+  }
+  #expect(await provider.waitForRequests(1))
+
+  var updated = initial
+  updated.retry.delaySeconds = 0
+  #expect(await runtime.reconfigure(pid, with: updated))
+
+  let result = try await task.value
+  watchdog.cancel()
+  #expect(result.response.text == "retried")
+  #expect(await provider.requests.count == 2)
+}
+
 @Test("agentToolGroup derived workers adopt live parent settings without restarting")
 func agentToolGroupDerivedSubagentReconfiguresWithParent() async throws {
   let provider = LiveSettingsProvider(
@@ -3046,14 +3077,21 @@ private actor LiveSettingsProvider: ChatProvider {
   nonisolated let descriptor: ProviderDescriptor
   private var responses: [ProviderResponse]
   private let blockedRequest: Int?
+  private var failures: Int
   private var blockedRequestReleased = false
   private(set) var requests: [ProviderRequest] = []
 
-  init(id: ProviderID, responses: [ProviderResponse], blockedRequest: Int? = nil) {
+  init(
+    id: ProviderID,
+    responses: [ProviderResponse],
+    blockedRequest: Int? = nil,
+    failures: Int = 0
+  ) {
     descriptor = ProviderDescriptor(
       id: id, displayName: id.rawValue, capabilities: [.streaming, .nativeToolCalling])
     self.responses = responses
     self.blockedRequest = blockedRequest
+    self.failures = failures
   }
 
   func complete(
@@ -3061,6 +3099,10 @@ private actor LiveSettingsProvider: ChatProvider {
     emit: @escaping ProviderEventHandler
   ) async throws -> ProviderResponse {
     requests.append(request)
+    if failures > 0 {
+      failures -= 1
+      throw TestError.missingResponse
+    }
     if let blockedRequest, requests.count == blockedRequest {
       while !blockedRequestReleased { try await Task.sleep(for: .milliseconds(5)) }
     }
