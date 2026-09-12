@@ -239,8 +239,9 @@ func deepSeekFlashAutomaticRequest() throws {
       ProviderRequest(
         model: "deepseek-flash", messages: [.user("Hi")], options: options, stream: false),
       model: "deepseek-flash")
-    return try #require(
-      JSONDecoder().decode(JSONValue.self, from: try #require(request.httpBody)).objectValue)
+    let data = try #require(request.httpBody)
+    let decoded = try JSONDecoder().decode(JSONValue.self, from: data)
+    return try #require(decoded.objectValue)
   }
 
   #expect(try body()["thinking"] == .object(["type": .string("disabled")]))
