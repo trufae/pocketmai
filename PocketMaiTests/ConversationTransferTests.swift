@@ -170,6 +170,40 @@ final class ConversationTransferTests: XCTestCase {
     XCTAssertEqual(decoded.chats?.first?.subagents, original.subagents)
   }
 
+  func testStructuredAgentTranscriptUsesRegularReasoningAndToolRows() throws {
+    let call = ToolCall(
+      id: "call-1",
+      name: "github_search",
+      arguments: .object(["query": .string("radare2")]))
+    let messages = [
+      AgentMessage(
+        id: "11111111-1111-1111-1111-111111111111",
+        role: .assistant,
+        content: [.reasoning("Find the repository."), .toolCall(call)]),
+      AgentMessage(
+        id: "22222222-2222-2222-2222-222222222222",
+        role: .tool,
+        content: [.toolResult(ToolResult(callID: call.id, text: "Found trufae/radare2"))]),
+      AgentMessage(
+        id: "33333333-3333-3333-3333-333333333333",
+        role: .assistant,
+        content: [.text("Done.")]),
+    ]
+
+    let rendered = ChatMessage.conversationMessages(from: messages)
+
+    XCTAssertEqual(rendered.map(\.role), [.assistant, .tool, .assistant])
+    XCTAssertEqual(
+      MessageContentFilter.render(rendered[0].text).hiddenSections.map(\.tag), ["think"])
+    let toolSection = try XCTUnwrap(
+      MessageContentFilter.render(rendered[1].text).hiddenSections.first)
+    let toolRow = try XCTUnwrap(ToolCallParser.parse(toolSection.content).first)
+    XCTAssertEqual(toolRow.name, call.name)
+    XCTAssertEqual(toolRow.params, #"{"query":"radare2"}"#)
+    XCTAssertEqual(toolRow.body, "Found trufae/radare2")
+    XCTAssertEqual(rendered[2].text, "Done.")
+  }
+
   func testPortableProviderAndMCPAdaptersPreserveSharedSettings() throws {
     let expiry = Date(timeIntervalSince1970: 1_700_000_600)
     let endpoint = OpenAIEndpoint(

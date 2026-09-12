@@ -110,6 +110,43 @@ public enum MessageContentFilter {
     return pieces.joined(separator: "\n\n")
   }
 
+  /// Removes one rendered hidden section without disturbing an identical block
+  /// elsewhere in the message. `occurrence` is counted only among sections with
+  /// the same tag and content, which lets a UI delete the exact reasoning or
+  /// tool row that was pressed.
+  public static func removingHiddenSection(
+    tag: String,
+    content: String,
+    occurrence: Int,
+    from text: String
+  ) -> String? {
+    guard occurrence >= 0 else { return nil }
+    let normalizedTag = tag.lowercased()
+    guard hiddenTagSet.contains(normalizedTag) else { return nil }
+
+    var cursor = text.startIndex
+    var remaining = occurrence
+    while let block = nextHiddenBlock(in: text, from: cursor, hiding: hiddenTagSet) {
+      cursor = block.range.upperBound
+      guard block.tag == normalizedTag,
+        block.content.map({ String(text[$0]) }) == content
+      else { continue }
+      if remaining > 0 {
+        remaining -= 1
+        continue
+      }
+
+      let before = text[..<block.range.lowerBound]
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      let after = text[block.range.upperBound...]
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      if before.isEmpty { return after }
+      if after.isEmpty { return before }
+      return "\(before)\n\n\(after)"
+    }
+    return nil
+  }
+
   /// Ranges of the hidden blocks, tags included, in the order they appear.
   private static func hiddenSpans(
     in text: String,

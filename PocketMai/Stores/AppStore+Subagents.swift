@@ -217,6 +217,28 @@ extension AppStore {
     Task { await agentSupervisor.resume(pid) }
   }
 
+  /// Stops and removes one child subtree from both the live supervisor and
+  /// the conversation's durable records. Interrupting alone deliberately
+  /// keeps the transcript; deletion is the explicit destructive operation.
+  func deleteAgentProcess(_ pid: AgentPID, from conversationID: UUID?) {
+    guard let conversationID,
+      let selected = agentProcesses.first(where: { $0.pid == pid })
+    else { return }
+    Task {
+      let subtree = await agentSupervisor.tree().subtree(of: pid)
+      var deletedRunIDs = Set(subtree.map(\.runID))
+      deletedRunIDs.insert(selected.runID)
+      let stopped = await agentSupervisor.stop(pid, reason: "Deleted from the chat")
+      for victim in stopped.reversed() {
+        await agentSupervisor.forget(victim)
+      }
+      await refreshAgentProcesses()
+
+      removeAgentProcessRecordSubtrees(
+        rootedAt: deletedRunIDs, from: conversationID)
+    }
+  }
+
   /// Queues a message a running child reads before its next model turn.
   func sendMessageToAgentProcess(_ pid: AgentPID, text: String) {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)

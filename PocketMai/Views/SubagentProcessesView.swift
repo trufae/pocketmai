@@ -74,6 +74,7 @@ struct SubagentProcessesSheet: View {
   @ObservedObject var storeObservation: AppStoreViewObservation
   let conversationID: UUID?
   @Environment(\.dismiss) private var dismiss
+  @State private var agentPendingDeletion: AgentProcessInfo?
 
   private var processes: [AgentProcessInfo] {
     store.agentChildren(of: conversationID)
@@ -94,7 +95,8 @@ struct SubagentProcessesSheet: View {
             ForEach(processes) { process in
               NavigationLink {
                 SubagentProcessDetailView(
-                  store: store, storeObservation: storeObservation, pid: process.pid)
+                  store: store, storeObservation: storeObservation,
+                  conversationID: conversationID, pid: process.pid)
               } label: {
                 SubagentProcessRow(process: process)
               }
@@ -120,6 +122,34 @@ struct SubagentProcessesSheet: View {
                     }
                     .tint(.orange)
                   }
+                }
+              }
+              .contextMenu {
+                if !process.state.isTerminal {
+                  if process.state == .paused {
+                    Button {
+                      store.resumeAgentProcess(process.pid)
+                    } label: {
+                      Label("Resume", systemImage: "play.fill")
+                    }
+                  } else {
+                    Button {
+                      store.pauseAgentProcess(process.pid)
+                    } label: {
+                      Label("Pause", systemImage: "pause.fill")
+                    }
+                  }
+                  Button(role: .destructive) {
+                    store.stopAgentProcess(process.pid)
+                  } label: {
+                    Label("Interrupt", systemImage: "stop.fill")
+                  }
+                  Divider()
+                }
+                Button(role: .destructive) {
+                  agentPendingDeletion = process
+                } label: {
+                  Label("Delete", systemImage: "trash")
                 }
               }
             }
@@ -153,6 +183,15 @@ struct SubagentProcessesSheet: View {
           }
           .accessibilityLabel("Agent actions")
         }
+      }
+      .alert(item: $agentPendingDeletion) { process in
+        Alert(
+          title: Text("Delete \(process.displayName)?"),
+          message: Text("Its transcript and any child agents will be deleted."),
+          primaryButton: .destructive(Text("Delete")) {
+            store.deleteAgentProcess(process.pid, from: conversationID)
+          },
+          secondaryButton: .cancel())
       }
     }
   }
@@ -256,12 +295,21 @@ struct SubagentStateBadge: View {
 struct SubagentProcessDetailView: View {
   let store: AppStore
   @ObservedObject var storeObservation: AppStoreViewObservation
+  let conversationID: UUID?
   let pid: AgentPID
   @State private var transcript: [AgentMessage] = []
   @State private var draft = ""
 
   private var process: AgentProcessInfo? {
     store.agentProcesses.first { $0.pid == pid }
+  }
+
+  private var conversation: Conversation? {
+    conversationID.flatMap { store.conversation(withID: $0) }
+  }
+
+  private var renderedTranscript: [ChatMessage] {
+    ChatMessage.conversationMessages(from: transcript)
   }
 
   var body: some View {
@@ -323,19 +371,27 @@ struct SubagentProcessDetailView: View {
           }
         }
         Section {
-          if transcript.isEmpty {
+          if renderedTranscript.isEmpty {
             Text("Nothing yet.")
               .foregroundStyle(.secondary)
           } else {
-            ForEach(Array(transcript.enumerated()), id: \.offset) { index, message in
-              VStack(alignment: .leading, spacing: 4) {
-                Text("\(index + 1) · \(message.role.rawValue)")
-                  .font(.caption.weight(.semibold))
-                  .foregroundStyle(.secondary)
-                Text(message.text)
-                  .font(.callout)
-                  .textSelection(.enabled)
-              }
+            ForEach(renderedTranscript) { message in
+              MessageBubble(
+                message: message,
+                toolSettings: store.effectiveToolSettings(for: conversation),
+                openAIEndpoints: store.settings.airplaneModeEnabled
+                  ? [] : store.settings.openAIEndpoints,
+                skipTechnicalContentInTTS: store.settings.conversation
+                  .skipTechnicalContentInTTS,
+                appearance: store.settings.appearance,
+                renderMarkdown: store.settings.renderMarkdownInChat,
+                renderImages: store.settings.renderMarkdownImagesInChat,
+                conversationCreatedAt: process.startedAt,
+                showThinking: store.effectiveShowThinking(for: conversation),
+                isWaitingForResponse: false)
+                .listRowInsets(EdgeInsets(top: 7, leading: 16, bottom: 7, trailing: 16))
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
             }
           }
         } header: {
