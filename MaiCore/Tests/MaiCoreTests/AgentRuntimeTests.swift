@@ -3095,7 +3095,10 @@ private actor LiveTreeProvider: ChatProvider {
         message: AgentMessage(role: .assistant, content: [
           .toolCall(ToolCall(
             id: "start", name: AgentRuntime.agentStartToolName,
-            arguments: .object(["task": .string("inspect")]))),
+            arguments: .object([
+              "task": .string("inspect"),
+              "output": .string("a short summary"),
+            ]))),
         ]),
         stopReason: .toolCall)
     }
