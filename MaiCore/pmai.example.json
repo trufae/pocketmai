@@ -186,8 +186,8 @@
       "toolCallingStrategy": "automatic",
       "useToolProxy": true,
       "limits": {
-        "maxModelTurns": 50,
-        "maxToolCalls": 100,
+        "maxModelTurns": 60,
+        "maxToolCalls": 50,
         "maxSubagents": 5,
         "maxSubagentDepth": 5
       },

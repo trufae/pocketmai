@@ -51,6 +51,24 @@ final class AgentProfileTests: XCTestCase {
     XCTAssertEqual(settings.agents[0].settings, AgentSettings())
   }
 
+  func testToolCallLimitDefaultsAndBoundsApplyToEveryAgent() throws {
+    XCTAssertEqual(AppSettings.defaultMaxToolCallsPerTurn, 50)
+    XCTAssertEqual(AgentSettings().maxToolCallsPerTurn, 50)
+    XCTAssertEqual(AppSettings().maxToolCallsPerTurn, 50)
+    XCTAssertEqual(AppSettings.clampedMaxToolCallsPerTurn(0), 1)
+    XCTAssertEqual(AppSettings.clampedMaxToolCallsPerTurn(100), 100)
+    XCTAssertEqual(AppSettings.clampedMaxToolCallsPerTurn(101), 100)
+
+    let decodedAgent = try JSONDecoder().decode(
+      AgentSettings.self, from: Data(#"{"maxToolCallsPerTurn":101}"#.utf8))
+    XCTAssertEqual(decodedAgent.maxToolCallsPerTurn, 100)
+
+    let decodedSettings = try JSONDecoder().decode(
+      AppSettings.self, from: Data(#"{"maxToolCallsPerTurn":101}"#.utf8))
+    XCTAssertEqual(decodedSettings.maxToolCallsPerTurn, 100)
+    XCTAssertEqual(decodedSettings.agents[0].settings.maxToolCallsPerTurn, 100)
+  }
+
   func testAgentSettingsRoundTripThroughTheLiveFields() {
     var settings = AppSettings.defaults
     let custom = customAgentSettings()

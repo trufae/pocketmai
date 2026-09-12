@@ -10408,8 +10408,8 @@ struct MaiCLI {
         -l, --list          list saved chats in this project and exit
         --markdown          render replies as markdown even when piped
         --max-subagents N   children an agent may run at once (default 5)
-        --max-tool-calls N  tool calls allowed per agent run (default 100)
-        --max-turns N       model turns allowed per agent run (default 50)
+        --max-tool-calls N  tool calls allowed per agent run (default 50)
+        --max-turns N       model turns allowed per agent run (default 60)
         --mcp               serve pmai as an MCP server on stdio (one prompt tool)
         --model NAME        override the selected model
         --no-markdown       print replies verbatim
