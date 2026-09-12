@@ -3014,25 +3014,7 @@ func queuedRetryDelayReconfiguresWithoutRestarting() async throws {
 
 @Test("agentToolGroup derived workers adopt live parent settings without restarting")
 func agentToolGroupDerivedSubagentReconfiguresWithParent() async throws {
-  let provider = LiveSettingsProvider(
-    id: "live-tree",
-    responses: [
-      ProviderResponse(
-        message: AgentMessage(role: .assistant, content: [
-          .toolCall(ToolCall(
-            id: "start", name: AgentRuntime.agentStartToolName,
-            arguments: .object(["task": .string("inspect")]))),
-        ]),
-        stopReason: .toolCall),
-      ProviderResponse(
-        message: AgentMessage(role: .assistant, content: [
-          .toolCall(ToolCall(id: "old", name: "old-tool", arguments: .object([:])))
-        ]),
-        stopReason: .toolCall),
-      ProviderResponse(message: .assistant("child done"), stopReason: .stop),
-      ProviderResponse(message: .assistant("parent done"), stopReason: .stop),
-    ],
-    blockedRequest: 2)
+  let provider = LiveTreeProvider()
   let runtime = AgentRuntime(approvalHandler: AllowAllApprovals())
   try await runtime.register(provider)
   try await runtime.register(
@@ -3053,7 +3035,7 @@ func agentToolGroupDerivedSubagentReconfiguresWithParent() async throws {
     toolGroupNames: [AgentRuntime.agentToolGroup.id],
     toolDelegation: .subagent)
   let task = Task { try await runtime.run(initial, process: pid) }
-  #expect(await provider.waitForRequests(2))
+  #expect(await provider.waitForFirstChildRequest())
 
   var updated = initial
   updated.model = "new-model"
@@ -3064,13 +3046,74 @@ func agentToolGroupDerivedSubagentReconfiguresWithParent() async throws {
 
   let result = try await task.value
   #expect(result.response.text == "parent done")
-  let requests = await provider.requests
-  #expect(requests.count == 4)
-  #expect(requests[2].model == "new-model")
-  #expect(requests[2].options.reasoningEffort == ReasoningEffort.high.rawValue)
-  #expect(Set(requests[2].tools.map(\.name)).contains("new-tool"))
-  #expect(!Set(requests[2].tools.map(\.name)).contains("old-tool"))
-  #expect(requests[3].model == "new-model")
+  let childRequests = await provider.childRequests
+  let parentRequests = await provider.parentRequests
+  #expect(childRequests.count == 2)
+  #expect(parentRequests.count == 2)
+  let refreshedChild = try #require(childRequests.last)
+  let refreshedParent = try #require(parentRequests.last)
+  #expect(refreshedChild.model == "new-model")
+  #expect(refreshedChild.options.reasoningEffort == ReasoningEffort.high.rawValue)
+  #expect(Set(refreshedChild.tools.map(\.name)).contains("new-tool"))
+  #expect(!Set(refreshedChild.tools.map(\.name)).contains("old-tool"))
+  #expect(refreshedParent.model == "new-model")
+}
+
+private actor LiveTreeProvider: ChatProvider {
+  nonisolated let descriptor = ProviderDescriptor(
+    id: "live-tree",
+    displayName: "Live tree",
+    capabilities: [.streaming, .nativeToolCalling])
+  private var firstChildReleased = false
+  private(set) var childRequests: [ProviderRequest] = []
+  private(set) var parentRequests: [ProviderRequest] = []
+
+  func complete(
+    _ request: ProviderRequest,
+    emit: @escaping ProviderEventHandler
+  ) async throws -> ProviderResponse {
+    let isChild = request.messages.contains {
+      $0.role == .user && $0.text.contains("## Task") && $0.text.contains("inspect")
+    }
+    if isChild {
+      childRequests.append(request)
+      if childRequests.count == 1 {
+        while !firstChildReleased { try await Task.sleep(for: .milliseconds(5)) }
+        return ProviderResponse(
+          message: AgentMessage(role: .assistant, content: [
+            .toolCall(ToolCall(id: "old", name: "old-tool", arguments: .object([:])))
+          ]),
+          stopReason: .toolCall)
+      }
+      await emit(.textDelta("child done"))
+      return ProviderResponse(message: .assistant("child done"), stopReason: .stop)
+    }
+
+    parentRequests.append(request)
+    if parentRequests.count == 1 {
+      return ProviderResponse(
+        message: AgentMessage(role: .assistant, content: [
+          .toolCall(ToolCall(
+            id: "start", name: AgentRuntime.agentStartToolName,
+            arguments: .object(["task": .string("inspect")]))),
+        ]),
+        stopReason: .toolCall)
+    }
+    await emit(.textDelta("parent done"))
+    return ProviderResponse(message: .assistant("parent done"), stopReason: .stop)
+  }
+
+  func waitForFirstChildRequest() async -> Bool {
+    for _ in 0..<1_000 {
+      if !childRequests.isEmpty { return true }
+      try? await Task.sleep(for: .milliseconds(5))
+    }
+    return false
+  }
+
+  func releaseBlockedRequest() {
+    firstChildReleased = true
+  }
 }
 
 private actor LiveSettingsProvider: ChatProvider {
