@@ -147,6 +147,11 @@ public actor AgentRuntime {
       liveRequests[pid] = request
       await runBudgets[pid]?.update(limits: request.limits)
     }
+    for pid in Array(derivedRuns.keys) {
+      guard let fallback = liveRequests[pid] else { continue }
+      let inherited = currentRequest(fallback, for: pid)
+      await runBudgets[pid]?.update(limits: inherited.limits)
+    }
   }
 
   /// Replaces the operational settings of a running process. The provider or
