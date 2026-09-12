@@ -15,6 +15,18 @@ private actor AdmissionRecorder {
   }
 }
 
+private actor DynamicLimit {
+  var value: Int
+
+  init(_ value: Int) {
+    self.value = value
+  }
+
+  func set(_ value: Int) {
+    self.value = value
+  }
+}
+
 private func childResult(_ text: String, agentID: String = "worker") -> AgentResult {
   AgentResult(
     runID: UUID(),
@@ -203,6 +215,49 @@ func queuedChildAndStop() async throws {
     callID: "c3", caller: parent, supervisor: supervisor)
   #expect(refused.isError)
   #expect(refused.text.contains("is not available: done"))
+}
+
+@Test("A queued child starts as soon as its dynamic limit is raised")
+func queuedChildStartsWhenDynamicLimitIsRaised() async throws {
+  let supervisor = AgentSupervisor()
+  let parent = await supervisor.register(
+    runID: UUID(), parent: nil, agentID: "main", task: "chat", depth: 0)
+  let first = await AgentProcessTools.register(
+    supervisor: supervisor, parent: parent, agentID: "worker", task: "one",
+    depth: 1, limit: 1)
+  let second = await AgentProcessTools.register(
+    supervisor: supervisor, parent: parent, agentID: "worker", task: "two",
+    depth: 1, limit: 1)
+  #expect(first.admitted)
+  #expect(!second.admitted)
+
+  let limit = DynamicLimit(1)
+  let task = Task {
+    try await AgentProcessTools.run(
+      second.pid,
+      supervisor: supervisor,
+      dynamicLimit: { await limit.value },
+      admitted: second.admitted,
+      background: false
+    ) {
+      childResult("second")
+    }
+  }
+  await supervisor.attach(task, to: second.pid)
+  let watchdog = Task {
+    try? await Task.sleep(for: .seconds(2))
+    task.cancel()
+  }
+
+  try await Task.sleep(for: .milliseconds(150))
+  #expect(await supervisor.info(second.pid)?.state == .queued)
+  await limit.set(2)
+  let result = try await task.value
+  watchdog.cancel()
+
+  #expect(result.response.text == "second")
+  #expect(await supervisor.info(second.pid)?.state == .completed)
+  await supervisor.stop(first.pid)
 }
 
 @Test("A host-driven process is completed between turns and reopened for the next")
