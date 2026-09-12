@@ -3025,6 +3025,8 @@ struct AppSettings: Codable, Equatable, Sendable {
   static let defaultMCPTools: Set<String> = []
   static let defaultMCPRequestTimeoutSeconds = 60
   static let mcpRequestTimeoutRange = 5...300
+  static let defaultMaxToolCallsPerTurn = 50
+  static let maxToolCallsPerTurnRange = 1...100
   static let defaultLLMRequestTimeoutSeconds = 600
   static let llmRequestTimeoutChoices = [60, 180, 300, 600, 900, 1800]
   static let defaultSystemPrompt = SystemPrompt(
@@ -3078,7 +3080,7 @@ struct AppSettings: Codable, Equatable, Sendable {
   var llmRequestTimeoutSeconds: Int = AppSettings.defaultLLMRequestTimeoutSeconds
   var memory: String = ""
   var toolCallingMode: ToolCallingMode = .text
-  var maxToolCallsPerTurn: Int = 8
+  var maxToolCallsPerTurn: Int = AppSettings.defaultMaxToolCallsPerTurn
   var yoloModeEnabled: Bool = true
   var useToolProxy: Bool = false
   var contextWindowMode: ContextWindowMode = .full
@@ -3117,6 +3119,10 @@ struct AppSettings: Codable, Equatable, Sendable {
 
   static func clampedMCPRequestTimeoutSeconds(_ seconds: Int) -> Int {
     min(mcpRequestTimeoutRange.upperBound, max(mcpRequestTimeoutRange.lowerBound, seconds))
+  }
+
+  static func clampedMaxToolCallsPerTurn(_ calls: Int) -> Int {
+    min(maxToolCallsPerTurnRange.upperBound, max(maxToolCallsPerTurnRange.lowerBound, calls))
   }
 
   static func normalizedLLMRequestTimeoutSeconds(_ seconds: Int) -> Int {
@@ -3337,8 +3343,9 @@ struct AppSettings: Codable, Equatable, Sendable {
     let migratedFromLegacyProxy = (storedMode == "proxy")
     toolCallingMode =
       ToolCallingMode(rawValue: storedMode) ?? .text
-    maxToolCallsPerTurn =
-      min(20, max(1, (try? c.decode(Int.self, forKey: .maxToolCallsPerTurn)) ?? 8))
+    maxToolCallsPerTurn = Self.clampedMaxToolCallsPerTurn(
+      (try? c.decode(Int.self, forKey: .maxToolCallsPerTurn))
+        ?? Self.defaultMaxToolCallsPerTurn)
     yoloModeEnabled =
       (try? c.decode(Bool.self, forKey: .yoloModeEnabled)) ?? true
     useToolProxy =

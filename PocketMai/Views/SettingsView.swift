@@ -637,7 +637,7 @@ struct SettingsView: View {
     Text("Applies to MCP tool calls, resource reads, and refreshes.")
       .font(.caption)
       .foregroundStyle(.secondary)
-    Stepper(value: settingsBinding(\.maxToolCallsPerTurn), in: 1...20) {
+    Stepper(value: settingsBinding(\.maxToolCallsPerTurn), in: AppSettings.maxToolCallsPerTurnRange) {
       Text("Max Tool Calls: \(store.settings.maxToolCallsPerTurn)")
     }
   }

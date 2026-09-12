@@ -20,7 +20,7 @@ struct AgentSettings: Codable, Equatable, Sendable {
   var mcpRequestTimeoutSeconds: Int = AppSettings.defaultMCPRequestTimeoutSeconds
   var llmRequestTimeoutSeconds: Int = AppSettings.defaultLLMRequestTimeoutSeconds
   var toolCallingMode: ToolCallingMode = .text
-  var maxToolCallsPerTurn: Int = 8
+  var maxToolCallsPerTurn: Int = AppSettings.defaultMaxToolCallsPerTurn
   var yoloModeEnabled: Bool = true
   var useToolProxy: Bool = false
   var contextWindowMode: ContextWindowMode = .full
@@ -78,8 +78,8 @@ struct AgentSettings: Codable, Equatable, Sendable {
         ?? defaults.llmRequestTimeoutSeconds)
     toolCallingMode =
       (try? c.decode(ToolCallingMode.self, forKey: .toolCallingMode)) ?? defaults.toolCallingMode
-    maxToolCallsPerTurn =
-      (try? c.decode(Int.self, forKey: .maxToolCallsPerTurn)) ?? defaults.maxToolCallsPerTurn
+    maxToolCallsPerTurn = AppSettings.clampedMaxToolCallsPerTurn(
+      (try? c.decode(Int.self, forKey: .maxToolCallsPerTurn)) ?? defaults.maxToolCallsPerTurn)
     yoloModeEnabled =
       (try? c.decode(Bool.self, forKey: .yoloModeEnabled)) ?? defaults.yoloModeEnabled
     useToolProxy = (try? c.decode(Bool.self, forKey: .useToolProxy)) ?? defaults.useToolProxy

@@ -1467,7 +1467,7 @@ enum AssistantToolLoop {
   }
 
   private static func maxToolCallsPerTurn(settings: AppSettings) -> Int {
-    min(20, max(1, settings.maxToolCallsPerTurn))
+    AppSettings.clampedMaxToolCallsPerTurn(settings.maxToolCallsPerTurn)
   }
 
   private static func maxRepairTurnsPerTurn(store: AppStore) -> Int {

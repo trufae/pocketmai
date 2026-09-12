@@ -753,6 +753,10 @@ public struct ProviderResponse: Codable, Equatable, Sendable {
 /// at its next turn boundary with `AgentResult.interruption` set and a
 /// transcript a host can continue from, so a long task is paused, not lost.
 public struct AgentRunLimits: Codable, Equatable, Sendable {
+  public static let defaultMaxToolCalls = 50
+  /// Text tool protocols use one model turn per call and still need a final reply.
+  public static let defaultMaxModelTurns = defaultMaxToolCalls + 10
+
   public var maxModelTurns: Int
   public var maxToolCalls: Int
   /// Children that may run at once. A child started past this number waits
@@ -765,8 +769,8 @@ public struct AgentRunLimits: Codable, Equatable, Sendable {
   public var maxSeconds: Int?
 
   public init(
-    maxModelTurns: Int = 50,
-    maxToolCalls: Int = 100,
+    maxModelTurns: Int = defaultMaxModelTurns,
+    maxToolCalls: Int = defaultMaxToolCalls,
     maxSubagents: Int = 5,
     maxSubagentDepth: Int = 5,
     maxTotalTokens: Int? = nil,
@@ -787,8 +791,10 @@ public struct AgentRunLimits: Codable, Equatable, Sendable {
   public init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     self.init(
-      maxModelTurns: try container.decodeIfPresent(Int.self, forKey: .maxModelTurns) ?? 50,
-      maxToolCalls: try container.decodeIfPresent(Int.self, forKey: .maxToolCalls) ?? 100,
+      maxModelTurns: try container.decodeIfPresent(Int.self, forKey: .maxModelTurns)
+        ?? Self.defaultMaxModelTurns,
+      maxToolCalls: try container.decodeIfPresent(Int.self, forKey: .maxToolCalls)
+        ?? Self.defaultMaxToolCalls,
       maxSubagents: try container.decodeIfPresent(Int.self, forKey: .maxSubagents) ?? 5,
       maxSubagentDepth: try container.decodeIfPresent(Int.self, forKey: .maxSubagentDepth) ?? 5,
       maxTotalTokens: try container.decodeIfPresent(Int.self, forKey: .maxTotalTokens),

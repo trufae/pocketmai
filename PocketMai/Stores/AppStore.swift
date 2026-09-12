@@ -5161,7 +5161,7 @@ final class AppStore: ObservableObject {
       let resolver = AgentToolNameResolver(tools: visibleDefinitions)
       return visibleDefinitions.map { resolver.apiName(for: $0.name) }
     }()
-    let maxToolCalls = min(20, max(1, settings.maxToolCallsPerTurn))
+    let maxToolCalls = AppSettings.clampedMaxToolCallsPerTurn(settings.maxToolCallsPerTurn)
     let maxRepairTurns = min(4, maxToolCalls + 1)
     let contextPrompt = context?.text ?? ""
     let requestContext = [contextPrompt, toolPrompt]
@@ -5919,7 +5919,7 @@ final class AppStore: ObservableObject {
       settings.toolCallingMode = mode
     }
     if let limit = payload.maxToolCallsPerTurn {
-      settings.maxToolCallsPerTurn = min(20, max(1, limit))
+      settings.maxToolCallsPerTurn = AppSettings.clampedMaxToolCallsPerTurn(limit)
     }
     if let yolo = payload.yoloModeEnabled {
       settings.yoloModeEnabled = yolo
