@@ -1461,7 +1461,11 @@ public actor AgentRuntime {
     // one line, or dropped — is the host's call, not the runtime's. The child
     // runs in a task of its own, so `agent_stop` kills a blocking child the
     // same way it kills a background one.
-    liveRequests[childPID] = childRequest
+    var liveChildRequest = childRequest
+    if start.agent != nil, let currentDefinition = agents[definition.id] {
+      liveChildRequest.applyRuntimeSettings(from: currentDefinition)
+    }
+    liveRequests[childPID] = liveChildRequest
     if let derived { derivedRuns[childPID] = derived }
     runBudgets[childPID] = childBudget
     let task = Task {
