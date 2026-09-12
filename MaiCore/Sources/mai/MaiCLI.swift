@@ -329,7 +329,7 @@ private final class ProviderBaseURLStore: @unchecked Sendable {
   }
 }
 
-private struct VisualBridge {
+private struct VisualBridge: Sendable {
   var approvalHandler: TerminalApprovalHandler
   var configurationPath: String?
   var implicitProviders: [ConfiguredProvider]
@@ -502,7 +502,7 @@ private final class MemoryState: @unchecked Sendable {
   }
 }
 
-struct SessionProfile {
+struct SessionProfile: Sendable {
   var agentID: String
   var displayName: String
   /// Carried through so writing the chat's agent back to the configuration
@@ -622,7 +622,7 @@ struct SessionProfile {
   }
 }
 
-struct REPLSession {
+struct REPLSession: Sendable {
   var id: UUID
   /// The session the chat presents to providers; see `ChatSession`.
   var sessionID: String
@@ -747,16 +747,19 @@ private final class TerminalInterruptHandler: @unchecked Sendable {
     private let source: DispatchSourceSignal
   #endif
   private let lock = NSLock()
-  private var cancellation: (@Sendable () -> Void)?
-  private var interrupted = false
+  private var nextID: UInt = 0
+  private var active: (REPLInterruptID, @Sendable () -> Void, reports: Bool)?
+  private var interrupted: Set<REPLInterruptID> = []
+  private let notify: @Sendable (REPLInterruptID?, Bool) -> Void
 
-  init() {
+  init(notify: @escaping @Sendable (REPLInterruptID?, Bool) -> Void) {
+    self.notify = notify
     #if os(Windows)
-      WindowsConsole.watchInterrupts { [weak self] in self?.interrupt() }
+      WindowsConsole.watchInterrupts { [weak self] in self?.requestInterrupt() }
     #else
       signal(SIGINT, SIG_IGN)
       source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
-      source.setEventHandler { [weak self] in self?.interrupt() }
+      source.setEventHandler { [weak self] in self?.requestInterrupt() }
       source.resume()
     #endif
   }
@@ -770,28 +773,50 @@ private final class TerminalInterruptHandler: @unchecked Sendable {
     #endif
   }
 
-  func activate(cancellation: @escaping @Sendable () -> Void) {
+  @discardableResult
+  func activate(
+    reports: Bool = true,
+    cancellation: @escaping @Sendable () -> Void
+  ) -> REPLInterruptID {
     lock.withLock {
-      interrupted = false
-      self.cancellation = cancellation
+      nextID &+= 1
+      let registration = REPLInterruptID(rawValue: nextID)
+      active = (registration, cancellation, reports)
+      return registration
     }
   }
 
-  func deactivate() {
-    lock.withLock { cancellation = nil }
+  /// Removes only the operation that registered this token. This prevents a
+  /// late completion from disabling Ctrl+C for the job that replaced it.
+  @discardableResult
+  func deactivate(_ registration: REPLInterruptID) -> Bool {
+    lock.withLock {
+      if active?.0 == registration { active = nil }
+      return interrupted.remove(registration) != nil
+    }
   }
 
-  func interruptedActiveOperation() -> Bool {
-    lock.withLock { interrupted }
+  func suspend(_ registration: REPLInterruptID) {
+    lock.withLock {
+      if active?.0 == registration { active = nil }
+    }
   }
 
-  private func interrupt() {
-    let action = lock.withLock { () -> (@Sendable () -> Void)? in
-      guard let cancellation else { return nil }
-      interrupted = true
-      return cancellation
+  func restore(
+    _ registration: REPLInterruptID,
+    cancellation: @escaping @Sendable () -> Void
+  ) {
+    lock.withLock { active = (registration, cancellation, true) }
+  }
+
+  func requestInterrupt(endedInput: Bool = false) {
+    let (action, registration, reports) = lock.withLock {
+      let operation = active
+      if let registration = operation?.0 { interrupted.insert(registration) }
+      return (operation?.1, operation?.0, operation?.reports ?? true)
     }
     action?()
+    if reports { notify(registration, endedInput) }
   }
 }
 
@@ -1531,6 +1556,7 @@ struct MaiCLI {
   /// back even after the person edited the chat or moved to another one.
   private struct REPLTurn {
     let task: Task<AgentResult, any Error>
+    let interrupt: REPLInterruptID
     let started: ContinuousClock.Instant
     let pid: AgentPID
     let kind: REPLTurnKind
@@ -1540,6 +1566,7 @@ struct MaiCLI {
 
   private struct REPLLoop {
     var activeTurn: REPLTurn?
+    var foregroundCommand: String?
     var focus: REPLMessageTarget = .main
     var approvals: [(request: ApprovalRequest, reply: REPLApprovalReply)] = []
     var editingApproval: (request: ApprovalRequest, reply: REPLApprovalReply)?
@@ -1567,6 +1594,16 @@ struct MaiCLI {
       self.configuration = configuration
       directory = FileManager.default.currentDirectoryPath
     }
+  }
+
+  /// The value state a slash command may change. Commands run on a child task
+  /// so Ctrl+C can cancel them while the event loop remains the sole owner of
+  /// the live REPL state.
+  private struct REPLCommandResult: Sendable {
+    var session: REPLSession
+    var configuration: MaiConfiguration?
+    var catalogs: [MCPServerCatalog]
+    var exits: Bool
   }
 
   /// What a chat holds once a run that started from `sent` comes back with
@@ -1608,7 +1645,6 @@ struct MaiCLI {
     var project = project
     var session = REPLSession(chat: workspace.selectedChat!)
     let editor = TerminalLineEditor(historyURL: historyURL)
-    let interruptHandler = TerminalInterruptHandler()
     var announcedAttention: Set<AgentPID> = []
     // One process per chat, not per turn: a background agent started three
     // turns ago is still the current run's child, so it stays collectable,
@@ -1632,7 +1668,13 @@ struct MaiCLI {
     }
 
     let (events, continuation) = AsyncStream<REPLEvent>.makeStream()
-    let reader = REPLInputReader(editor: editor, continuation: continuation)
+    let interruptHandler = TerminalInterruptHandler {
+      continuation.yield(.interrupt($0, endedInput: $1))
+    }
+    let reader = REPLInputReader(
+      editor: editor,
+      continuation: continuation,
+      interrupt: { interruptHandler.requestInterrupt(endedInput: true) })
     let screen = TerminalScreen()
     if let screen {
       screen.configure(ui: tintedUI(configuration?.ui ?? .init(), project: project))
@@ -1693,6 +1735,7 @@ struct MaiCLI {
           prefix + (activity.isEmpty || activity == "thinking" ? "thinking" : "running \(activity)")
         )
       }
+      if let command = loop.foregroundCommand { facts.append("running \(command)") }
       let children = await runtime.supervisor.liveProcesses().filter { $0.depth > 0 }
       if !children.isEmpty {
         let paused = children.filter { $0.state == .paused }.count
@@ -1835,10 +1878,10 @@ struct MaiCLI {
           await terminal.consume(event)
         }
       }
-      interruptHandler.activate { task.cancel() }
+      let interrupt = interruptHandler.activate { task.cancel() }
       activityWasInterrupted = false
       loop.activeTurn = REPLTurn(
-        task: task, started: ContinuousClock.now, pid: pid, kind: kind,
+        task: task, interrupt: interrupt, started: ContinuousClock.now, pid: pid, kind: kind,
         chatID: kind == .chat ? session.id : nil, sent: request.messages)
       Task {
         let outcome: Result<AgentResult, any Error>
@@ -1969,13 +2012,32 @@ struct MaiCLI {
     /// the command hands the tty to — an editor, a shell — keeps its own
     /// Ctrl+C instead of ending the run.
     func withTurnInterruptSetAside(_ body: () async -> Void) async {
-      guard let turn = loop.activeTurn else {
-        await body()
-        return
-      }
-      interruptHandler.deactivate()
+      let turn = loop.activeTurn
+      if let turn { interruptHandler.suspend(turn.interrupt) }
+      let shield = interruptHandler.activate(reports: false) {}
       await body()
-      interruptHandler.activate { turn.task.cancel() }
+      _ = interruptHandler.deactivate(shield)
+      if let turn { interruptHandler.restore(turn.interrupt) { turn.task.cancel() } }
+    }
+
+    /// Gives Ctrl+C to one non-interactive command, then restores a turn that
+    /// may still be streaming behind it. Its value state is applied by the
+    /// event loop only after the command ends.
+    func runForeground<Value: Sendable>(
+      _ name: String,
+      operation: @escaping @Sendable () async -> Value
+    ) async -> (value: Value, interrupted: Bool) {
+      let turn = loop.activeTurn
+      if let turn { interruptHandler.suspend(turn.interrupt) }
+      let task = Task { await operation() }
+      let interrupt = interruptHandler.activate { task.cancel() }
+      loop.foregroundCommand = name
+      if screen != nil { await releaseReader(workspace: workspace) }
+      let value = await task.value
+      let interrupted = interruptHandler.deactivate(interrupt)
+      loop.foregroundCommand = nil
+      if let turn { interruptHandler.restore(turn.interrupt) { turn.task.cancel() } }
+      return (value, interrupted)
     }
 
     /// After a command ran under a turn: says how what it changed meets the
@@ -2185,7 +2247,7 @@ struct MaiCLI {
         }
         if !heredoc, text == "/stop" {
           // Use the same event as Ctrl+C, including pending queue decisions.
-          continuation.yield(.interrupt)
+          interruptHandler.requestInterrupt()
           continue
         }
         if let pending = loop.pendingQueueMessage {
@@ -2295,14 +2357,17 @@ struct MaiCLI {
           }
           if name == "/prompts" {
             let before = REPLCommandSnapshot(session: session, configuration: configuration)
-            switch await handlePromptsCommand(
-              argument,
-              session: session,
-              configuration: &configuration,
-              configurationPath: visual.configurationPath,
-              skills: visual.skills.catalog,
-              terminal: terminal)
-            {
+            var outcome = PromptsCommandOutcome.handled
+            await withTurnInterruptSetAside {
+              outcome = await handlePromptsCommand(
+                argument,
+                session: session,
+                configuration: &configuration,
+                configurationPath: visual.configurationPath,
+                skills: visual.skills.catalog,
+                terminal: terminal)
+            }
+            switch outcome {
             case .handled:
               break
             case .send(let message, let title):
@@ -2440,19 +2505,49 @@ struct MaiCLI {
             }
           #endif
           var exits = false
-          await withTurnInterruptSetAside {
-            exits = await handleCommand(
-              text,
-              session: &session,
-              runtime: runtime,
-              plugins: plugins,
-              ocrProvider: ocrProvider,
-              configuration: &configuration,
-              catalogs: &catalogs,
-              visual: visual,
-              chatProcess: chatProcessIDs[session.id],
-              editor: editor,
-              terminal: terminal)
+          var commandWasInterrupted = false
+          let editsInTerminal =
+            ["/edit", "/attach", "/visual"].contains(name)
+            || argument.split(whereSeparator: \Character.isWhitespace).first?.lowercased() == "edit"
+          if editsInTerminal {
+            await withTurnInterruptSetAside {
+              exits = await handleCommand(
+                text,
+                session: &session,
+                runtime: runtime,
+                plugins: plugins,
+                ocrProvider: ocrProvider,
+                configuration: &configuration,
+                catalogs: &catalogs,
+                visual: visual,
+                chatProcess: chatProcessIDs[session.id],
+                editor: editor,
+                terminal: terminal)
+            }
+          } else {
+            let commandSession = session
+            let commandConfiguration = configuration
+            let commandCatalogs = catalogs
+            let commandChatProcess = chatProcessIDs[session.id]
+            let command = await runForeground(name) {
+              await runCommand(
+                text,
+                session: commandSession,
+                runtime: runtime,
+                plugins: plugins,
+                ocrProvider: ocrProvider,
+                configuration: commandConfiguration,
+                catalogs: commandCatalogs,
+                visual: visual,
+                chatProcess: commandChatProcess,
+                terminal: terminal)
+            }
+            commandWasInterrupted = command.interrupted
+            session = command.value.session
+            configuration = command.value.configuration
+            catalogs = command.value.catalogs
+            exits = command.value.exits
+            if commandWasInterrupted { await terminal.note("cancelled \(name)") }
           }
           if exits {
             loop.exiting = true
@@ -2473,22 +2568,27 @@ struct MaiCLI {
           await saveWorkspace(&workspace, store: store, terminal: terminal)
           await restoreSavedSubagents()
           await noteTurnEffects(since: before)
-          await releaseIfIdle(workspace: workspace)
+          // A cancellation has an ordered interrupt event waiting behind this
+          // command; that event releases exactly one prompt. Signalling here as
+          // well would leave an extra semaphore permit and start two readers.
+          if !commandWasInterrupted { await releaseIfIdle(workspace: workspace) }
           continue
         }
         await deliver(text, to: loop.focus)
         await releaseIfIdle(workspace: workspace)
 
-      case .interrupt:
-        loop.readerParked = true
+      case .interrupt(let cancelledOperation, let endedInput):
+        if endedInput { loop.readerParked = true }
         // Reflect Ctrl+C immediately, rather than waiting for a provider or
         // tool cancellation to make its way through the supervisor.
-        activityWasInterrupted = true
+        activityWasInterrupted = cancelledOperation == loop.activeTurn?.interrupt
         if loop.pendingQueueMessage != nil {
           loop.pendingQueueMessage = nil
           await terminal.note("New message cancelled; the queue is unchanged.")
-        } else if let turn = loop.activeTurn {
-          turn.task.cancel()
+        } else if cancelledOperation != nil {
+          // The input or signal path already cancelled exactly the operation
+          // that was active when Ctrl+C arrived. Do not let a delayed event
+          // cancel whatever became active afterwards.
         } else if let waiting = loop.approvals.first {
           loop.approvals.removeFirst()
           waiting.reply.fail(CancellationError())
@@ -2511,8 +2611,8 @@ struct MaiCLI {
         break events
 
       case .turnFinished(let outcome):
-        interruptHandler.deactivate()
         let turn = loop.activeTurn
+        let wasInterrupted = turn.map { interruptHandler.deactivate($0.interrupt) } ?? false
         loop.activeTurn = nil
         var succeeded = false
         var paused: AgentRunInterruption?
@@ -2526,8 +2626,7 @@ struct MaiCLI {
           succeeded = true
           paused = result.interruption
         case .failure(let error):
-          let cancelled =
-            error is CancellationError || interruptHandler.interruptedActiveOperation()
+          let cancelled = error is CancellationError || wasInterrupted
           if cancelled {
             await terminal.recoverAfterCancellation()
           } else {
@@ -2731,8 +2830,7 @@ struct MaiCLI {
     session: inout REPLSession,
     runtime: AgentRuntime,
     process: inout AgentPID?,
-    terminal: TerminalWriter,
-    interruptHandler: TerminalInterruptHandler? = nil
+    terminal: TerminalWriter
   ) async -> Bool {
     var content: [ContentPart] = [.text(text)]
     content.append(contentsOf: session.pendingContent)
@@ -2764,14 +2862,9 @@ struct MaiCLI {
         context: profile.context,
         sessionID: session.sessionID)
       let existingProcess = process
-      let task = Task {
-        try await runtime.run(request, process: existingProcess) { event in
-          await terminal.consume(event)
-        }
+      let result = try await runtime.run(request, process: existingProcess) { event in
+        await terminal.consume(event)
       }
-      interruptHandler?.activate { task.cancel() }
-      defer { interruptHandler?.deactivate() }
-      let result = try await task.value
       process = await runtime.supervisor.tree().processes.first { $0.runID == result.runID }?.pid
       session.history.replaceAll(with: result.transcript)
       if let interruption = result.interruption {
@@ -2781,7 +2874,7 @@ struct MaiCLI {
       }
       return true
     } catch {
-      if error is CancellationError || interruptHandler?.interruptedActiveOperation() == true {
+      if error is CancellationError {
         await terminal.recoverAfterCancellation()
         return false
       }
@@ -2917,6 +3010,39 @@ struct MaiCLI {
       return
     }
     await terminal.line(FileManager.default.currentDirectoryPath)
+  }
+
+  /// Runs the large command switch against copies. The event loop applies the
+  /// returned values once the task ends, keeping mutable REPL state in one
+  /// place while letting Ctrl+C cancel network and other cooperative waits.
+  private static func runCommand(
+    _ input: String,
+    session: REPLSession,
+    runtime: AgentRuntime,
+    plugins: PluginRegistry,
+    ocrProvider: any OCRProvider,
+    configuration: MaiConfiguration?,
+    catalogs: [MCPServerCatalog],
+    visual: VisualBridge,
+    chatProcess: AgentPID?,
+    terminal: TerminalWriter
+  ) async -> REPLCommandResult {
+    var session = session
+    var configuration = configuration
+    var catalogs = catalogs
+    let exits = await handleCommand(
+      input,
+      session: &session,
+      runtime: runtime,
+      plugins: plugins,
+      ocrProvider: ocrProvider,
+      configuration: &configuration,
+      catalogs: &catalogs,
+      visual: visual,
+      chatProcess: chatProcess,
+      terminal: terminal)
+    return REPLCommandResult(
+      session: session, configuration: configuration, catalogs: catalogs, exits: exits)
   }
 
   private static func handleCommand(
