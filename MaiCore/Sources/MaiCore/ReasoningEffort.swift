@@ -140,7 +140,12 @@ public enum ReasoningEffort: String, Codable, CaseIterable, Identifiable, Sendab
   }
 
   public func requestFields(family: APIFamily, model: String) -> [String: JSONValue] {
-    guard self != .automatic else { return [:] }
+    if self == .automatic {
+      // DeepSeek Flash otherwise enables thinking at high effort. Keep the
+      // normal pmai path fast and bounded; an explicit effort turns it back on.
+      guard family == .deepSeek, Self.isDeepSeekFlash(model) else { return [:] }
+      return ["thinking": .object(["type": .string("disabled")])]
+    }
     let enabled = self != .disabled
     switch family {
     case .kimi:
@@ -279,9 +284,13 @@ public enum ReasoningEffort: String, Codable, CaseIterable, Identifiable, Sendab
   public var id: String { rawValue }
 
   public func limitation(model: String, provider: String = "", baseURL: String = "") -> String? {
-    guard self != .automatic else { return nil }
     let family = APIFamily.detect(model: model, provider: provider, baseURL: baseURL)
     let name = model.lowercased()
+    if self == .automatic {
+      return family == .deepSeek && Self.isDeepSeekFlash(model)
+        ? "Thinking is off by default for DeepSeek Flash; choose Low or higher to enable it."
+        : nil
+    }
     if self != .disabled {
       if family == .minimax || family == .gemma
         || ((family == .kimi || family == .kimiLocal) && !name.contains("kimi-k3"))
@@ -331,12 +340,19 @@ public enum ReasoningEffort: String, Codable, CaseIterable, Identifiable, Sendab
     return name.contains("gemma4")
   }
 
-  /// These APIs require reasoning to continue tool calls, independently of display.
+  static func isDeepSeekFlash(_ model: String) -> Bool {
+    model.lowercased().contains("flash")
+  }
+
+  /// These APIs require reasoning history independently of display. DeepSeek
+  /// consumes it only when the request carries `tools`; without tools it is
+  /// ignored and needlessly enlarges the request.
   public static func requiresReasoningHistory(
-    model: String, provider: String = "", baseURL: String = ""
+    model: String, provider: String = "", baseURL: String = "", hasTools: Bool = true
   ) -> Bool {
     switch APIFamily.detect(model: model, provider: provider, baseURL: baseURL) {
-    case .deepSeek, .kimi, .kimiLocal, .minimax: true
+    case .deepSeek: hasTools
+    case .kimi, .kimiLocal, .minimax: true
     default: false
     }
   }

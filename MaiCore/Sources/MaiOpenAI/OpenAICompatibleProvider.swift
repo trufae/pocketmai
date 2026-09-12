@@ -197,9 +197,14 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       baseURL: configuration.baseURL.absoluteString)
     var body = request.options.additional
     body["model"] = .string(model)
+    let includesReasoningHistory = family != .deepSeek || !request.tools.isEmpty
     body["messages"] = .array(
       try ReasoningEffort.messages(request.messages, options: request.options, model: model)
-        .flatMap { try openAIMessages($0, resolver: resolver, family: family) })
+        .flatMap {
+          try openAIMessages(
+            $0, resolver: resolver, family: family,
+            includesReasoningHistory: includesReasoningHistory)
+        })
     body["stream"] = .bool(request.stream)
     if request.stream && request.options.includeStreamUsage {
       body["stream_options"] = .object(["include_usage": .bool(true)])
@@ -214,9 +219,17 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
     if let maxOutputTokens = request.options.maxOutputTokens {
       body["max_tokens"] = .integer(maxOutputTokens)
     }
-    if let reasoningEffort = request.options.reasoningEffort?.trimmingCharacters(
-      in: .whitespacesAndNewlines), !reasoningEffort.isEmpty
+    let reasoningEffort = request.options.reasoningEffort?.trimmingCharacters(
+      in: .whitespacesAndNewlines) ?? ""
+    if reasoningEffort.isEmpty,
+      request.options.additional["thinking"] == nil,
+      request.options.additional["reasoning_effort"] == nil
     {
+      for (key, value) in ReasoningEffort.automatic.requestFields(family: family, model: model)
+      where request.options.additional[key] == nil {
+        body[key] = value
+      }
+    } else {
       // One of our levels becomes whatever this endpoint's API family takes;
       // anything else is a value meant for the endpoint and goes as it is.
       // Fields set through `additional` are the person's own and stay.
@@ -498,7 +511,8 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
   private func openAIMessages(
     _ message: AgentMessage,
     resolver: ToolNameResolver,
-    family: ReasoningEffort.APIFamily
+    family: ReasoningEffort.APIFamily,
+    includesReasoningHistory: Bool
   ) throws -> [JSONValue] {
     if message.role == .tool || !message.toolResults.isEmpty {
       return try message.toolResults.map { result in
@@ -538,7 +552,7 @@ public final class OpenAICompatibleProvider: ChatProvider, @unchecked Sendable {
       }
     }
     object["content"] = visibleParts.isEmpty ? .null : try openAIContent(visibleParts)
-    if !message.reasoning.isEmpty {
+    if includesReasoningHistory, !message.reasoning.isEmpty {
       if family == .minimax {
         object["content"] = .string(ReasoningText.render(message.content))
       } else {

@@ -1,10293 +1,3685 @@
-import Foundation
-import MaiACP
-import MaiCore
-import MaiDocuments
-import MaiMCP
-import MaiMarkdown
-import MaiOpenAI
-import MaiPluginHost
-import MaiStandardTools
-import MaiVisionOCR
-
-#if PMAI_HAS_VISUAL
-  import MaiVisual
-#endif
-
-#if canImport(Android)
-  import Android
-#elseif canImport(Musl)
-  import Musl
-#elseif canImport(Glibc)
-  import Glibc
-#elseif canImport(Darwin)
-  import Darwin
-#endif
-
-@_silgen_name("system")
-private func posixSystem(_ command: UnsafePointer<CChar>) -> CInt
-
-/// Swift discovers argv from the initial process stack on ELF targets. The
-/// Play Store build of Termux preserves argv[0], inserts the executable at
-/// argv[1], and starts Android's linker. Bionic skips the preserved argv[0]
-/// before calling C main, but Swift still finds it on the initial stack.
-private func platformCommandLineArguments(environment: [String: String]) -> [String] {
-  var arguments = CommandLine.arguments
-  #if canImport(Android)
-    guard arguments.count >= 2 else { return arguments }
-
-    if environment["TERMUX_EXEC__PROC_SELF_EXE"] != nil {
-      arguments.removeFirst()
-    } else {
-      // Also support invoking the Android linker explicitly, outside the
-      // termux-exec wrapper.
-      let first = URL(fileURLWithPath: arguments[0]).lastPathComponent
-      if first == "linker" || first == "linker64" {
-        arguments.removeFirst()
-      }
-    }
-  #endif
-  return arguments
-}
-
-private struct CLIOptions {
-  var configPath: String?
-  /// Root holding the project index and shared state; nil follows PMAI_HOME or ~/.pmai.
-  var homePath: String?
-  /// Directory holding this project's chat files; nil uses .pmai/chats in the project.
-  var statePath: String?
-  var historyPath: String?
-  var agentOverride: String?
-  var providerOverride: ProviderID?
-  var modelOverride: String?
-  var baseURLOverride: URL?
-  var apiKeyOverride: String?
-  var systemOverride: String?
-  var maxToolCalls: Int?
-  var maxModelTurns: Int?
-  var maxSubagents: Int?
-  var stream = true
-  /// Permit all tool calls without prompting for this process.
-  var yolo = false
-  /// Reopen the most recently updated chat instead of starting a fresh one.
-  var resume = false
-  /// A chat list index, UUID prefix, or title to reopen.
-  var resumeSelector: String?
-  /// Render replies as markdown; nil follows the configuration and the tty.
-  var markdown: Bool?
-  var imagePaths: [String] = []
-  /// Attach what arrives on standard input as a text file, for one-liners
-  /// such as `git diff | pmai --stdin "review this"`.
-  var readStdin = false
-  var pluginPaths: [String] = []
-  var initialPrompt: String?
-  var printConfig = false
-  /// List every known project and exit.
-  var listProjects = false
-  /// List this project's saved chats and exit.
-  var listChats = false
-  /// Serve one protocol on stdio instead of the REPL.
-  var serve: ServeMode?
-
-  init(arguments: [String], environment: [String: String]) throws {
-    configPath = environment["PMAI_CONFIG"]
-    statePath = environment["PMAI_STATE"]
-    historyPath = environment["PMAI_HISTORY"]
-    var positional: [String] = []
-    var index = 0
-    while index < arguments.count {
-      let argument = arguments[index]
-      switch argument {
-      case "--config":
-        configPath = try Self.value(after: argument, in: arguments, index: &index)
-      case "--state":
-        statePath = try Self.value(after: argument, in: arguments, index: &index)
-      case "--history":
-        historyPath = try Self.value(after: argument, in: arguments, index: &index)
-      case "--home":
-        homePath = try Self.value(after: argument, in: arguments, index: &index)
-      case "--projects":
-        listProjects = true
-      case "-l", "--list":
-        listChats = true
-      case "--agent":
-        agentOverride = try Self.value(after: argument, in: arguments, index: &index)
-      case "--provider":
-        providerOverride = ProviderID(try Self.value(after: argument, in: arguments, index: &index))
-      case "--model":
-        modelOverride = try Self.value(after: argument, in: arguments, index: &index)
-      case "--base-url":
-        let value = try Self.value(after: argument, in: arguments, index: &index)
-        guard let url = URL(string: value) else { throw CLIError.invalidURL(value) }
-        baseURLOverride = url
-      case "--api-key":
-        apiKeyOverride = try Self.value(after: argument, in: arguments, index: &index)
-      case "--system":
-        systemOverride = try Self.value(after: argument, in: arguments, index: &index)
-      case "--max-tool-calls":
-        maxToolCalls = try Self.count(after: argument, in: arguments, index: &index)
-      case "--max-turns", "--max-model-turns":
-        maxModelTurns = try Self.count(after: argument, in: arguments, index: &index)
-      case "--max-subagents":
-        maxSubagents = try Self.count(after: argument, in: arguments, index: &index)
-      case "--image":
-        imagePaths.append(try Self.value(after: argument, in: arguments, index: &index))
-      case "--stdin":
-        readStdin = true
-      case "--plugin":
-        pluginPaths.append(try Self.value(after: argument, in: arguments, index: &index))
-      case "--no-stream":
-        stream = false
-      case "-y", "--yolo":
-        yolo = true
-      case "-r", "--resume", "--continue":
-        resume = true
-        if index + 1 < arguments.count, !arguments[index + 1].hasPrefix("-") {
-          index += 1
-          resumeSelector = arguments[index]
-        }
-      case "--markdown":
-        markdown = true
-      case "--no-markdown":
-        markdown = false
-      case "--print-config":
-        printConfig = true
-      case "--acp":
-        serve = .acp
-      case "--mcp":
-        serve = .mcp
-      default:
-        guard !argument.hasPrefix("-") else { throw CLIError.unknownOption(argument) }
-        positional.append(argument)
-      }
-      index += 1
-    }
-    if !positional.isEmpty { initialPrompt = positional.joined(separator: " ") }
-    if readStdin, serve != nil { throw CLIError.stdinServesProtocol }
-  }
-
-  private static func value(
-    after option: String,
-    in arguments: [String],
-    index: inout Int
-  ) throws -> String {
-    index += 1
-    guard index < arguments.count else { throw CLIError.missingValue(option) }
-    return arguments[index]
-  }
-
-  private static func count(
-    after option: String,
-    in arguments: [String],
-    index: inout Int
-  ) throws -> Int {
-    let raw = try value(after: option, in: arguments, index: &index)
-    guard let count = Int(raw), count >= 0 else { throw CLIError.invalidCount(option, raw) }
-    return count
-  }
-
-  /// Applies command-line run limits on top of a configured agent.
-  func applyLimitOverrides(to limits: inout AgentRunLimits) {
-    if let maxToolCalls { limits.maxToolCalls = max(0, maxToolCalls) }
-    if let maxModelTurns { limits.maxModelTurns = max(1, maxModelTurns) }
-    if let maxSubagents { limits.maxSubagents = max(0, maxSubagents) }
-  }
-}
-
-/// A protocol pmai speaks over stdio instead of running its REPL.
-enum ServeMode: String, Sendable {
-  case acp
-  case mcp
-}
-
-private enum CLIError: LocalizedError {
-  case invalidURL(String)
-  case missingValue(String)
-  case unknownOption(String)
-  case unknownChat(String)
-  case invalidCount(String, String)
-  case configNotFound(String)
-  case noProvider
-  case noProject
-  case invalidImage(String)
-  case isDirectory(String)
-  case missingFolder(String)
-  case stdinServesProtocol
-  case stdinWithoutTerminal
-  case apiKeySourcesConflict
-
-  var errorDescription: String? {
-    switch self {
-    case .noProject: "No project is open."
-    case .stdinServesProtocol:
-      "--stdin cannot be combined with --acp or --mcp: they own standard input."
-    case .apiKeySourcesConflict: "Set PMAI_API_KEY or PMAI_API_KEY_FILE, not both."
-    case .stdinWithoutTerminal:
-      "--stdin was read, but there is no terminal for the REPL; give the message on the command line."
-    case .invalidURL(let value): "Invalid URL: \(value)"
-    case .missingValue(let option): "Missing value after \(option)."
-    case .unknownOption(let option): "Unknown option: \(option)"
-    case .unknownChat(let selector): "No chat matches '\(selector)'. Run pmai -l to list chats."
-    case .invalidCount(let option, let value):
-      "\(option) expects a non-negative integer, got '\(value)'."
-    case .configNotFound(let path): "Configuration file not found: \(path)"
-    case .noProvider: "No provider is configured."
-    case .invalidImage(let path): "Unable to load image: \(path)"
-    case .isDirectory(let path): "\(path) is a folder; give a file name."
-    case .missingFolder(let path): "The folder \(path) does not exist; create it first."
-    }
-  }
-}
-
-private enum MCPCommandError: LocalizedError {
-  case missingID
-  case invalidID(String)
-  case duplicateID(String)
-  case missingCommand
-  case missingOptionValue(String)
-  case invalidOption(String)
-  case invalidEnvironment
-  case invalidTimeout
-  case invalidApproval
-  case unterminatedQuote
-  case danglingEscape
-
-  var errorDescription: String? {
-    switch self {
-    case .missingID: "Could not infer an MCP name from the command. Use --name ID."
-    case .invalidID(let id):
-      "Invalid MCP name '\(id)'. Start with a letter or number; "
-        + "then use letters, numbers, '.', '_', or '-'."
-    case .duplicateID(let id): "An MCP server named '\(id)' is already configured."
-    case .missingCommand: "The stdio MCP command is missing."
-    case .missingOptionValue(let option): "Missing value after \(option)."
-    case .invalidOption(let option): "Unknown MCP option '\(option)'."
-    case .invalidEnvironment: "--env expects KEY=VALUE."
-    case .invalidTimeout: "--timeout expects a positive number of seconds."
-    case .invalidApproval: "--approval expects automatic, confirm, or dangerous."
-    case .unterminatedQuote: "The command contains an unterminated quote."
-    case .danglingEscape: "The command ends with an incomplete escape."
-    }
-  }
-}
-
-private struct RuntimeSetup {
-  var catalogs: [MCPServerCatalog]
-  var implicitProviders: [ConfiguredProvider] = []
-  var providerBaseURLs: [String: URL] = [:]
-}
-
-private func environmentValue(
-  _ names: [String],
-  in environment: [String: String]
-) -> String? {
-  names.lazy.compactMap { environment[$0] }.first { !$0.isEmpty }
-}
-
-/// Unlike the other ad-hoc settings, an explicitly exported empty API key is
-/// meaningful: it suppresses lower-priority aliases and configured secrets.
-/// `PMAI_API_KEY_FILE` names a file holding the key instead, so the secret
-/// itself never sits in the environment; it excludes `PMAI_API_KEY`.
-private func environmentAPIKey(in environment: [String: String]) throws -> String? {
-  let keyFile =
-    environment["PMAI_API_KEY_FILE"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-  if !keyFile.isEmpty {
-    guard environment["PMAI_API_KEY"] == nil else { throw CLIError.apiKeySourcesConflict }
-    return try ConfiguredProvider.apiKey(fromFile: keyFile)
-  }
-  for name in ["PMAI_API_KEY", "MAI_API_KEY", "OPENAI_API_KEY"] {
-    if let value = environment[name] { return value }
-  }
-  return nil
-}
-
-private func environmentName(
-  _ names: [String],
-  in environment: [String: String]
-) -> String? {
-  names.first { environment[$0].map { !$0.isEmpty } ?? false }
-}
-
-/// What `/visual` needs beyond the REPL session itself.
-private final class ProviderBaseURLStore: @unchecked Sendable {
-  private let lock = NSLock()
-  private var urls: [String: URL]
-
-  init(_ urls: [String: URL]) {
-    self.urls = urls
-  }
-
-  func url(for providerID: String) -> URL? {
-    lock.withLock { urls[providerID] }
-  }
-
-  func set(_ url: URL, for providerID: String) {
-    lock.withLock { urls[providerID] = url }
-  }
-
-  func snapshot() -> [String: URL] {
-    lock.withLock { urls }
-  }
-}
-
-private struct VisualBridge {
-  var approvalHandler: TerminalApprovalHandler
-  var configurationPath: String?
-  var implicitProviders: [ConfiguredProvider]
-  var providerBaseURLs: ProviderBaseURLStore
-  var memory: MemoryState
-  var todo: TodoState
-  var skills: SkillState
-  /// Tokens/s and time in use per provider:model, shared with the runtime.
-  var usageStats: ModelUsageStore
-}
-
-/// Where the current project's todo list lives. The `todo_*` tools are
-/// registered before the project is opened, so they resolve the file through
-/// this box on every call; the file itself is the only copy, read fresh each
-/// time so edits made in an editor are seen at once.
-private final class TodoState: @unchecked Sendable {
-  private let lock = NSLock()
-  private let home: AgentHome
-  private var project: AgentProject?
-
-  init(home: AgentHome) {
-    self.home = home
-  }
-
-  func focus(project: AgentProject) {
-    lock.withLock { self.project = project }
-  }
-
-  var url: URL? {
-    lock.withLock { project.map { home.todoURL(for: $0) } }
-  }
-
-  var current: AgentTodoList {
-    url.flatMap { try? AgentTodoList.load(from: $0) } ?? AgentTodoList()
-  }
-
-  func save(_ list: AgentTodoList) throws {
-    guard let url else { throw CLIError.noProject }
-    try list.save(to: url)
-  }
-}
-
-/// Where skills are read from: the project's `.pmai/skills`, then the
-/// `skills` folder under the home. The `skills_*` tools are registered before
-/// the project is opened, so until then the start directory stands in for
-/// it; every listing and call reads the SKILL.md files afresh.
-private final class SkillState: @unchecked Sendable {
-  private let lock = NSLock()
-  private let home: AgentHome
-  private var project: AgentProject?
-
-  init(home: AgentHome) {
-    self.home = home
-  }
-
-  func focus(project: AgentProject) {
-    lock.withLock { self.project = project }
-  }
-
-  /// The project's directory first, so its skills shadow the home's.
-  var directories: [URL] {
-    let local =
-      lock.withLock { project.map { home.skillsURL(for: $0) } }
-      ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-      .appendingPathComponent(AgentHome.directoryName, isDirectory: true)
-      .appendingPathComponent(AgentHome.skillsDirectoryName, isDirectory: true)
-    return [local, userDirectory]
-  }
-
-  var userDirectory: URL { home.skillsDirectoryURL }
-
-  var catalog: AgentSkillCatalog { AgentSkillCatalog.load(directories: directories) }
-}
-
-/// Everything the memory feature needs that outlives one command: where the
-/// notes are stored, which chats the `chats_*` tools may reach, and how far.
-/// The REPL keeps it current; commands and tools read it.
-///
-/// The project arrives after the runtime is built, so the tools are registered
-/// against this box rather than against a project they cannot see yet.
-private final class MemoryState: @unchecked Sendable {
-  private let lock = NSLock()
-  private let home: AgentHome
-  private var project: AgentProject?
-  private var currentChatID: UUID?
-  private var memory = AgentMemory()
-  private var settings = ConfiguredMemory()
-
-  init(home: AgentHome) {
-    self.home = home
-  }
-
-  /// Adopts the project whose memory this is, loading its notes from disk.
-  func adopt(project: AgentProject, settings: ConfiguredMemory) {
-    lock.withLock {
-      self.project = project
-      self.settings = settings
-      memory = (try? AgentMemory.load(from: home.memoryURL(for: project))) ?? AgentMemory()
-    }
-  }
-
-  func focus(project: AgentProject, chatID: UUID?) {
-    lock.withLock {
-      self.project = project
-      currentChatID = chatID
-    }
-  }
-
-  func apply(_ settings: ConfiguredMemory) {
-    lock.withLock { self.settings = settings }
-  }
-
-  var current: AgentMemory { lock.withLock { memory } }
-  var configuration: ConfiguredMemory { lock.withLock { settings } }
-  var readsOtherChats: Bool { lock.withLock { settings.scope != .none } }
-
-  var url: URL? {
-    lock.withLock { project.map { home.memoryURL(for: $0) } }
-  }
-
-  /// What the runtime should inject, or nil when memory is off or empty.
-  var promptSection: String? {
-    lock.withLock { settings.enabled ? memory.promptSection : nil }
-  }
-
-  func save(_ updated: AgentMemory) throws {
-    let url = lock.withLock { () -> URL? in
-      memory = updated
-      return project.map { home.memoryURL(for: $0) }
-    }
-    guard let url else { throw CLIError.noProvider }
-    try updated.save(to: url)
-  }
-
-  func reload() {
-    lock.withLock {
-      guard let project else { return }
-      memory = (try? AgentMemory.load(from: home.memoryURL(for: project))) ?? AgentMemory()
-    }
-  }
-
-  /// Every chat in the current project, newest first, for `/memory learn --all`.
-  func projectChats() -> [MemoryChat] {
-    guard let project = lock.withLock({ project }) else { return [] }
-    return chats(of: project)
-  }
-
-  /// The chats the tools may read: never the one asking, and only this
-  /// project unless the scope opens every working directory.
-  func reachableChats() -> [MemoryChat] {
-    let (project, currentChatID, scope) = lock.withLock {
-      (self.project, self.currentChatID, settings.scope)
-    }
-    guard scope != .none, let project else { return [] }
-    var reachable = chats(of: project)
-    if scope == .all, let index = try? home.loadProjectIndex() {
-      for other in index.orderedProjects where other.id != project.id {
-        reachable += chats(of: other)
-      }
-    }
-    return reachable.filter { $0.id != currentChatID }
-      .sorted { $0.updatedAt > $1.updatedAt }
-  }
-
-  private func chats(of project: AgentProject) -> [MemoryChat] {
-    let chats = (try? home.chatStore(for: project).loadChats()) ?? []
-    return chats.filter(\.hasConversation)
-      .map { MemoryChat($0, scope: project.displayName) }
-      .sorted { $0.updatedAt > $1.updatedAt }
-  }
-}
-
-struct SessionProfile {
-  var agentID: String
-  var displayName: String
-  /// Carried through so writing the chat's agent back to the configuration
-  /// never erases the setup's purpose or its enabled state.
-  var description: String
-  var isEnabled: Bool
-  var provider: ProviderID
-  var model: String
-  var instructions: String
-  var systemPrompt: String?
-  var toolNames: Set<String>
-  var toolGroupNames: Set<String>
-  var subagentNames: Set<String>
-  var stream: Bool
-  var limits: AgentRunLimits
-  var toolChoice: ToolChoice
-  var responseFormat: ResponseFormat
-  var options: GenerationOptions
-  var toolCallingStrategy: ToolCallingStrategy
-  var useToolProxy: Bool
-  var proxyExposedTools: Set<String>?
-  var toolDelegation: AgentToolDelegation
-  var retry: AgentRetryPolicy
-  var autocompact: AgentAutocompact
-  var context: AgentContextMode
-
-  init(definition: AgentDefinition) {
-    agentID = definition.id
-    displayName = definition.displayName
-    description = definition.description
-    isEnabled = definition.isEnabled
-    provider = definition.provider
-    model = definition.model
-    instructions = definition.instructions
-    systemPrompt = definition.systemPrompt
-    toolNames = definition.toolNames
-    toolGroupNames = definition.toolGroupNames
-    subagentNames = definition.subagentNames
-    stream = definition.stream
-    limits = definition.limits
-    toolChoice = definition.toolChoice
-    responseFormat = definition.responseFormat
-    options = definition.options
-    toolCallingStrategy = definition.toolCallingStrategy
-    useToolProxy = definition.useToolProxy
-    proxyExposedTools = definition.proxyExposedTools
-    toolDelegation = definition.toolDelegation
-    retry = definition.retry
-    autocompact = definition.autocompact
-    context = definition.context
-  }
-
-  init(provider: ProviderID, model: String, instructions: String, stream: Bool) {
-    agentID = "main"
-    displayName = "main"
-    description = ""
-    isEnabled = true
-    self.provider = provider
-    self.model = model
-    self.instructions = instructions
-    systemPrompt = nil
-    toolNames = Set(
-      [
-        MaiEchoTool.name,
-        MaiCurrentTimeTool.name,
-        MaiCalculatorTool.name,
-        MaiWeatherTool.name,
-        MaiWebSearchTool.name,
-        MaiWebFetchTool.name,
-        MaiMastodonTool.name,
-      ] + MaiFileWorkspaceTool.toolNames + MaiRunTool.toolNames + MaiGitHubTool.toolNames
-        + MaiTodoTools.toolNames + MaiContextTools.toolNames)
-    toolGroupNames = [
-      "echo", "datetime", "calc", "files", "run", "weather", "web", "mastodon", "github", "todo",
-      "context", MaiSkillTools.groupID,
-    ]
-    subagentNames = []
-    self.stream = stream
-    limits = .init()
-    toolChoice = .automatic
-    responseFormat = .text
-    options = .init()
-    toolCallingStrategy = .automatic
-    useToolProxy = false
-    proxyExposedTools = nil
-    toolDelegation = .inline
-    retry = .init()
-    autocompact = .init()
-    context = .cache
-  }
-
-  var agentDefinition: AgentDefinition {
-    AgentDefinition(
-      id: agentID,
-      displayName: displayName,
-      description: description,
-      isEnabled: isEnabled,
-      instructions: instructions,
-      systemPrompt: systemPrompt,
-      provider: provider,
-      model: model,
-      toolNames: toolNames,
-      toolGroupNames: toolGroupNames,
-      subagentNames: subagentNames,
-      stream: stream,
-      limits: limits,
-      toolChoice: toolChoice,
-      responseFormat: responseFormat,
-      options: options,
-      toolCallingStrategy: toolCallingStrategy,
-      useToolProxy: useToolProxy,
-      proxyExposedTools: proxyExposedTools,
-      toolDelegation: toolDelegation,
-      retry: retry,
-      autocompact: autocompact,
-      context: context)
-  }
-}
-
-struct REPLSession {
-  var id: UUID
-  /// The session the chat presents to providers; see `ChatSession`.
-  var sessionID: String
-  var title: String
-  var profile: SessionProfile
-  var history: AgentTranscript
-  var pendingContent: [ContentPart]
-  var createdAt: Date
-  var updatedAt: Date
-  var isArchived: Bool
-  /// The agents this chat's runs started, with their transcripts, as saved
-  /// with the chat. The REPL brings them up to date from the supervisor as
-  /// runs end and puts them back in the process table when the chat is
-  /// reopened, so `/agents tree` and `/agents log` outlive the session.
-  var subagents: [AgentProcessRecord]
-  #if PMAI_HAS_VISUAL
-    /// Conversations and panes left behind by the last `/visual` session.
-    var visualSnapshot: VisualWorkspaceSnapshot?
-  #endif
-
-  init(
-    id: UUID = UUID(),
-    title: String? = nil,
-    profile: SessionProfile,
-    pendingContent: [ContentPart] = [],
-    createdAt: Date = Date(),
-    updatedAt: Date = Date(),
-    sessionID: String? = nil
-  ) {
-    self.id = id
-    self.sessionID = sessionID ?? ChatSession.newID()
-    self.title = title ?? profile.agentID
-    self.profile = profile
-    history = AgentTranscript(messages: Self.initialHistory(for: profile))
-    self.pendingContent = pendingContent
-    self.createdAt = createdAt
-    self.updatedAt = updatedAt
-    isArchived = false
-    subagents = []
-  }
-
-  init(chat: AgentChat) {
-    id = chat.id
-    sessionID = chat.sessionID
-    title = chat.title
-    profile = SessionProfile(definition: chat.primaryAgent)
-    history = AgentTranscript(messages: chat.messages)
-    pendingContent = chat.pendingContent
-    createdAt = chat.createdAt
-    updatedAt = chat.updatedAt
-    isArchived = chat.isArchived
-    subagents = chat.subagents
-  }
-
-  var chat: AgentChat {
-    AgentChat(
-      id: id,
-      title: title,
-      primaryAgent: profile.agentDefinition,
-      messages: history.messages,
-      pendingContent: pendingContent,
-      createdAt: createdAt,
-      updatedAt: updatedAt,
-      isArchived: isArchived,
-      sessionID: sessionID,
-      subagents: subagents)
-  }
-
-  /// Names a placeholder chat after its first message; chosen titles stay.
-  mutating func refreshTitle(from text: String) {
-    let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard trimmed.isEmpty || trimmed == AgentChat.placeholderTitle,
-      let derived = AgentChat.derivedTitle(from: text)
-    else { return }
-    title = derived
-  }
-
-  /// A cleared conversation keeps nothing of its runs: the agents they
-  /// started go with the messages.
-  mutating func reset(profile: SessionProfile? = nil) {
-    if let profile { self.profile = profile }
-    history.replaceAll(with: Self.initialHistory(for: self.profile))
-    pendingContent.removeAll()
-    subagents.removeAll()
-    touch()
-  }
-
-  mutating func touch() {
-    updatedAt = Date()
-  }
-
-  #if PMAI_HAS_VISUAL
-    func visualSeed() -> VisualConversationSeed {
-      VisualConversationSeed(
-        id: id,
-        title: title,
-        profile: profile.agentDefinition,
-        messages: history.messages,
-        pendingContent: pendingContent,
-        sessionID: sessionID)
-    }
-
-    mutating func adopt(_ conversation: VisualConversationSeed) {
-      id = conversation.id
-      sessionID = conversation.sessionID
-      title = conversation.title
-      profile = SessionProfile(definition: conversation.profile)
-      history.replaceAll(with: conversation.messages)
-      pendingContent = conversation.pendingContent
-      touch()
-    }
-  #endif
-
-  private static func initialHistory(for profile: SessionProfile) -> [AgentMessage] {
-    let instructions = profile.instructions.trimmingCharacters(in: .whitespacesAndNewlines)
-    return instructions.isEmpty ? [] : [.system(instructions)]
-  }
-}
-
-private final class TerminalInterruptHandler: @unchecked Sendable {
-  #if !os(Windows)
-    private let source: DispatchSourceSignal
-  #endif
-  private let lock = NSLock()
-  private var cancellation: (@Sendable () -> Void)?
-  private var interrupted = false
-
-  init() {
-    #if os(Windows)
-      WindowsConsole.watchInterrupts { [weak self] in self?.interrupt() }
-    #else
-      signal(SIGINT, SIG_IGN)
-      source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
-      source.setEventHandler { [weak self] in self?.interrupt() }
-      source.resume()
-    #endif
-  }
-
-  deinit {
-    #if os(Windows)
-      WindowsConsole.watchInterrupts(nil)
-    #else
-      source.cancel()
-      signal(SIGINT, SIG_DFL)
-    #endif
-  }
-
-  func activate(cancellation: @escaping @Sendable () -> Void) {
-    lock.withLock {
-      interrupted = false
-      self.cancellation = cancellation
-    }
-  }
-
-  func deactivate() {
-    lock.withLock { cancellation = nil }
-  }
-
-  func interruptedActiveOperation() -> Bool {
-    lock.withLock { interrupted }
-  }
-
-  private func interrupt() {
-    let action = lock.withLock { () -> (@Sendable () -> Void)? in
-      guard let cancellation else { return nil }
-      interrupted = true
-      return cancellation
-    }
-    action?()
-  }
-}
-
-private actor TerminalApprovalHandler: ApprovalHandler {
-  typealias Prompter = @Sendable (ApprovalRequest) async throws -> ApprovalDecision
-
-  private let configuration: ConfiguredApprovals
-  private var delegate: (any ApprovalHandler)?
-  private var yoloEnabled: Bool
-  /// Asks through the REPL's own prompt while the persistent screen owns the
-  /// terminal, so a question from a child agent never fights the line editor
-  /// for stdin.
-  private var prompter: Prompter?
-
-  init(configuration: ConfiguredApprovals, yoloEnabled: Bool = false) {
-    self.configuration = configuration
-    self.yoloEnabled = yoloEnabled
-  }
-
-  /// Routes `ask` decisions elsewhere while another surface owns the terminal.
-  func setDelegate(_ handler: (any ApprovalHandler)?) {
-    delegate = handler
-  }
-
-  func setYOLOEnabled(_ enabled: Bool) {
-    yoloEnabled = enabled
-  }
-
-  func isYOLOEnabled() -> Bool {
-    yoloEnabled
-  }
-
-  func setPrompter(_ prompter: Prompter?) {
-    self.prompter = prompter
-  }
-
-  func decide(_ request: ApprovalRequest) async throws -> ApprovalDecision {
-    if yoloEnabled {
-      return .approve(arguments: request.call.arguments)
-    }
-    let mode =
-      request.tool.annotations.approval == .dangerous
-      ? configuration.dangerous : configuration.confirm
-    switch mode {
-    case .allow:
-      return .approve(arguments: request.call.arguments)
-    case .deny:
-      return .deny(reason: "Denied by configuration.")
-    case .ask:
-      if let delegate { return try await delegate.decide(request) }
-      if let prompter { return try await prompter(request) }
-      guard isatty(STDIN_FILENO) != 0 else {
-        return .deny(reason: "Interactive approval requires a terminal.")
-      }
-      FileHandle.standardError.write(
-        Data(
-          "Approve \(request.tool.annotations.approval.rawValue) tool '\(request.tool.name)'?\nArguments: \(request.call.arguments.compactJSONString)\n"
-            .utf8))
-      let editor = TerminalLineEditor()
-      editor.configure(
-        ui: ConfiguredTerminalUI(backgroundLine: "", promptForeground: "yellow"))
-      guard
-        let answer = editor.readLine(
-          prompt: "[y]es/[a]lways/[n]o/[e]dit/[c]ancel run: ", completions: [])?
-          .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-      else { return .deny(reason: "No approval response.") }
-      if editor.wasInterrupted { throw CancellationError() }
-      switch answer {
-      case "y", "yes":
-        return .approve(arguments: request.call.arguments)
-      case "a", "always":
-        yoloEnabled = true
-        return .approve(arguments: request.call.arguments)
-      case "e", "edit":
-        FileHandle.standardError.write(Data("Replacement JSON arguments: ".utf8))
-        guard let raw = readLine(), let data = raw.data(using: .utf8),
-          let value = try? JSONDecoder().decode(JSONValue.self, from: data),
-          value.objectValue != nil
-        else { return .deny(reason: "Edited arguments were not a JSON object.") }
-        return .approve(arguments: value)
-      case "c", "cancel":
-        return .cancelRun
-      default:
-        return .deny(reason: "Denied by user.")
-      }
-    }
-  }
-}
-
-@main
-struct MaiCLI {
-  private static let version = "1.7.5"
-
-  static func main() async {
-    let environment = ProcessInfo.processInfo.environment
-    let commandLineArguments = platformCommandLineArguments(environment: environment)
-    if commandLineArguments.dropFirst().contains(where: { $0 == "--help" || $0 == "-h" }) {
-      printUsage()
-      return
-    }
-    if commandLineArguments.dropFirst().contains(where: { $0 == "--version" || $0 == "-v" }) {
-      print(version)
-      return
-    }
-
-    do {
-      let options = try CLIOptions(
-        arguments: Array(commandLineArguments.dropFirst()),
-        environment: environment)
-      if options.printConfig {
-        FileHandle.standardOutput.write(try sampleConfiguration().encoded())
-        FileHandle.standardOutput.write(Data("\n".utf8))
-        return
-      }
-      if options.listProjects {
-        let home = resolvedHome(options: options, environment: environment)
-        print(projectListing(try home.loadProjectIndex(), currentID: nil, now: Date()))
-        return
-      }
-      if options.listChats {
-        let home = resolvedHome(options: options, environment: environment)
-        let project = try home.openProject(
-          atWorkingDirectory: URL(
-            fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true))
-        let store = resolvedChatStore(
-          options: options, home: home, project: project, environment: environment)
-        let workspace = try store.loadWorkspace { error in
-          FileHandle.standardError.write(
-            Data("warning: skipped a chat file. \(error.localizedDescription)\n".utf8))
-        }
-        print(chatListing(workspace, scope: .all, selectedID: nil))
-        return
-      }
-
-      let loaded = try loadConfiguration(options: options, environment: environment)
-      let configurationPath = loaded?.path ?? defaultConfigurationPath(environment: environment)
-      var configuration = loaded?.configuration
-      if var existing = configuration {
-        var changed = existing.associateSystemPrompts()
-        if !existing.toolSources.contains(where: {
-          $0.kind == MaiStandardToolsPlugin.factoryKind
-        }) {
-          existing.toolSources.append(
-            ConfiguredToolSource(
-              id: "standard-tools",
-              kind: MaiStandardToolsPlugin.factoryKind))
-          changed = true
-        }
-        if changed { try existing.save(to: URL(fileURLWithPath: configurationPath)) }
-        configuration = existing
-      }
-      let approvalHandler = TerminalApprovalHandler(
-        configuration: configuration?.approvals ?? .init(),
-        yoloEnabled: options.yolo || (configuration?.approvals.yolo ?? false))
-      let runtime = AgentRuntime(approvalHandler: approvalHandler)
-      let plugins = PluginRegistry()
-      try await plugins.install(MaiCoreBuiltinsPlugin(), origin: "built-in")
-      try await plugins.install(MaiMCPPlugin(), origin: "built-in")
-      try await plugins.install(MaiOpenAIPlugin(), origin: "built-in")
-      try await plugins.install(MaiACPPlugin(), origin: "built-in")
-      do {
-        try await plugins.install(MaiVisionOCRPlugin(), origin: "built-in")
-      } catch {
-        // OCR is optional: a platform without a usable backend must not stop
-        // the CLI from starting.
-        FileHandle.standardError.write(
-          Data("warning: OCR plugin unavailable: \(error.localizedDescription)\n".utf8))
-      }
-      try await plugins.install(MaiStandardToolsPlugin(), origin: "built-in")
-      let nativePluginHost = NativePluginHost()
-      try await loadNativePlugins(
-        options: options,
-        loadedConfigurationPath: loaded?.path,
-        configuration: configuration,
-        environment: environment,
-        host: nativePluginHost,
-        registry: plugins)
-      let memoryState = MemoryState(
-        home: resolvedHome(options: options, environment: environment))
-      let todoState = TodoState(
-        home: resolvedHome(options: options, environment: environment))
-      let skillState = SkillState(
-        home: resolvedHome(options: options, environment: environment))
-      try await registerTools(
-        in: runtime,
-        plugins: plugins,
-        configuration: configuration,
-        environment: environment)
-      try await registerMemoryTools(in: runtime, state: memoryState)
-      try await registerTodoTools(in: runtime, state: todoState)
-      for tool in MaiContextTools.makeTools(supervisor: runtime.supervisor) {
-        try await runtime.register(tool: tool)
-      }
-      try await registerSkillTools(in: runtime, state: skillState)
-      try await synchronizeToolGroupSelections(
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        plugins: plugins,
-        runtime: runtime,
-        environment: environment)
-      let ocrProvider = await configuredOCRProvider(
-        plugins: plugins,
-        configuration: configuration,
-        environment: environment)
-      let setup = try await configureRuntime(
-        runtime,
-        plugins: plugins,
-        configuration: configuration,
-        options: options,
-        environment: environment)
-      var profile = try selectedProfile(
-        configuration: configuration,
-        options: options,
-        environment: environment)
-      if configuration == nil {
-        var created = MaiConfiguration(
-          defaultAgent: profile.agentID,
-          providers: setup.implicitProviders,
-          toolSources: [
-            ConfiguredToolSource(
-              id: "standard-tools",
-              kind: MaiStandardToolsPlugin.factoryKind)
-          ],
-          agents: [profile.agentDefinition])
-        created.associateSystemPrompts()
-        try created.save(to: URL(fileURLWithPath: configurationPath))
-        configuration = created
-        profile = try selectedProfile(
-          configuration: created,
-          options: options,
-          environment: environment)
-      }
-      let home = resolvedHome(options: options, environment: environment)
-      let usageStats = ModelUsageStore(url: home.usageStatsURL)
-      await runtime.configureUsageStats(usageStats)
-      let project = try home.openProject(
-        atWorkingDirectory: URL(
-          fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true))
-      memoryState.adopt(project: project, settings: configuration?.memory ?? .init())
-      todoState.focus(project: project)
-      skillState.focus(project: project)
-      await runtime.configureMemory(memoryState.promptSection)
-      await runtime.configureProjectInstructions(projectInstructionsSection(configuration))
-      await runtime.configurePlanning(configuration?.use.plan ?? true)
-      let store = resolvedChatStore(
-        options: options, home: home, project: project, environment: environment)
-      importLegacyChats(into: store, project: project, options: options, environment: environment)
-      let providerOverride =
-        options.providerOverride
-        ?? environmentValue(["PMAI_PROVIDER", "MAI_PROVIDER"], in: environment).map {
-          ProviderID($0)
-        }
-      let modelOverride =
-        options.modelOverride
-        ?? environmentValue(["PMAI_MODEL", "MAI_MODEL", "OPENAI_MODEL"], in: environment)
-      var workspace = try loadChatWorkspace(
-        from: store,
-        initialProfile: profile,
-        configuredAgents: configuration?.agents ?? [],
-        providerOverride: providerOverride,
-        modelOverride: modelOverride,
-        options: options)
-      var session = REPLSession(chat: workspace.selectedChat!)
-      session.pendingContent.append(contentsOf: try options.imagePaths.map(imageContent))
-      if options.readStdin {
-        session.pendingContent.append(
-          try stdinAttachment(reopeningTerminal: options.initialPrompt == nil))
-      }
-      session.touch()
-      workspace.upsert(session.chat, selecting: true)
-      let terminal = TerminalWriter()
-      await terminal.configureMarkdown(
-        markdownRenderer(
-          enabled: options.markdown ?? configuration?.ui.markdown ?? true,
-          forced: options.markdown == true,
-          environment: environment))
-      await terminal.configureThinking(configuration?.ui.thinking ?? .status)
-      await terminal.configureToolResultLines(
-        configuration?.ui.toolResultLines ?? ConfiguredTerminalUI().toolResultLines)
-      await terminal.configureToolResultColor(
-        configuration?.ui.toolResultForeground ?? ConfiguredTerminalUI().toolResultForeground)
-      await terminal.configureSubagentOutput(
-        configuration?.ui.subagentOutput ?? ConfiguredTerminalUI().subagentOutput)
-      await terminal.configurePromptColor(
-        configuration?.ui.promptForeground ?? ConfiguredTerminalUI().promptForeground)
-      configureEditor(configuration?.ui.editor ?? "")
-
-      if let mode = options.serve {
-        await runServer(
-          mode,
-          runtime: runtime,
-          approvalHandler: approvalHandler,
-          agent: profile.agentDefinition)
-        return
-      }
-      if loaded == nil {
-        await terminal.line("Created \(configurationPath)", to: .standardError)
-      }
-      if let prompt = options.initialPrompt {
-        var oneShotProcess: AgentPID?
-        let succeeded = await submit(
-          prompt,
-          session: &session,
-          runtime: runtime,
-          process: &oneShotProcess,
-          terminal: terminal)
-        if let process = oneShotProcess {
-          session.subagents = AgentProcessRecord.merging(
-            saved: session.subagents,
-            current: await runtime.supervisor.records(under: process))
-        }
-        workspace.upsert(session.chat, selecting: true)
-        try store.commit(&workspace)
-        if !succeeded { exit(1) }
-        return
-      }
-      await runREPL(
-        workspace: &workspace,
-        store: store,
-        home: home,
-        project: project,
-        historyURL: resolvedHistoryURL(options: options, home: home, environment: environment),
-        runtime: runtime,
-        plugins: plugins,
-        ocrProvider: ocrProvider,
-        configuration: configuration,
-        catalogs: setup.catalogs,
-        visual: VisualBridge(
-          approvalHandler: approvalHandler,
-          configurationPath: configurationPath,
-          implicitProviders: setup.implicitProviders,
-          providerBaseURLs: ProviderBaseURLStore(setup.providerBaseURLs),
-          memory: memoryState,
-          todo: todoState,
-          skills: skillState,
-          usageStats: usageStats),
-        terminal: terminal)
-    } catch {
-      FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
-      exit(2)
-    }
-  }
-
-  private static func loadNativePlugins(
-    options: CLIOptions,
-    loadedConfigurationPath: String?,
-    configuration: MaiConfiguration?,
-    environment: [String: String],
-    host: NativePluginHost,
-    registry: PluginRegistry
-  ) async throws {
-    let currentDirectory = URL(
-      fileURLWithPath: FileManager.default.currentDirectoryPath,
-      isDirectory: true)
-    let configDirectory =
-      loadedConfigurationPath.map {
-        URL(fileURLWithPath: $0).deletingLastPathComponent()
-      } ?? currentDirectory
-    let configured =
-      configuration?.plugins.filter(\.enabled).map {
-        (entry: $0, baseURL: configDirectory)
-      } ?? []
-    let commandLine = options.pluginPaths.map {
-      (entry: ConfiguredPlugin(path: $0), baseURL: currentDirectory)
-    }
-
-    for item in configured + commandLine {
-      let expanded = AgentHome.expandUserPath(item.entry.path, environment: environment)
-      let url = URL(fileURLWithPath: expanded, relativeTo: item.baseURL).standardizedFileURL
-      do {
-        _ = try await host.loadPlugin(at: url, into: registry)
-      } catch {
-        if item.entry.required { throw error }
-        FileHandle.standardError.write(
-          Data(
-            "warning: optional plugin '\(url.path)' was not loaded: \(error.localizedDescription)\n"
-              .utf8))
-      }
-    }
-  }
-
-  private static func registerTools(
-    in runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: MaiConfiguration?,
-    environment: [String: String]
-  ) async throws {
-    let sources = configuration?.toolSources ?? []
-    let configuredStandardTools = sources.filter {
-      $0.kind == MaiStandardToolsPlugin.factoryKind
-    }
-    if configuredStandardTools.isEmpty {
-      let tools = try await plugins.makeTools(
-        kind: MaiStandardToolsPlugin.factoryKind,
-        context: PluginFactoryContext(id: "standard-tools", environment: environment))
-      for tool in tools { try await runtime.register(tool: tool) }
-    } else {
-      for source in configuredStandardTools where source.enabled {
-        let tools = try await plugins.makeTools(
-          kind: source.kind,
-          context: source.context(environment: environment))
-        for tool in tools { try await runtime.register(tool: tool) }
-      }
-    }
-
-    for source in sources
-    where source.enabled && source.kind != MaiStandardToolsPlugin.factoryKind {
-      let tools = try await plugins.makeTools(
-        kind: source.kind,
-        context: source.context(environment: environment))
-      for tool in tools { try await runtime.register(tool: tool) }
-    }
-  }
-
-  /// Tool and group names that changed; agent records saved under the old
-  /// name are moved to the new one the next time the configuration is read.
-  private static let renamedToolNames = ["calculator": MaiCalculatorTool.name]
-
-  /// Tool names remain in the agent record for provider/runtime portability;
-  /// group names let a host expand newly added plugin tools without requiring
-  /// users to toggle an already enabled group off and on again.
-  private static func synchronizeToolGroupSelections(
-    configuration: inout MaiConfiguration?,
-    configurationPath: String,
-    plugins: PluginRegistry,
-    runtime: AgentRuntime,
-    environment: [String: String]
-  ) async throws {
-    guard var draft = configuration else { return }
-    var toolsByGroup: [String: Set<String>] = [
-      AgentRuntime.agentToolGroup.id: AgentRuntime.agentToolGroup.toolNames
-    ]
-    for source in draft.toolSources where source.enabled {
-      for group in try await plugins.toolGroups(
-        kind: source.kind,
-        context: source.context(environment: environment))
-      {
-        toolsByGroup[group.id, default: []].formUnion(group.toolNames)
-      }
-    }
-    // Tools pmai registers itself â€” todo, chats â€” belong to no plugin, so
-    // their groups are inferred the way /tools lists them; otherwise a group
-    // named in the configuration would show as enabled yet offer nothing.
-    let grouped = Set(toolsByGroup.values.flatMap { $0 })
-    let hostTools = await runtime.availableTools().filter { !grouped.contains($0.name) }
-    for group in ToolGroupDefinition.inferred(from: hostTools) {
-      toolsByGroup[group.id, default: []].formUnion(group.toolNames)
-    }
-    var changed = false
-    for index in draft.agents.indices {
-      let previous = draft.agents[index].toolNames
-      let previousGroups = draft.agents[index].toolGroupNames
-      for (old, new) in renamedToolNames {
-        if draft.agents[index].toolNames.remove(old) != nil {
-          draft.agents[index].toolNames.insert(new)
-        }
-        if draft.agents[index].toolGroupNames.remove(old) != nil {
-          draft.agents[index].toolGroupNames.insert(new)
-        }
-      }
-      for groupName in draft.agents[index].toolGroupNames {
-        draft.agents[index].toolNames.formUnion(toolsByGroup[groupName] ?? [])
-      }
-      changed =
-        changed || previous != draft.agents[index].toolNames
-        || previousGroups != draft.agents[index].toolGroupNames
-    }
-    guard changed else { return }
-    try draft.save(to: URL(fileURLWithPath: configurationPath))
-    configuration = draft
-  }
-
-  /// Picks the configured OCR backend, falling back to whatever this platform
-  /// can offer (Apple Vision, then a local tesseract binary). OCR never blocks
-  /// startup: when nothing is usable the returned provider explains why the
-  /// first time OCR is requested.
-  private static func configuredOCRProvider(
-    plugins: PluginRegistry,
-    configuration: MaiConfiguration?,
-    environment: [String: String]
-  ) async -> any OCRProvider {
-    var failures: [String] = []
-    if let configured = configuration?.ocrProviders.first(where: \.enabled) {
-      do {
-        return try await plugins.makeOCRProvider(
-          kind: configured.kind,
-          context: configured.context(environment: environment))
-      } catch {
-        failures.append(error.localizedDescription)
-      }
-    }
-    var fallbackKinds = [MaiVisionOCRPlugin.preferredFactoryKind]
-    for kind in ["vision", TesseractOCRProvider.factoryKind] where !fallbackKinds.contains(kind) {
-      fallbackKinds.append(kind)
-    }
-    for kind in fallbackKinds {
-      do {
-        return try await plugins.makeOCRProvider(
-          kind: kind,
-          context: PluginFactoryContext(id: kind, environment: environment))
-      } catch {
-        failures.append(error.localizedDescription)
-      }
-    }
-    return UnavailableOCRProvider(
-      reason: failures.isEmpty
-        ? "no OCR provider is registered on this platform."
-        : failures.joined(separator: " "))
-  }
-
-  /// Exposes the shared `chats_*` tools over this session's reachable chats.
-  /// They are registered before configured agents are filtered against the
-  /// known tool names, so an agent may list them like any other tool.
-  private static func registerMemoryTools(
-    in runtime: AgentRuntime,
-    state: MemoryState
-  ) async throws {
-    for definition in MaiMemoryTools.definitions {
-      let name = definition.name
-      try await runtime.register(
-        tool: ClosureTool(definition: definition) { arguments, _ in
-          guard state.readsOtherChats else {
-            return ToolOutput(
-              text:
-                "Error: reading other chats is disabled. Enable it with /memory scope project or /memory scope all.",
-              isError: true)
-          }
-          return ToolOutput(
-            text: MaiMemoryTools.execute(
-              name: name,
-              arguments: arguments.objectValue ?? [:],
-              chats: state.reachableChats()))
-        })
-    }
-  }
-
-  /// Exposes the shared `todo_*` tools over the current project's list file.
-  /// Like the memory tools they are registered before agents are filtered
-  /// against the known tool names, so an agent may list them like any other.
-  private static func registerTodoTools(
-    in runtime: AgentRuntime,
-    state: TodoState
-  ) async throws {
-    for tool in MaiTodoTools.makeTools(url: { state.url }) {
-      try await runtime.register(tool: tool)
-    }
-  }
-
-  /// Runs pmai as a stdio server instead of the REPL: ACP for editors, MCP for
-  /// tool callers. Both speak JSON-RPC over stdin/stdout, so no output may go
-  /// there but the protocol itself; diagnostics go to stderr.
-  private static func runServer(
-    _ mode: ServeMode,
-    runtime: AgentRuntime,
-    approvalHandler: TerminalApprovalHandler,
-    agent: AgentDefinition
-  ) async {
-    let transport = StdioJSONRPCTransport.standardIO()
-    switch mode {
-    case .acp:
-      // Tool approvals belong to the editor, not to a terminal nobody is at.
-      let bridge = ACPPermissionBridge()
-      await approvalHandler.setDelegate(bridge.approvalHandler)
-      let server = ACPServer(runtime: runtime, agent: agent, bridge: bridge)
-      FileHandle.standardError.write(
-        Data("pmai ACP agent ready (\(agent.id)); waiting for a client on stdio.\n".utf8))
-      await server.serve(on: transport)
-    case .mcp:
-      let server = MCPAgentServer(runtime: runtime, agent: agent)
-      FileHandle.standardError.write(
-        Data("pmai MCP server ready (\(agent.id)); waiting for a client on stdio.\n".utf8))
-      await server.serve(on: transport)
-    }
-  }
-
-  private static func configureRuntime(
-    _ runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: MaiConfiguration?,
-    options: CLIOptions,
-    environment: [String: String]
-  ) async throws -> RuntimeSetup {
-    let providerOverride =
-      options.providerOverride
-      ?? environmentValue(["PMAI_PROVIDER", "MAI_PROVIDER"], in: environment).map {
-        ProviderID($0)
-      }
-    let rawBaseURL =
-      options.baseURLOverride?.absoluteString
-      ?? environmentValue(
-        ["PMAI_BASE_URL", "MAI_BASE_URL", "OPENAI_BASE_URL"], in: environment)
-    let baseURLOverride: URL?
-    if let rawBaseURL {
-      guard let url = URL(string: rawBaseURL) else { throw CLIError.invalidURL(rawBaseURL) }
-      baseURLOverride = url
-    } else {
-      baseURLOverride = nil
-    }
-    let apiKeyOverride =
-      try options.apiKeyOverride ?? environmentAPIKey(in: environment)
-
-    if let configuration {
-      let selectedAgentID =
-        options.agentOverride ?? configuration.defaultAgent
-        ?? configuration.agents.first?.id
-      let selectedProviderID = selectedAgentID.flatMap { selectedAgentID in
-        configuration.agents.first { $0.id == selectedAgentID }?.provider.rawValue
-      }
-      let targetProviderID =
-        providerOverride?.rawValue ?? selectedProviderID
-        ?? ProviderID.openAI.rawValue
-      var providerBaseURLs: [String: URL] = [:]
-      for configuredProvider in configuration.providers {
-        var provider = configuredProvider
-        if provider.id == targetProviderID {
-          if let baseURLOverride { provider.baseURL = baseURLOverride }
-          if let apiKeyOverride {
-            provider.apiKey = apiKeyOverride
-            provider.apiKeyEnvironment = nil
-            provider.apiKeyFile = nil
-          }
-        }
-        providerBaseURLs[provider.id] = provider.baseURL
-        try await runtime.register(
-          plugins.makeProvider(from: provider, environment: environment))
-      }
-      var catalogs: [MCPServerCatalog] = []
-      for server in configuration.mcpServers where server.enabled {
-        let source = try await plugins.makeMCPToolSource(
-          kind: server.kind,
-          configuration: server,
-          environment: environment)
-        catalogs.append(try await runtime.register(mcp: source))
-      }
-      await runtime.configureDelegation(
-        prompt: configuration.prompts?.delegation,
-        workerInstructions: configuration.prompts?.worker)
-      await runtime.configureCompaction(prompt: configuration.prompts?.compact)
-      let knownTools = Set(await runtime.availableTools().map(\.name))
-      for var agent in configuration.agents {
-        agent.toolNames.formIntersection(knownTools)
-        try await runtime.register(agent: agent)
-      }
-      return RuntimeSetup(catalogs: catalogs, providerBaseURLs: providerBaseURLs)
-    }
-
-    let hello = ConfiguredProvider(id: "hello", kind: .hello)
-    try await runtime.register(plugins.makeProvider(from: hello, environment: environment))
-    let baseURL = baseURLOverride ?? URL(string: "http://127.0.0.1:11434/v1")!
-    let openAI = ConfiguredProvider(
-      id: ProviderID.openAI.rawValue,
-      kind: .openAICompatible,
-      baseURL: baseURL,
-      apiKey: apiKeyOverride)
-    try await runtime.register(plugins.makeProvider(from: openAI, environment: environment))
-    // The visual workspace drafts a configuration from these implicit providers.
-    // It references the API key through its environment variable instead of
-    // copying the secret into a file.
-    var draft = openAI
-    draft.apiKey = nil
-    draft.apiKeyEnvironment = environmentName(
-      ["PMAI_API_KEY", "MAI_API_KEY", "OPENAI_API_KEY"], in: environment)
-    draft.apiKeyFile = environment["PMAI_API_KEY_FILE"].flatMap {
-      $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
-    }
-    return RuntimeSetup(
-      catalogs: [],
-      implicitProviders: [hello, draft],
-      providerBaseURLs: [openAI.id: baseURL])
-  }
-
-  private static func selectedProfile(
-    configuration: MaiConfiguration?,
-    options: CLIOptions,
-    environment: [String: String]
-  ) throws -> SessionProfile {
-    let providerOverride =
-      options.providerOverride
-      ?? environmentValue(["PMAI_PROVIDER", "MAI_PROVIDER"], in: environment).map {
-        ProviderID($0)
-      }
-    let modelOverride =
-      options.modelOverride
-      ?? environmentValue(["PMAI_MODEL", "MAI_MODEL", "OPENAI_MODEL"], in: environment)
-    if let configuration, !configuration.agents.isEmpty {
-      let selectedID =
-        options.agentOverride ?? configuration.defaultAgent
-        ?? configuration.agents.first?.id
-      guard let definition = configuration.agents.first(where: { $0.id == selectedID }) else {
-        throw MaiConfigurationError.unknownAgent(selectedID ?? "")
-      }
-      var profile = SessionProfile(definition: definition)
-      if let providerOverride { profile.provider = providerOverride }
-      if let modelOverride { profile.model = modelOverride }
-      if let system = options.systemOverride {
-        profile.instructions = system
-        profile.systemPrompt = nil
-      }
-      profile.stream = options.stream && profile.stream
-      options.applyLimitOverrides(to: &profile.limits)
-      return profile
-    }
-    var profile = SessionProfile(
-      provider: providerOverride ?? .openAI,
-      model: modelOverride ?? "gpt-oss:20b",
-      instructions: options.systemOverride ?? "You are a helpful, concise assistant.",
-      stream: options.stream)
-    options.applyLimitOverrides(to: &profile.limits)
-    return profile
-  }
-
-  /// A renderer for replies on this terminal, or nil to print them verbatim.
-  /// Output that is not a terminal stays verbatim unless rendering is forced.
-  private static func markdownRenderer(
-    enabled: Bool,
-    forced: Bool,
-    environment: [String: String]
-  ) -> MarkdownTerminalRenderer? {
-    guard enabled, forced || isatty(STDOUT_FILENO) != 0 else { return nil }
-    let detected = MarkdownTerminalEnvironment.detect(environment)
-    return MarkdownTerminalRenderer(
-      theme: detected.theme,
-      options: MarkdownLayoutOptions(
-        width: TerminalLineEditor.terminalColumns(), unicode: detected.unicode),
-      widthProvider: { TerminalLineEditor.terminalColumns() })
-  }
-
-  /// What outlives one event of the loop: the turn in flight, who typed text
-  /// goes to, and the tool calls waiting for an answer.
-  private enum REPLTurnKind {
-    case chat
-    case btw
-  }
-
-  /// One run in flight. A chat turn also remembers which chat it belongs to
-  /// and what that chat held when it was sent, so its reply finds its way
-  /// back even after the person edited the chat or moved to another one.
-  private struct REPLTurn {
-    let task: Task<AgentResult, any Error>
-    let started: ContinuousClock.Instant
-    let pid: AgentPID
-    let kind: REPLTurnKind
-    let chatID: UUID?
-    let sent: [AgentMessage]
-  }
-
-  private struct REPLLoop {
-    var activeTurn: REPLTurn?
-    var focus: REPLMessageTarget = .main
-    var approvals: [(request: ApprovalRequest, reply: REPLApprovalReply)] = []
-    var editingApproval: (request: ApprovalRequest, reply: REPLApprovalReply)?
-    var pendingQueueMessage: String?
-    /// True while the input thread waits for the loop before reading again.
-    var readerParked = true
-    var exiting = false
-  }
-
-  /// What a command may change under a running turn, taken before it runs
-  /// so the person can be told how the change and the run meet.
-  private struct REPLCommandSnapshot {
-    let chatID: UUID
-    let title: String
-    let messages: [AgentMessage]
-    let agent: AgentDefinition
-    let configuration: MaiConfiguration?
-    let directory: String
-
-    init(session: REPLSession, configuration: MaiConfiguration?) {
-      chatID = session.id
-      title = session.title
-      messages = session.history.messages
-      agent = session.profile.agentDefinition
-      self.configuration = configuration
-      directory = FileManager.default.currentDirectoryPath
-    }
-  }
-
-  /// What a chat holds once a run that started from `sent` comes back with
-  /// `result`. Usually nothing touched the chat meanwhile and the run's
-  /// transcript is the chat. When the person edited it during the run â€”
-  /// cleared it, undid a message, compacted it â€” their edits stay and what
-  /// the run added goes after them.
-  static func mergedTranscript(
-    current: [AgentMessage], sent: [AgentMessage], result: [AgentMessage]
-  ) -> [AgentMessage] {
-    guard current != sent else { return result }
-    let shared = zip(sent, result).prefix { $0.0 == $0.1 }.count
-    return current + result.dropFirst(shared)
-  }
-
-  /// The REPL is one loop over one stream of events. Typed lines arrive from
-  /// a thread of their own, so the prompt stays on screen while a turn runs;
-  /// a turn ending, a tool asking for approval, and a change in the process
-  /// table arrive on the same stream. On a terminal the prompt lives on two
-  /// reserved rows under the output (`TerminalScreen`); piped input keeps the
-  /// one-line-at-a-time behaviour, where a turn finishes before the next line
-  /// is read.
-  private static func runREPL(
-    workspace: inout AgentChatWorkspace,
-    store: AgentChatStore,
-    home: AgentHome,
-    project: AgentProject,
-    historyURL: URL,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    ocrProvider: any OCRProvider,
-    configuration: MaiConfiguration?,
-    catalogs: [MCPServerCatalog],
-    visual: VisualBridge,
-    terminal: TerminalWriter
-  ) async {
-    var configuration = configuration
-    var catalogs = catalogs
-    var project = project
-    var session = REPLSession(chat: workspace.selectedChat!)
-    let editor = TerminalLineEditor(historyURL: historyURL)
-    let interruptHandler = TerminalInterruptHandler()
-    var announcedAttention: Set<AgentPID> = []
-    // One process per chat, not per turn: a background agent started three
-    // turns ago is still the current run's child, so it stays collectable,
-    // and a message typed while a turn runs has a pid to wait in.
-    var chatProcessIDs: [UUID: AgentPID] = [:]
-    // Chats whose saved agents were put back in the process table this
-    // session: once is enough, and clearing the table must not bring them
-    // back.
-    var restoredChatIDs: Set<UUID> = []
-    await terminal.line("pmai â€” MaiCore agent REPL")
-    await terminal.line(
-      "Project: \(project.displayName) Â· \(abbreviatedPath(project.workingDirectory)) Â· /project shows more"
-    )
-    await terminal.line(
-      "Type /help for commands. \(promptIdentity(session)) Â· \(session.title)")
-    let earlier = workspace.chats.filter { $0.id != session.id && $0.hasConversation }
-    if !earlier.isEmpty {
-      await terminal.line(
-        "\(earlier.count) earlier chat\(earlier.count == 1 ? "" : "s") in this project: /chat list shows them, /chat use N switches."
-      )
-    }
-
-    let (events, continuation) = AsyncStream<REPLEvent>.makeStream()
-    let reader = REPLInputReader(editor: editor, continuation: continuation)
-    let screen = TerminalScreen()
-    if let screen {
-      screen.configure(ui: tintedUI(configuration?.ui ?? .init(), project: project))
-      screen.activate()
-      TerminalScreen.install(screen)
-      editor.install(surface: screen)
-      await terminal.attach(screen: screen)
-      await visual.approvalHandler.setPrompter { request in
-        try await withCheckedThrowingContinuation { pending in
-          continuation.yield(.approval(request, REPLApprovalReply(pending)))
-        }
-      }
-    }
-    let supervisorFeed = Task {
-      for await change in await runtime.supervisor.events() {
-        continuation.yield(.supervisor(change))
-      }
-    }
-    // The input reader deliberately blocks on its own thread, leaving this
-    // event loop free to animate the activity marker while a run is active.
-    let activityPulse = Task {
-      while !Task.isCancelled {
-        try? await Task.sleep(nanoseconds: 200_000_000)
-        guard !Task.isCancelled else { return }
-        continuation.yield(.activityPulse)
-      }
-    }
-    var loop = REPLLoop()
-    var activityWasInterrupted = false
-
-    func refreshTerminalSettings() async {
-      let ui = tintedUI(configuration?.ui ?? .init(), project: project)
-      editor.configure(ui: ui)
-      screen?.configure(ui: ui)
-      await terminal.configureThinking(ui.thinking)
-      await terminal.configureToolResultLines(ui.toolResultLines)
-      await terminal.configureToolResultColor(ui.toolResultForeground)
-      await terminal.configureSubagentOutput(ui.subagentOutput)
-      await terminal.configurePromptColor(ui.promptForeground)
-      await terminal.configureTerminalTitle(ui.title)
-      configureEditor(ui.editor)
-      visual.memory.focus(project: project, chatID: session.id)
-      visual.todo.focus(project: project)
-      await runtime.configureMemory(visual.memory.promptSection)
-      await runtime.configureProjectInstructions(Self.projectInstructionsSection(configuration))
-      await runtime.configurePlanning(configuration?.use.plan ?? true)
-    }
-
-    func statusLine() async -> String {
-      var facts: [String] = []
-      let liveProcesses = await runtime.supervisor.liveProcesses()
-      let running = !activityWasInterrupted && !liveProcesses.isEmpty
-      let activityMarker = running ? randomBrailleString() : "â—‹"
-      if let turn = loop.activeTurn {
-        let activity = await runtime.supervisor.info(turn.pid)?.activity ?? ""
-        let prefix = turn.kind == .btw ? "btw " : ""
-        facts.append(
-          prefix + (activity.isEmpty || activity == "thinking" ? "thinking" : "running \(activity)")
-        )
-      }
-      let children = await runtime.supervisor.liveProcesses().filter { $0.depth > 0 }
-      if !children.isEmpty {
-        let paused = children.filter { $0.state == .paused }.count
-        let queued = children.filter { $0.state == .queued }.count
-        var notes: [String] = []
-        if paused > 0 { notes.append("\(paused) paused") }
-        if queued > 0 { notes.append("\(queued) queued") }
-        facts.append(
-          "\(children.count) agent\(children.count == 1 ? "" : "s")"
-            + (notes.isEmpty ? "" : " (\(notes.joined(separator: ", ")))"))
-      }
-      let queued = await runtime.supervisor.queuedMessages().count
-      if queued > 0 { facts.append("\(queued) queued") }
-      if case .agent(let pid) = loop.focus { facts.append("â†’ agent#\(pid.rawValue)") }
-      if let editing = loop.editingApproval {
-        facts.append("json for \(editing.request.tool.name)?")
-      } else if let waiting = loop.approvals.first {
-        let who = waiting.request.run.pid.map { "agent#\($0.rawValue) " } ?? ""
-        facts.append("approve? \(who)\(waiting.request.tool.name) [y/a/n/e/c]")
-      }
-      let detail = facts.isEmpty ? "" : " Â· " + facts.joined(separator: " Â· ")
-      // The chat title goes last so a narrow terminal truncates it, not the status.
-      return
-        "\(activityMarker) \(currentDirectoryName()) Â· \(project.displayName) \(promptIdentity(session))\(detail) Â· \(session.title)"
-    }
-
-    func promptText() -> String {
-      let prompt: String
-      if loop.pendingQueueMessage != nil {
-        prompt = "queue [submit/ignore/clear]> "
-      } else if loop.editingApproval != nil {
-        prompt = "json> "
-      } else if let waiting = loop.approvals.first {
-        let who = waiting.request.run.pid.map { "#\($0.rawValue) " } ?? ""
-        prompt = "approve \(who)\(waiting.request.tool.name)? [y/a/n/e/c] "
-      } else if case .agent(let pid) = loop.focus {
-        // The prompt names the process a line goes to: a focused child, or the
-        // chat's own once it has run, so its pid is at hand for /agents commands.
-        prompt = "pmai#\(pid.rawValue)> "
-      } else if let pid = chatProcessIDs[session.id] {
-        prompt = "pmai#\(pid.rawValue)> "
-      } else {
-        prompt = "pmai> "
-      }
-      let title = visibleUITitle(configuration?.ui.title ?? "")
-      return title.isEmpty ? prompt : "[\(title)] \(prompt)"
-    }
-
-    func refreshStatus() async {
-      guard let screen else { return }
-      screen.setStatus(await statusLine())
-    }
-
-    /// Lets the input thread read the next line. Settings that the editor
-    /// reads are refreshed here, while the thread is parked and cannot race.
-    func releaseReader(workspace: AgentChatWorkspace) async {
-      guard loop.readerParked, !loop.exiting else { return }
-      await refreshTerminalSettings()
-      if screen == nil {
-        // Announcing while the classic editor owns the row would corrupt it,
-        // so on a plain terminal this happens between prompts.
-        await announceAgentAttention(
-          runtime: runtime, announced: &announcedAttention, terminal: terminal)
-      }
-      let status = await statusLine()
-      screen?.setStatus(status)
-      loop.readerParked = false
-      reader.resume(
-        with: REPLInputReader.Prompt(
-          text: promptText(),
-          completions: completionCandidates(
-            workspace: workspace, configuration: configuration,
-            skills: visual.skills.catalog.skills),
-          separator: screen == nil ? status : nil))
-    }
-
-    /// On a plain terminal a turn owns the screen, so the next line waits for
-    /// it; on the persistent screen the prompt is always open.
-    func releaseIfIdle(workspace: AgentChatWorkspace) async {
-      if screen != nil || loop.activeTurn == nil {
-        await releaseReader(workspace: workspace)
-      }
-    }
-
-    func mainProcess() async -> AgentPID {
-      if let pid = chatProcessIDs[session.id] { return pid }
-      let pid = await runtime.allocateProcess(agentID: session.profile.agentID, task: session.title)
-      chatProcessIDs[session.id] = pid
-      return pid
-    }
-
-    /// Brings every chat's saved agents up to date with the process table:
-    /// what runs under a chat's process, live or finished, replaces its
-    /// saved copy, and what the table has since forgotten stays as saved.
-    /// Called wherever the workspace is about to be written.
-    func recordSubagents() async {
-      for (chatID, pid) in chatProcessIDs {
-        let current = await runtime.supervisor.records(under: pid)
-        if chatID == session.id {
-          session.subagents = AgentProcessRecord.merging(
-            saved: session.subagents, current: current)
-        } else if var chat = workspace.chats.first(where: { $0.id == chatID }) {
-          chat.subagents = AgentProcessRecord.merging(saved: chat.subagents, current: current)
-          workspace.upsert(chat)
-        }
-      }
-    }
-
-    /// Puts the agents saved with the chat at the prompt back in the process
-    /// table, once per chat and session, so `/agents tree` and `/agents log`
-    /// show what earlier runs started before the chat's next turn.
-    func restoreSavedSubagents() async {
-      guard restoredChatIDs.insert(session.id).inserted, !session.subagents.isEmpty else {
-        return
-      }
-      let pid = await mainProcess()
-      let restored = await runtime.supervisor.restore(session.subagents, under: pid)
-      // Idle between turns, like a chat that has already run: listed as done,
-      // cleared with the rest, and reopened by its next turn.
-      await runtime.supervisor.complete(pid)
-      guard !restored.isEmpty else { return }
-      await terminal.line(
-        "\(restored.count) agent\(restored.count == 1 ? "" : "s") from earlier runs of this chat: /agents tree lists them, /agents log PID reads one, /agents clear drops them."
-      )
-    }
-
-    /// Drops the agents saved with the chat at the prompt that the process
-    /// table no longer holds, after `/agents clear`. Answers how many went.
-    func dropForgottenSubagents() async -> Int {
-      let known = Set(await runtime.supervisor.processes().map(\.runID))
-      let before = session.subagents.count
-      session.subagents.removeAll { !known.contains($0.runID) }
-      return before - session.subagents.count
-    }
-
-    func beginTurn(_ request: AgentRequest, process pid: AgentPID, kind: REPLTurnKind) async {
-      await terminal.resetResponse()
-      let task = Task {
-        try await runtime.run(request, process: pid) { event in
-          await terminal.consume(event)
-        }
-      }
-      interruptHandler.activate { task.cancel() }
-      activityWasInterrupted = false
-      loop.activeTurn = REPLTurn(
-        task: task, started: ContinuousClock.now, pid: pid, kind: kind,
-        chatID: kind == .chat ? session.id : nil, sent: request.messages)
-      Task {
-        let outcome: Result<AgentResult, any Error>
-        do {
-          outcome = .success(try await task.value)
-        } catch {
-          outcome = .failure(error)
-        }
-        continuation.yield(.turnFinished(outcome))
-      }
-      await refreshStatus()
-    }
-
-    /// Starts one turn with whatever is queued for the chat followed by the
-    /// texts just typed. The turn runs in its own task; the loop hears about
-    /// its end as an event.
-    func startTurn(_ texts: [String], ignoringQueue: Bool = false) async {
-      let pid = await mainProcess()
-      let held = ignoringQueue
-        ? Set(await runtime.supervisor.queuedMessages(for: pid).map(\.id)) : []
-      var messages = await runtime.supervisor.drainInbox(pid, excluding: held)
-      messages.append(contentsOf: texts.map { AgentMessage.user($0) })
-      guard !messages.isEmpty else { return }
-      if !session.pendingContent.isEmpty {
-        messages[0].content.append(contentsOf: session.pendingContent)
-        session.pendingContent.removeAll()
-      }
-      for message in messages { session.history.append(message) }
-      session.refreshTitle(from: messages[0].text)
-      var request = chatRequest()
-      request.ignoredQueuedMessageIDs = held
-      await beginTurn(request, process: pid, kind: .chat)
-    }
-
-    /// The chat's next run: its whole history under the current profile.
-    func chatRequest() -> AgentRequest {
-      let profile = session.profile
-      return AgentRequest(
-        agentID: profile.agentID,
-        provider: profile.provider,
-        model: profile.model,
-        messages: session.history.messages,
-        toolNames: profile.toolNames,
-        toolGroupNames: profile.toolGroupNames,
-        subagentNames: profile.subagentNames,
-        toolChoice: profile.toolChoice,
-        responseFormat: profile.responseFormat,
-        options: profile.options,
-        limits: profile.limits,
-        stream: profile.stream,
-        toolCallingStrategy: profile.toolCallingStrategy,
-        useToolProxy: profile.useToolProxy,
-        proxyExposedTools: profile.proxyExposedTools,
-        toolDelegation: profile.toolDelegation,
-        retry: profile.retry,
-        autocompact: profile.autocompact,
-        context: profile.context,
-        sessionID: session.sessionID)
-    }
-
-    /// Picks a paused or interrupted task up where it stopped: the history is
-    /// run again with a fresh budget and nothing new said, so the model sees
-    /// its last tool results and carries on. Queued messages go with it, the
-    /// way they would with a typed one.
-    @discardableResult
-    func continueTurn() async -> Bool {
-      let pid = await mainProcess()
-      if await runtime.supervisor.hasQueuedMessages(pid) {
-        await startTurn([])
-        return true
-      }
-      guard let last = session.history.messages.last, last.role != .system else {
-        await terminal.line("Nothing to continue yet: this chat has no messages.")
-        return false
-      }
-      if last.role == .assistant, last.toolCalls.isEmpty {
-        await terminal.line(
-          "Nothing to continue: the last reply was complete. Type a message instead.")
-        return false
-      }
-      await beginTurn(chatRequest(), process: pid, kind: .chat)
-      return true
-    }
-
-    /// Folds what an interrupted run had already added into the chat, with
-    /// any tool call it never answered marked as such, so the next turn â€” a
-    /// typed one or /continue â€” starts from there instead of from before the
-    /// run. Returns how many messages were kept.
-    func keepPartialTranscript(of turn: REPLTurn, reason: String) async -> Int {
-      guard let chatID = turn.chatID, let current = currentMessages(of: chatID) else { return 0 }
-      let partial = await runtime.supervisor.transcript(turn.pid)
-      guard !partial.isEmpty, partial != current else { return 0 }
-      let kept = max(0, partial.count - turn.sent.count)
-      settle(
-        AgentTranscriptEditor.answeringUnansweredToolCalls(in: partial, reason: reason), from: turn)
-      return kept
-    }
-
-    /// The messages a chat holds right now: the session's for the chat at the
-    /// prompt, the workspace copy for any other. Nil once the chat is closed.
-    func currentMessages(of chatID: UUID) -> [AgentMessage]? {
-      if chatID == session.id { return session.history.messages }
-      return workspace.chats.first { $0.id == chatID }?.messages
-    }
-
-    /// Folds a run's transcript into the chat it started from. That is
-    /// usually the chat at the prompt, but the person may have moved to
-    /// another chat or edited this one while the run was going; the reply
-    /// still lands where the run began, after any edits made there meanwhile.
-    /// Answers false when that chat was closed in the meantime.
-    @discardableResult
-    func settle(_ transcript: [AgentMessage], from turn: REPLTurn) -> Bool {
-      guard let chatID = turn.chatID, let current = currentMessages(of: chatID) else {
-        return false
-      }
-      let merged = Self.mergedTranscript(current: current, sent: turn.sent, result: transcript)
-      if chatID == session.id {
-        session.history.replaceAll(with: merged)
-      } else if var chat = workspace.chats.first(where: { $0.id == chatID }) {
-        chat.messages = merged
-        chat.touch()
-        workspace.upsert(chat)
-      }
-      return true
-    }
-
-    /// Runs a command with the running turn's Ctrl+C set aside, so a program
-    /// the command hands the tty to â€” an editor, a shell â€” keeps its own
-    /// Ctrl+C instead of ending the run.
-    func withTurnInterruptSetAside(_ body: () async -> Void) async {
-      guard let turn = loop.activeTurn else {
-        await body()
-        return
-      }
-      interruptHandler.deactivate()
-      await body()
-      interruptHandler.activate { turn.task.cancel() }
-    }
-
-    /// After a command ran under a turn: says how what it changed meets the
-    /// run. A run keeps its chat when the prompt moves to another, edits to
-    /// its chat are kept when its reply is folded in, and settings reach the
-    /// next turn because the running request copied them when it started.
-    func noteTurnEffects(since before: REPLCommandSnapshot) async {
-      guard let turn = loop.activeTurn else { return }
-      if session.id != before.chatID {
-        guard turn.chatID == before.chatID else { return }
-        if workspace.chats.contains(where: { $0.id == before.chatID }) {
-          await terminal.note(
-            "The turn running in '\(before.title)' finishes there; its reply lands in that chat.")
-        } else {
-          await terminal.note(
-            "The turn running in '\(before.title)' goes on without its chat; /agents log \(turn.pid.rawValue) will show its reply, Ctrl+C cancels it."
-          )
-        }
-        return
-      }
-      if session.history.messages != before.messages, turn.chatID == session.id {
-        await terminal.note(
-          "A turn is running; what it adds goes after this edit when it finishes.")
-      }
-      if FileManager.default.currentDirectoryPath != before.directory {
-        await terminal.note("A turn is running; its tools now work in the new directory.")
-      } else if session.profile.agentDefinition != before.agent
-        || configuration != before.configuration
-      {
-        await terminal.note(
-          "A turn is running; it keeps the settings it started with. This change reaches the next turn."
-        )
-      }
-    }
-
-    /// Runs a one-off prompt with the active profile and no conversation
-    /// messages. It is a real turn so streaming, tools, approvals, and Ctrl+C
-    /// work normally, but its transcript never replaces the chat's.
-    func startBTW(_ text: String) async {
-      guard let request = btwRequest(text, profile: session.profile) else {
-        await terminal.line("Usage: /btw PROMPT")
-        return
-      }
-      let pid = await runtime.allocateProcess(
-        agentID: session.profile.agentID, task: "btw: \(text)")
-      await beginTurn(request, process: pid, kind: .btw)
-    }
-
-    /// Sends typed text where it belongs: to the chat as a new turn when it
-    /// is idle, or into an inbox the running agent reads at its next turn.
-    func deliver(_ text: String, to target: REPLMessageTarget) async {
-      switch target {
-      case .main:
-        guard loop.activeTurn != nil else {
-          let pid = await mainProcess()
-          let count = await runtime.supervisor.queuedMessages(for: pid).count
-          if count > 0 {
-            loop.pendingQueueMessage = text
-            await terminal.line(
-              "\(count) queued message(s). Submit them before this message, ignore them for this turn, or clear them? [submit/ignore/clear]")
-          } else {
-            await startTurn([text])
-          }
-          return
-        }
-        let pid = await mainProcess()
-        await runtime.supervisor.post(.user(text), to: pid)
-        let waiting = await runtime.supervisor.queuedMessages(for: pid).count
-        await terminal.note(
-          "queued (\(waiting) waiting): it joins the conversation at the next model turn Â· /queue")
-      case .agent(let pid):
-        guard let info = await runtime.supervisor.info(pid) else {
-          await terminal.note("No agent #\(pid.rawValue). /agents tree lists the running ones.")
-          return
-        }
-        if pid == chatProcessIDs[session.id] {
-          await deliver(text, to: .main)
-          return
-        }
-        // A top-level pid from another chat owns a different inbox, even
-        // when that chat is idle. Never redirect it to the focused chat.
-        guard info.depth == 0 || !info.state.isTerminal else {
-          await terminal.note(
-            "agent#\(pid.rawValue) (\(info.agentID)) has finished; /agents log \(pid.rawValue) shows what it did."
-          )
-          if loop.focus == .agent(pid) { loop.focus = .main }
-          return
-        }
-        await runtime.supervisor.post(.user(text), to: pid)
-        let waiting = await runtime.supervisor.queuedMessages(for: pid).count
-        let when =
-          await runtime.supervisor.isPaused(pid)
-          ? "it is paused, so /agents continue \(pid.rawValue) delivers it"
-          : "delivered at its next model turn"
-        await terminal.note(
-          "queued for agent#\(pid.rawValue) (\(info.agentID)) (\(waiting) waiting): \(when)"
-        )
-      }
-      await refreshStatus()
-    }
-
-    /// Treats a typed line as the answer to the approval at the head of the
-    /// queue when it reads as one; anything else stays an ordinary line and
-    /// the question keeps waiting.
-    func answerApproval(_ text: String) async -> Bool {
-      if let editing = loop.editingApproval {
-        loop.editingApproval = nil
-        if let data = text.data(using: .utf8),
-          let value = try? JSONDecoder().decode(JSONValue.self, from: data),
-          value.objectValue != nil
-        {
-          editing.reply.resume(with: .approve(arguments: value))
-          await terminal.note("approved \(editing.request.tool.name) with the edited arguments")
-        } else {
-          editing.reply.resume(with: .deny(reason: "Edited arguments were not a JSON object."))
-          await terminal.note(
-            "denied \(editing.request.tool.name): the arguments were not a JSON object")
-        }
-        return true
-      }
-      guard let waiting = loop.approvals.first else { return false }
-      let tool = waiting.request.tool.name
-      switch text.lowercased() {
-      case "y", "yes":
-        waiting.reply.resume(with: .approve(arguments: waiting.request.call.arguments))
-        await terminal.note("approved \(tool)")
-      case "a", "always":
-        await visual.approvalHandler.setYOLOEnabled(true)
-        waiting.reply.resume(with: .approve(arguments: waiting.request.call.arguments))
-        await terminal.note("approved \(tool); YOLO mode is on for this session")
-      case "n", "no":
-        waiting.reply.resume(with: .deny(reason: "Denied by user."))
-        await terminal.note("denied \(tool)")
-      case "e", "edit":
-        loop.approvals.removeFirst()
-        loop.editingApproval = waiting
-        await terminal.note("Type the replacement JSON arguments for \(tool):")
-        return true
-      case "c", "cancel":
-        waiting.reply.resume(with: .cancelRun)
-        await terminal.note("cancelling the run that asked for \(tool)")
-      default:
-        return false
-      }
-      loop.approvals.removeFirst()
-      return true
-    }
-
-    func handleFocus(_ argument: String) async {
-      let trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !trimmed.isEmpty else {
-        switch loop.focus {
-        case .main:
-          await terminal.line(
-            "Messages go to this chat. /agents focus PID sends them to a running agent.")
-        case .agent(let pid):
-          await terminal.line(
-            "Messages go to agent#\(pid.rawValue). /agents focus main returns to the chat.")
-        }
-        return
-      }
-      guard let target = focusTarget(trimmed) else {
-        await terminal.line("Usage: /agents focus <PID|main>")
-        return
-      }
-      switch target {
-      case .main:
-        loop.focus = .main
-        await terminal.line("Messages go to this chat again.")
-      case .agent(let pid):
-        guard let info = await runtime.supervisor.info(pid) else {
-          await terminal.line("No agent #\(pid.rawValue). /agents tree lists the running ones.")
-          return
-        }
-        guard info.depth > 0, !info.state.isTerminal else {
-          await terminal.line(
-            info.depth == 0
-              ? "agent#\(pid.rawValue) is this chat; /agents focus main is the same thing."
-              : "agent#\(pid.rawValue) (\(info.agentID)) has finished; pick a running one from /agents tree."
-          )
-          return
-        }
-        loop.focus = .agent(pid)
-        await terminal.line(
-          "Messages go to agent#\(pid.rawValue) (\(info.agentID)) until /agents focus main; @main TEXT still reaches the chat."
-        )
-      }
-    }
-
-    await restoreSavedSubagents()
-    reader.start()
-    await releaseReader(workspace: workspace)
-
-    events: for await event in events {
-      switch event {
-      case .line(let raw, let heredoc):
-        loop.readerParked = true
-        let typed = heredoc ? raw : raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // `$NAME [TEXT]` is the short form of `/prompts NAME [TEXT]`.
-        let text =
-          !heredoc && typed.hasPrefix("$")
-          ? ("/prompts " + typed.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
-          : typed
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-          await releaseIfIdle(workspace: workspace)
-          continue
-        }
-        if !heredoc, text == "/stop" {
-          // Use the same event as Ctrl+C, including pending queue decisions.
-          continuation.yield(.interrupt)
-          continue
-        }
-        if let pending = loop.pendingQueueMessage {
-          switch text.lowercased() {
-          case "submit", "s":
-            loop.pendingQueueMessage = nil
-            await startTurn([pending])
-          case "ignore", "i":
-            loop.pendingQueueMessage = nil
-            await startTurn([pending], ignoringQueue: true)
-          case "clear", "c":
-            loop.pendingQueueMessage = nil
-            let pid = await mainProcess()
-            await runtime.supervisor.clearQueuedMessages(for: pid)
-            await startTurn([pending])
-          default:
-            await terminal.line("Choose submit, ignore, or clear. Ctrl+C or /stop cancels this new message and keeps the queue.")
-          }
-          await releaseIfIdle(workspace: workspace)
-          continue
-        }
-        if !heredoc, await answerApproval(text) {
-          await refreshStatus()
-          await releaseIfIdle(workspace: workspace)
-          continue
-        }
-        if !heredoc, let addressed = addressedMessage(text) {
-          await deliver(addressed.body, to: addressed.target)
-          await releaseIfIdle(workspace: workspace)
-          continue
-        }
-        if !heredoc, text.hasPrefix("!") {
-          if loop.activeTurn != nil {
-            await terminal.note("A turn is running; what it prints waits until the command ends.")
-          }
-          await withTurnInterruptSetAside {
-            await runShellCommand(String(text.dropFirst()), terminal: terminal)
-          }
-          await releaseIfIdle(workspace: workspace)
-          continue
-        }
-        if !heredoc, text.hasPrefix("/") {
-          let command = text.split(maxSplits: 1, whereSeparator: \Character.isWhitespace)
-          let name = String(command[0])
-          let argument =
-            command.count > 1
-            ? command[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-          if name == "/queue" {
-            let main = await mainProcess()
-            await handleQueueCommand(
-              argument, focus: loop.focus, main: main, runtime: runtime, terminal: terminal)
-            await refreshStatus()
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          if name == "/agents" || name == "/agent",
-            argument == "focus" || argument.hasPrefix("focus ")
-          {
-            await handleFocus(String(argument.dropFirst("focus".count)))
-            await refreshStatus()
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          if name == "/agents" || name == "/agent", argument.lowercased() == "clear" {
-            let cleared = Set(await runtime.supervisor.clearFinished())
-            // A chat whose idle process went with them gets a fresh one at
-            // its next turn; nothing it said is lost, the session has it.
-            chatProcessIDs = chatProcessIDs.filter { !cleared.contains($0.value) }
-            // Clearing is also how the agents saved with this chat are
-            // purged: what stays in its file is what the table still holds.
-            let dropped = await dropForgottenSubagents()
-            if dropped > 0 {
-              workspace.upsert(session.chat, selecting: true)
-              await saveWorkspace(&workspace, store: store, terminal: terminal)
-            }
-            let summary =
-              switch (cleared.count, dropped) {
-              case (0, 0): "No finished agents to clear."
-              case (let count, 0):
-                "Cleared \(count) finished agent\(count == 1 ? "" : "s"); /agents tree lists what still runs."
-              case (0, let dropped):
-                "Dropped \(dropped) agent\(dropped == 1 ? "" : "s") saved with this chat."
-              case (let count, let dropped):
-                "Cleared \(count) finished agent\(count == 1 ? "" : "s") and dropped \(dropped) saved with this chat; /agents tree lists what still runs."
-              }
-            await terminal.line(summary)
-            await refreshStatus()
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          if name == "/exit" || name == "/quit" {
-            loop.exiting = true
-            if let turn = loop.activeTurn {
-              turn.task.cancel()
-              continue
-            }
-            break events
-          }
-          if name == "/continue" {
-            if loop.activeTurn != nil {
-              await terminal.note("A turn is already running; Ctrl+C cancels it.")
-            } else {
-              await continueTurn()
-            }
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          if name == "/prompts" {
-            let before = REPLCommandSnapshot(session: session, configuration: configuration)
-            switch await handlePromptsCommand(
-              argument,
-              session: session,
-              configuration: &configuration,
-              configurationPath: visual.configurationPath,
-              skills: visual.skills.catalog,
-              terminal: terminal)
-            {
-            case .handled:
-              break
-            case .send(let message, let title):
-              session.refreshTitle(from: title)
-              await deliver(message, to: loop.focus)
-            case .selectSystemPrompt(let promptName, let message):
-              await selectSystemPrompt(
-                promptName,
-                session: &session,
-                runtime: runtime,
-                configuration: &configuration,
-                configurationPath: visual.configurationPath,
-                terminal: terminal)
-              session.touch()
-              workspace.upsert(session.chat, selecting: true)
-              await saveWorkspace(&workspace, store: store, terminal: terminal)
-              await noteTurnEffects(since: before)
-              if let message { await deliver(message, to: loop.focus) }
-            }
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          if name == "/skills" || name == "/skill", let request = skillPromptRequest(argument) {
-            if request.name.isEmpty {
-              await terminal.line("Usage: /skills prompt NAME [TEXT]   (/skills lists the names)")
-            } else if let skill = visual.skills.catalog.skill(named: request.name) {
-              session.refreshTitle(from: "\(skill.name) \(request.arguments)")
-              await deliver(skill.prompt(arguments: request.arguments), to: loop.focus)
-            } else {
-              await terminal.line("Unknown skill '\(request.name)'. /skills lists them.")
-            }
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          if name == "/edit", argument.lowercased() == "input" {
-            // The editor takes the terminal, as it does for /reply.
-            var message: String?
-            await withTurnInterruptSetAside {
-              message = await composeInput(terminal: terminal)
-            }
-            if let message { await deliver(message, to: loop.focus) }
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          if name == "/reply" {
-            // The editor takes the terminal, so a running turn keeps its
-            // Ctrl+C rather than ending on the one meant for the editor.
-            var message: String?
-            await withTurnInterruptSetAside {
-              message = await composeReply(argument, session: session, terminal: terminal)
-            }
-            if let message { await deliver(message, to: loop.focus) }
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          if name == "/btw" {
-            if loop.activeTurn != nil {
-              await terminal.note(
-                "/btw waits for the running turn; Ctrl+C cancels it. Messages typed now are queued."
-              )
-            } else {
-              await startBTW(argument)
-            }
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          #if PMAI_HAS_VISUAL
-            if name == "/visual", loop.activeTurn != nil {
-              await terminal.note(
-                "Visual mode takes the whole screen, so it waits for the running turn; Ctrl+C cancels it."
-              )
-              await releaseIfIdle(workspace: workspace)
-              continue
-            }
-          #endif
-          // Every other command runs now. What it changes and the running
-          // turn meet as noteTurnEffects describes, with a note, not a wait.
-          let before = REPLCommandSnapshot(session: session, configuration: configuration)
-          if name == "/project" {
-            await handleProjectCommand(
-              argument,
-              project: &project,
-              home: home,
-              store: store,
-              terminal: terminal)
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          if name == "/chat" {
-            await recordSubagents()
-            workspace.upsert(session.chat, selecting: true)
-            await handleWorkspaceChatCommand(
-              argument,
-              session: &session,
-              workspace: &workspace,
-              runtime: runtime,
-              configuration: configuration,
-              chatProcess: chatProcessIDs[session.id],
-              terminal: terminal)
-            await restoreSavedSubagents()
-            workspace.upsert(session.chat, selecting: true)
-            await saveWorkspace(&workspace, store: store, terminal: terminal)
-            await noteTurnEffects(since: before)
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          if name == "/import" {
-            await recordSubagents()
-            workspace.upsert(session.chat, selecting: true)
-            await withTurnInterruptSetAside {
-              await handleImportCommand(
-                argument,
-                session: &session,
-                workspace: &workspace,
-                runtime: runtime,
-                plugins: plugins,
-                configuration: &configuration,
-                catalogs: &catalogs,
-                visual: visual,
-                selectImportedChat: loop.activeTurn == nil,
-                terminal: terminal)
-            }
-            await restoreSavedSubagents()
-            workspace.upsert(session.chat, selecting: true)
-            await saveWorkspace(&workspace, store: store, terminal: terminal)
-            await noteTurnEffects(since: before)
-            await releaseIfIdle(workspace: workspace)
-            continue
-          }
-          await recordSubagents()
-          #if PMAI_HAS_VISUAL
-            if text == "/visual" {
-              workspace.upsert(session.chat, selecting: true)
-              session.visualSnapshot = visualSnapshot(for: workspace)
-            }
-          #endif
-          var exits = false
-          await withTurnInterruptSetAside {
-            exits = await handleCommand(
-              text,
-              session: &session,
-              runtime: runtime,
-              plugins: plugins,
-              ocrProvider: ocrProvider,
-              configuration: &configuration,
-              catalogs: &catalogs,
-              visual: visual,
-              chatProcess: chatProcessIDs[session.id],
-              editor: editor,
-              terminal: terminal)
-          }
-          if exits {
-            loop.exiting = true
-            break events
-          }
-          #if PMAI_HAS_VISUAL
-            if text == "/visual", let snapshot = session.visualSnapshot {
-              workspace = chatWorkspace(from: snapshot, focusedID: session.id, previous: workspace)
-              session = REPLSession(chat: workspace.selectedChat!)
-            } else {
-              session.touch()
-              workspace.upsert(session.chat, selecting: true)
-            }
-          #else
-            session.touch()
-            workspace.upsert(session.chat, selecting: true)
-          #endif
-          await saveWorkspace(&workspace, store: store, terminal: terminal)
-          await restoreSavedSubagents()
-          await noteTurnEffects(since: before)
-          await releaseIfIdle(workspace: workspace)
-          continue
-        }
-        await deliver(text, to: loop.focus)
-        await releaseIfIdle(workspace: workspace)
-
-      case .interrupt:
-        loop.readerParked = true
-        // Reflect Ctrl+C immediately, rather than waiting for a provider or
-        // tool cancellation to make its way through the supervisor.
-        activityWasInterrupted = true
-        if loop.pendingQueueMessage != nil {
-          loop.pendingQueueMessage = nil
-          await terminal.note("New message cancelled; the queue is unchanged.")
-        } else if let turn = loop.activeTurn {
-          turn.task.cancel()
-        } else if let waiting = loop.approvals.first {
-          loop.approvals.removeFirst()
-          waiting.reply.fail(CancellationError())
-        } else if loop.editingApproval != nil {
-          loop.editingApproval?.reply.resume(with: .deny(reason: "Edit cancelled."))
-          loop.editingApproval = nil
-        } else if screen != nil {
-          await terminal.note("Nothing to cancel. /exit or Ctrl+D quits.")
-        }
-        await refreshStatus()
-        await releaseIfIdle(workspace: workspace)
-
-      case .endOfFile:
-        loop.readerParked = true
-        loop.exiting = true
-        if let turn = loop.activeTurn {
-          turn.task.cancel()
-          continue
-        }
-        break events
-
-      case .turnFinished(let outcome):
-        interruptHandler.deactivate()
-        let turn = loop.activeTurn
-        loop.activeTurn = nil
-        var succeeded = false
-        var paused: AgentRunInterruption?
-        var kept = 0
-        var settled = true
-        switch outcome {
-        case .success(let result):
-          if let turn, turn.chatID != nil {
-            settled = settle(result.transcript, from: turn)
-          }
-          succeeded = true
-          paused = result.interruption
-        case .failure(let error):
-          let cancelled =
-            error is CancellationError || interruptHandler.interruptedActiveOperation()
-          if cancelled {
-            await terminal.recoverAfterCancellation()
-          } else {
-            await terminal.recoverAfterError(error.localizedDescription)
-          }
-          // What the run did before it broke off is not thrown away: the
-          // supervisor has its transcript, and /continue picks it up.
-          if let turn, turn.chatID != nil {
-            kept = await keepPartialTranscript(
-              of: turn, reason: cancelled ? "the run was cancelled" : "the run failed")
-          }
-        }
-        // The run's own chat is usually the one at the prompt; `elsewhere`
-        // names it when the person moved to another chat during the run.
-        let atPrompt = turn?.chatID == session.id
-        var elsewhere: String?
-        if let turn, let chatID = turn.chatID, !atPrompt {
-          elsewhere = workspace.chats.first { $0.id == chatID }?.displayTitle
-        }
-        if let turn {
-          let prefix = turn.kind == .btw ? "btw " : ""
-          var took = "\(prefix)took \(elapsedDescription(since: turn.started))"
-          if let elsewhere {
-            took += " Â· saved in '\(elsewhere)'"
-          } else if !settled {
-            took += " Â· its chat was closed; /agents log \(turn.pid.rawValue) shows the reply"
-          }
-          if let paused {
-            await terminal.note("â¸ \(took) Â· \(paused.summary)", color: "yellow")
-          } else {
-            await terminal.note(
-              succeeded ? "âœ“ \(took)" : "âœ— \(took)", color: succeeded ? "cyan" : "red")
-          }
-        }
-        if let turn, turn.chatID != nil {
-          // The agents the run started, and earlier ones still going, are
-          // saved with their chat as they stand now.
-          await recordSubagents()
-          if atPrompt {
-            session.touch()
-            workspace.upsert(session.chat, selecting: true)
-          }
-          await saveWorkspace(&workspace, store: store, terminal: terminal)
-        }
-        if loop.exiting { break events }
-        if let turn {
-          let waiting: Int
-          if let pid = chatProcessIDs[session.id] {
-            waiting = await runtime.supervisor.queuedMessages(for: pid).count
-          } else {
-            waiting = 0
-          }
-          // Entries deliberately ignored, or arriving after the last model
-          // turn, stay queued until the person chooses to submit them.
-          if waiting > 0 {
-            await terminal.note(
-              "\(waiting) queued message\(waiting == 1 ? "" : "s") still waiting: /queue shows them; /continue submits them; a new message asks what to do."
-            )
-          } else if let paused, atPrompt {
-            // A spent turn budget is a checkpoint, and with yolo on the person
-            // asked not to be consulted; time and token caps are theirs to lift.
-            if paused.isCheckpoint, await visual.approvalHandler.isYOLOEnabled() {
-              await terminal.note(
-                "continuing: yolo is on, so a spent turn budget does not stop the task (/set yolo off to be asked)",
-                color: "yellow")
-              await continueTurn()
-            } else {
-              await terminal.note(
-                "/continue picks the task up where it stopped Â· /set \(paused.settingKey) N goes further in one go"
-              )
-            }
-          } else if kept > 0, atPrompt {
-            await terminal.note(
-              "kept \(kept) message\(kept == 1 ? "" : "s") from the interrupted run Â· /continue resumes it"
-            )
-          }
-          if let elsewhere {
-            let left = await runtime.supervisor.queuedMessages(for: turn.pid).count
-            if left > 0 {
-              await terminal.note(
-                "\(left) queued message\(left == 1 ? "" : "s") wait in '\(elsewhere)'; /continue there submits them; a new message asks what to do."
-              )
-            } else if paused != nil || kept > 0 {
-              await terminal.note(
-                "/continue in '\(elsewhere)' picks that task up where it stopped.")
-            }
-          }
-        }
-        await refreshStatus()
-        await releaseIfIdle(workspace: workspace)
-
-      case .approval(let request, let reply):
-        loop.approvals.append((request, reply))
-        await terminal.approvalRequest(request)
-        await refreshStatus()
-
-      case .supervisor(let change):
-        switch change {
-        case .finished(let info) where info.depth > 0:
-          await terminal.processEnded(info)
-          if loop.focus == .agent(info.pid) {
-            loop.focus = .main
-            await terminal.note(
-              "agent#\(info.pid.rawValue) has ended; messages go to this chat again.")
-          }
-        case .attention where screen != nil:
-          await announceAgentAttention(
-            runtime: runtime, announced: &announcedAttention, terminal: terminal,
-            skippingApprovals: true)
-        default:
-          break
-        }
-        await refreshStatus()
-
-      case .activityPulse:
-        await refreshStatus()
-      }
-    }
-
-    for waiting in loop.approvals { waiting.reply.fail(CancellationError()) }
-    loop.editingApproval?.reply.fail(CancellationError())
-    reader.stop()
-    supervisorFeed.cancel()
-    activityPulse.cancel()
-    continuation.finish()
-    await visual.approvalHandler.setPrompter(nil)
-    await recordSubagents()
-    workspace.upsert(session.chat, selecting: true)
-    await saveWorkspace(&workspace, store: store, terminal: terminal, closing: true)
-    await terminal.attach(screen: nil)
-    editor.install(surface: nil)
-    TerminalScreen.install(nil)
-    screen?.deactivate()
-  }
-
-  /// `!ls`, `!git diff`, `!vim notes.md`: runs a line in the system shell with
-  /// the terminal handed over, so interactive programs work and their output
-  /// is neither captured nor sent to the model.
-  private static func runShellCommand(_ command: String, terminal: TerminalWriter) async {
-    let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else {
-      await terminal.line("Usage: !COMMAND")
-      return
-    }
-    var waitStatus: CInt = -1
-    let launch = { waitStatus = trimmed.withCString(posixSystem) }
-    if let screen = TerminalScreen.current {
-      screen.suspendTerminal(launch)
-    } else {
-      launch()
-    }
-    guard waitStatus != -1 else {
-      await terminal.line(
-        "error: Could not run '\(trimmed)': \(String(cString: strerror(errno)))",
-        to: .standardError)
-      return
-    }
-    // The wait status packs a signal in the low bits and an exit code above.
-    let signalNumber = waitStatus & 0x7f
-    if signalNumber != 0 {
-      await terminal.note("killed by signal \(signalNumber)")
-    } else if (waitStatus >> 8) & 0xff != 0 {
-      await terminal.note("exit status \((waitStatus >> 8) & 0xff)")
-    }
-  }
-
-  /// Reports background agents that are waiting on somebody, once each. A
-  /// process that stops asking and asks again is announced again.
-  private static func announceAgentAttention(
-    runtime: AgentRuntime,
-    announced: inout Set<AgentPID>,
-    terminal: TerminalWriter,
-    skippingApprovals: Bool = false
-  ) async {
-    // On the persistent screen an approval is already a question at the
-    // prompt, so only the other kinds of attention need a line here.
-    let waiting = await runtime.supervisor.processesNeedingAttention().filter { process in
-      guard skippingApprovals, case .approval = process.attention else { return true }
-      return false
-    }
-    let pids = Set(waiting.map(\.pid))
-    announced.formIntersection(pids)
-    for process in waiting where !announced.contains(process.pid) {
-      announced.insert(process.pid)
-      let verb =
-        switch process.attention {
-        case .approval: "needs approval"
-        case .input: "is waiting for you"
-        case .error: "stopped"
-        case .finished: "finished"
-        case nil: "changed"
-        }
-      await terminal.line(
-        "agent \(process.pid) (\(process.agentID)) \(verb): "
-          + "\(process.attention?.summary ?? "")  Â·  /agents log \(process.pid.rawValue)")
-    }
-  }
-
-  private static func submit(
-    _ text: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    process: inout AgentPID?,
-    terminal: TerminalWriter,
-    interruptHandler: TerminalInterruptHandler? = nil
-  ) async -> Bool {
-    var content: [ContentPart] = [.text(text)]
-    content.append(contentsOf: session.pendingContent)
-    session.pendingContent.removeAll()
-    session.history.append(AgentMessage(role: .user, content: content))
-    session.refreshTitle(from: text)
-    await terminal.resetResponse()
-    do {
-      let profile = session.profile
-      let request = AgentRequest(
-        agentID: profile.agentID,
-        provider: profile.provider,
-        model: profile.model,
-        messages: session.history.messages,
-        toolNames: profile.toolNames,
-        toolGroupNames: profile.toolGroupNames,
-        subagentNames: profile.subagentNames,
-        toolChoice: profile.toolChoice,
-        responseFormat: profile.responseFormat,
-        options: profile.options,
-        limits: profile.limits,
-        stream: profile.stream,
-        toolCallingStrategy: profile.toolCallingStrategy,
-        useToolProxy: profile.useToolProxy,
-        proxyExposedTools: profile.proxyExposedTools,
-        toolDelegation: profile.toolDelegation,
-        retry: profile.retry,
-        autocompact: profile.autocompact,
-        context: profile.context,
-        sessionID: session.sessionID)
-      let existingProcess = process
-      let task = Task {
-        try await runtime.run(request, process: existingProcess) { event in
-          await terminal.consume(event)
-        }
-      }
-      interruptHandler?.activate { task.cancel() }
-      defer { interruptHandler?.deactivate() }
-      let result = try await task.value
-      process = await runtime.supervisor.tree().processes.first { $0.runID == result.runID }?.pid
-      session.history.replaceAll(with: result.transcript)
-      if let interruption = result.interruption {
-        await terminal.note(
-          "â¸ \(interruption.summary) Â· send another message to continue, or raise \(interruption.settingKey)",
-          color: "yellow")
-      }
-      return true
-    } catch {
-      if error is CancellationError || interruptHandler?.interruptedActiveOperation() == true {
-        await terminal.recoverAfterCancellation()
-        return false
-      }
-      await terminal.recoverAfterError(error.localizedDescription)
-      return false
-    }
-  }
-
-  /// Builds the throwaway context used by `/btw`: the active agent's system
-  /// prompt plus this one question, with none of the chat's transcript or
-  /// pending attachments.
-  private static func btwRequest(_ text: String, profile: SessionProfile) -> AgentRequest? {
-    let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !prompt.isEmpty else { return nil }
-    var messages = AgentChat.initialHistory(for: profile.agentDefinition)
-    messages.append(.user(prompt))
-    return AgentRequest(
-      agentID: profile.agentID,
-      provider: profile.provider,
-      model: profile.model,
-      messages: messages,
-      toolNames: profile.toolNames,
-      toolGroupNames: profile.toolGroupNames,
-      subagentNames: profile.subagentNames,
-      toolChoice: profile.toolChoice,
-      responseFormat: profile.responseFormat,
-      options: profile.options,
-      limits: profile.limits,
-      stream: profile.stream,
-      toolCallingStrategy: profile.toolCallingStrategy,
-      useToolProxy: profile.useToolProxy,
-      proxyExposedTools: profile.proxyExposedTools,
-      toolDelegation: profile.toolDelegation,
-      retry: profile.retry,
-      autocompact: profile.autocompact,
-      context: profile.context)
-  }
-
-  /// Visual mode runs commands in their own task already, so it can await the
-  /// isolated turn directly. The REPL starts the same request in its event loop
-  /// to keep approvals and Ctrl+C responsive.
-  private static func handleBTWCommand(
-    _ text: String,
-    session: REPLSession,
-    runtime: AgentRuntime,
-    terminal: TerminalWriter
-  ) async {
-    guard let request = btwRequest(text, profile: session.profile) else {
-      await terminal.line("Usage: /btw PROMPT")
-      return
-    }
-    await terminal.resetResponse()
-    do {
-      _ = try await runtime.run(request) { event in
-        await terminal.consume(event)
-      }
-    } catch is CancellationError {
-      await terminal.recoverAfterCancellation()
-    } catch {
-      await terminal.recoverAfterError(error.localizedDescription)
-    }
-  }
-
-  /// The agent, estimated context, and model a chat runs on. The context is
-  /// deliberately immediately before the model so it stays easy to compare.
-  private static func promptIdentity(_ session: REPLSession) -> String {
-    let profile = session.profile
-    let model = profile.model.isEmpty ? profile.provider.rawValue : profile.model
-    return "[\(profile.agentID)] Â· \(promptContextStatus(session)) Â· \(model)"
-  }
-
-  /// The final component of the working directory, with a useful root label.
-  private static func currentDirectoryName() -> String {
-    let path = FileManager.default.currentDirectoryPath
-    if path == "/" { return path }
-    let name = URL(fileURLWithPath: path, isDirectory: true).lastPathComponent
-    return name.isEmpty ? path : name
-  }
-
-  /// Removes terminal controls from the configured label before showing it.
-  private static func visibleUITitle(_ title: String) -> String {
-    String(title.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) })
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-  }
-
-  /// One Unicode Braille pattern makes a compact, lively activity marker.
-  private static func randomBrailleString() -> String {
-    let randomValue = Int.random(in: 0x2800...0x28FF)
-    return String(Character(Unicode.Scalar(randomValue)!))
-  }
-
-  /// How long a turn took, as `5s`, `1m4s`, or `2h3m4s`.
-  private static func elapsedDescription(since start: ContinuousClock.Instant) -> String {
-    let parts = (ContinuousClock.now - start).components
-    let total = Int(parts.seconds) + (parts.attoseconds >= 500_000_000_000_000_000 ? 1 : 0)
-    guard total >= 1 else { return "<1s" }
-    let (hours, minutes, seconds) = (total / 3600, total % 3600 / 60, total % 60)
-    if hours > 0 { return "\(hours)h\(minutes)m\(seconds)s" }
-    if minutes > 0 { return "\(minutes)m\(seconds)s" }
-    return "\(seconds)s"
-  }
-
-  /// A fast, deliberately approximate context indicator. Providers tokenize
-  /// differently and do not all expose their context-window size, so showing
-  /// an estimate is more honest than implying an exact percentage.
-  private static func promptContextStatus(_ session: REPLSession) -> String {
-    let characters = session.history.messages.reduce(0) { total, message in
-      total + message.content.reduce(0) { $0 + renderFullContent($1).utf8.count }
-    }
-    let estimatedTokens = (characters + 2) / 3
-    let messageLabel = "\(session.history.count) msg"
-    return "\(messageLabel) \(ModelUsageFormat.tokens(estimatedTokens, estimated: true))"
-  }
-
-  private static func changeWorkingDirectory(_ argument: String, terminal: TerminalWriter) async {
-    let path = argument.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !path.isEmpty else {
-      await terminal.line("Usage: /cd PATH")
-      return
-    }
-    let expanded = NSString(string: path).expandingTildeInPath
-    let current = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-    let target = URL(fileURLWithPath: expanded, relativeTo: current).standardizedFileURL
-    var isDirectory: ObjCBool = false
-    guard FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory),
-      isDirectory.boolValue
-    else {
-      await terminal.line("error: Not a directory: \(target.path)", to: .standardError)
-      return
-    }
-    guard FileManager.default.changeCurrentDirectoryPath(target.path) else {
-      await terminal.line("error: Could not change directory to \(target.path)", to: .standardError)
-      return
-    }
-    await terminal.line(FileManager.default.currentDirectoryPath)
-  }
-
-  private static func handleCommand(
-    _ input: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    ocrProvider: any OCRProvider,
-    configuration: inout MaiConfiguration?,
-    catalogs: inout [MCPServerCatalog],
-    visual: VisualBridge,
-    chatProcess: AgentPID? = nil,
-    editor: TerminalLineEditor? = nil,
-    terminal: TerminalWriter
-  ) async -> Bool {
-    let parts = input.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(String.init)
-    let argument = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-
-    switch parts[0] {
-    case "/exit", "/quit":
-      return true
-    case "/version":
-      await terminal.line(version)
-    case "/help":
-      switch argument.lowercased() {
-      case "":
-        await terminal.line(replHelp)
-      case "set", "/set":
-        await terminal.line(setHelp)
-      case "memory", "/memory":
-        await terminal.line(memoryHelp)
-      case "todo", "/todo":
-        await terminal.line(todoHelp)
-      case "prompt", "prompts", "/prompt", "/prompts":
-        await terminal.line(promptHelp)
-      case "agents", "agent", "/agents", "/agent":
-        await terminal.line(agentsHelp)
-      case "mcp", "/mcp":
-        await terminal.line(mcpCommandHelp)
-      case "chat", "/chat":
-        await terminal.line(chatHelp)
-      case "edit", "/edit":
-        await terminal.line(editHelp)
-      case "tools", "/tools":
-        await terminal.line(toolHelp)
-      case "queue", "/queue":
-        await terminal.line(queueHelp)
-      case "export", "/export":
-        await terminal.line(exportHelp)
-      case "import", "/import":
-        await terminal.line(importHelp)
-      case "reply", "/reply":
-        await terminal.line(replyHelp)
-      case "copy", "/copy":
-        await terminal.line(copyHelp)
-      case "stats", "/stats":
-        await terminal.line(statsHelp)
-      case "skills", "skill", "/skills", "/skill":
-        await terminal.line(skillsHelp)
-      default:
-        await terminal.line(
-          "Unknown help topic '\(argument)'. Try /help, or /help set, memory, todo, prompts, agents, mcp, chat, edit, tools, skills, queue, export, import, copy, or stats."
-        )
-      }
-    case "/cwd", "/pwd":
-      await terminal.line(FileManager.default.currentDirectoryPath)
-    case "/cd":
-      await changeWorkingDirectory(argument, terminal: terminal)
-    case "/nothink":
-      await handleEffortCommand(
-        "off", session: &session, runtime: runtime, configuration: &configuration,
-        configurationPath: visual.configurationPath, terminal: terminal)
-    case "/set":
-      await handleSetCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        approvalHandler: visual.approvalHandler,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        terminal: terminal)
-    case "/providers":
-      for provider in await runtime.availableProviders() {
-        let selected = provider.id == session.profile.provider ? "*" : " "
-        let baseURL =
-          (visual.providerBaseURLs.url(for: provider.id.rawValue)
-          ?? configuration?.providers.first { $0.id == provider.id.rawValue }?.baseURL)
-          .map { " â€” \($0.absoluteString)" } ?? ""
-        await terminal.line("\(selected) \(provider.id) â€” \(provider.displayName)\(baseURL)")
-      }
-    case "/plugins":
-      for plugin in await plugins.installedPlugins() {
-        let capabilities = plugin.manifest.capabilities.map(\.rawValue).sorted().joined(
-          separator: ", ")
-        let origin = plugin.origin.map { " â€” \($0)" } ?? ""
-        await terminal.line(
-          "\(plugin.manifest.id) \(plugin.manifest.version) [\(capabilities)]\(origin)")
-      }
-    case "/models":
-      let providerID = argument.isEmpty ? session.profile.provider : ProviderID(argument)
-      do {
-        let models = try await runtime.availableModels(provider: providerID)
-        if models.isEmpty {
-          await terminal.line("Provider '\(providerID)' returned no models.")
-        }
-        for model in models {
-          let selected =
-            providerID == session.profile.provider && model.id == session.profile.model
-            ? "*" : " "
-          let owner = model.ownedBy.map { " â€” \($0)" } ?? ""
-          let label =
-            model.displayName == model.id ? model.id : "\(model.id) (\(model.displayName))"
-          await terminal.line("\(selected) \(label)\(owner)")
-        }
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-    case "/btw":
-      await handleBTWCommand(argument, session: session, runtime: runtime, terminal: terminal)
-    case "/todo":
-      await handleTodoCommand(argument, todo: visual.todo, terminal: terminal)
-    case "/skills", "/skill":
-      await handleSkillsCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        skills: visual.skills,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        terminal: terminal)
-    case "/memory":
-      await handleMemoryCommand(
-        argument,
-        session: session,
-        runtime: runtime,
-        memory: visual.memory,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        terminal: terminal)
-    case "/prompts":
-      // The REPL loop answers /prompts before it gets here, so a prompt can
-      // be sent; from anywhere else the catalog is listed and kept.
-      switch await handlePromptsCommand(
-        argument,
-        session: session,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        skills: visual.skills.catalog,
-        terminal: terminal)
-      {
-      case .handled:
-        break
-      case .send, .selectSystemPrompt:
-        await terminal.line("Use $NAME [TEXT] or /prompts NAME [TEXT] at the chat prompt.")
-      }
-    case "/prompt":
-      await handlePromptCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        skills: visual.skills.catalog,
-        terminal: terminal)
-    case "/chat":
-      await handleChatCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        compactPrompt: configuration?.prompts?.compact,
-        chatProcess: chatProcess,
-        terminal: terminal)
-    case "/edit":
-      await handleEditCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        memory: visual.memory,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        providerBaseURLs: visual.providerBaseURLs,
-        terminal: terminal)
-    case "/provider":
-      await handleProviderCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        providerBaseURLs: visual.providerBaseURLs,
-        terminal: terminal)
-    case "/baseurl":
-      await handleBaseURLCommand(
-        argument,
-        currentProvider: session.profile.provider,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        providerBaseURLs: visual.providerBaseURLs,
-        terminal: terminal)
-    case "/model":
-      if argument.isEmpty {
-        await terminal.line(
-          session.profile.model.isEmpty ? "No model selected." : "Model: \(session.profile.model)")
-      } else {
-        session.profile.model = argument
-        let saved = await persistAgentProfile(
-          session: session,
-          configuration: &configuration,
-          configurationPath: visual.configurationPath,
-          runtime: runtime,
-          terminal: terminal)
-        if saved {
-          await terminal.line("Model: \(argument) (saved for agent \(session.profile.agentID))")
-        }
-      }
-    case "/agents":
-      await handleAgentsCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        providerBaseURLs: visual.providerBaseURLs,
-        terminal: terminal)
-    case "/agent":
-      await handleAgentCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        providerBaseURLs: visual.providerBaseURLs.snapshot(),
-        terminal: terminal)
-    case "/tools":
-      await handleToolsCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        terminal: terminal)
-    case "/mcp":
-      await handleMCPCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        catalogs: &catalogs,
-        terminal: terminal)
-    case "/mcps":
-      await handleMCPCommand(
-        "list",
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: visual.configurationPath,
-        catalogs: &catalogs,
-        terminal: terminal)
-    case "/image":
-      let imageArguments = argument.split(
-        maxSplits: 1, whereSeparator: \Character.isWhitespace
-      ).map(String.init)
-      guard imageArguments.count == 2,
-        let mode = ImageAttachmentMode(rawValue: imageArguments[0].lowercased())
-      else {
-        await terminal.line("Usage: /image <tiny|small|medium|big|full|ocr> PATH")
-        return false
-      }
-      do {
-        let path = imageArguments[1].trimmingCharacters(in: .whitespacesAndNewlines)
-        session.pendingContent.append(
-          try await imageContent(path: path, mode: mode, ocrProvider: ocrProvider))
-        if mode == .ocr {
-          let markdownName = (path as NSString).lastPathComponent
-          await terminal.line(
-            "OCR text queued as \((markdownName as NSString).deletingPathExtension).md")
-        } else {
-          await terminal.line("Image queued at \(mode.rawValue) size: \(path)")
-        }
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-    case "/attach":
-      await attachDocument(
-        argument,
-        session: &session,
-        ocrProvider: ocrProvider,
-        editor: editor,
-        terminal: terminal)
-    case "/copy":
-      await copyToClipboard(argument, session: session, terminal: terminal)
-    case "/export":
-      await handleExportCommand(
-        argument,
-        session: session,
-        runtime: runtime,
-        process: chatProcess,
-        configuration: configuration,
-        skills: visual.skills.catalog,
-        terminal: terminal)
-    case "/import":
-      await terminal.line("Use /import PATH at the interactive chat prompt.")
-    case "/stats":
-      await handleStatsCommand(argument, store: visual.usageStats, terminal: terminal)
-    #if PMAI_HAS_VISUAL
-      case "/visual":
-        await runVisualMode(
-          session: &session,
-          runtime: runtime,
-          plugins: plugins,
-          ocrProvider: ocrProvider,
-          configuration: &configuration,
-          catalogs: &catalogs,
-          visual: visual,
-          terminal: terminal)
-    #endif
-    case "/clear":
-      session.reset()
-      // The agents the cleared runs started leave the table with them, so
-      // the next save does not bring them back; running ones stay.
-      if let chatProcess { await runtime.supervisor.clearFinished(under: chatProcess) }
-      await terminal.line("Conversation cleared.")
-    case "/queue":
-      await terminal.line("The message queue lives at the terminal prompt.\n" + queueHelp)
-    case "/reply":
-      await terminal.line(
-        "Use /reply at the chat prompt; it opens the last reply quoted in $EDITOR.")
-    case "/stop":
-      await terminal.line("Use /stop at the chat prompt to interrupt the running turn and keep its queue.")
-    case "/continue":
-      await terminal.line(
-        "Use /continue at the chat prompt; in visual mode, send \"continue\" as a message.")
-    default:
-      await terminal.line("Unknown command. Type /help.")
-    }
-    return false
-  }
-
-  private static func handleMCPCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    catalogs: inout [MCPServerCatalog],
-    terminal: TerminalWriter
-  ) async {
-    let pieces = argument.split(
-      maxSplits: 1, whereSeparator: \Character.isWhitespace
-    ).map(String.init)
-    let action = pieces.first?.lowercased() ?? "list"
-    switch action {
-    case "", "list":
-      let configured = configuration?.mcpServers ?? []
-      let connected = Dictionary(uniqueKeysWithValues: catalogs.map { ($0.serverID, $0) })
-      if configured.isEmpty, catalogs.isEmpty {
-        await terminal.line("No configured MCP servers.")
-        return
-      }
-      for server in configured {
-        let transport =
-          server.kind == "stdio"
-          ? server.command ?? "stdio" : server.url?.absoluteString ?? server.kind
-        let state: String
-        if !server.enabled {
-          state = "disabled"
-        } else if let catalog = connected[server.id] {
-          state =
-            "connected â€” \(catalog.tools.count) tools, \(catalog.resources.count) resources, MCP \(catalog.protocolVersion)"
-        } else {
-          state = "not connected"
-        }
-        await terminal.line("\(server.id) â€” \(transport) [\(state)]")
-      }
-      let configuredIDs = Set(configured.map(\.id))
-      for catalog in catalogs where !configuredIDs.contains(catalog.serverID) {
-        await terminal.line(
-          "\(catalog.serverID) â€” \(catalog.tools.count) tools, \(catalog.resources.count) resources, MCP \(catalog.protocolVersion) [connected]"
-        )
-      }
-
-    case "add":
-      guard let rawAddArguments = pieces.dropFirst().first else {
-        await terminal.line(mcpCommandHelp)
-        return
-      }
-      guard var draft = configuration, let configurationPath else {
-        await terminal.line("error: No writable configuration is active.", to: .standardError)
-        return
-      }
-      do {
-        let server = try parseStdioMCPAddArguments(rawAddArguments)
-        guard !draft.mcpServers.contains(where: { $0.id == server.id }) else {
-          throw MCPCommandError.duplicateID(server.id)
-        }
-        let source = try await plugins.makeMCPToolSource(
-          kind: server.kind,
-          configuration: server,
-          environment: ProcessInfo.processInfo.environment)
-        let toolsBefore = Set(await runtime.availableTools().map(\.name))
-        let catalog = try await runtime.register(mcp: source)
-        let addedTools = Set(await runtime.availableTools().map(\.name)).subtracting(toolsBefore)
-
-        draft.mcpServers.append(server)
-        try draft.save(to: URL(fileURLWithPath: configurationPath))
-        configuration = draft
-        catalogs.append(catalog)
-        await terminal.line(
-          "Added and connected stdio MCP '\(server.id)'; enabled all \(addedTools.count) tools for every agent."
-        )
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-
-    case "enable":
-      guard pieces.count == 2 else {
-        await terminal.line(mcpCommandHelp)
-        return
-      }
-      let id = pieces[1].trimmingCharacters(in: .whitespacesAndNewlines)
-      guard var draft = configuration, let configurationPath,
-        let serverIndex = draft.mcpServers.firstIndex(where: { $0.id == id })
-      else {
-        await terminal.line("error: MCP server '\(id)' is not configured.", to: .standardError)
-        return
-      }
-      if catalogs.contains(where: { $0.serverID == id }) {
-        await terminal.line("MCP server '\(id)' is already enabled and connected.")
-        return
-      }
-      do {
-        var server = draft.mcpServers[serverIndex]
-        server.enabled = true
-        let source = try await plugins.makeMCPToolSource(
-          kind: server.kind,
-          configuration: server,
-          environment: ProcessInfo.processInfo.environment)
-        let toolsBefore = Set(await runtime.availableTools().map(\.name))
-        let catalog = try await runtime.register(mcp: source)
-        let addedTools = Set(await runtime.availableTools().map(\.name)).subtracting(toolsBefore)
-        draft.mcpServers[serverIndex] = server
-        try draft.save(to: URL(fileURLWithPath: configurationPath))
-        configuration = draft
-        catalogs.append(catalog)
-        await terminal.line(
-          "Enabled and connected MCP '\(id)'; enabled all \(addedTools.count) tools for every agent."
-        )
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-
-    case "disable":
-      guard pieces.count == 2 else {
-        await terminal.line(mcpCommandHelp)
-        return
-      }
-      let id = pieces[1].trimmingCharacters(in: .whitespacesAndNewlines)
-      guard var draft = configuration, let configurationPath,
-        let serverIndex = draft.mcpServers.firstIndex(where: { $0.id == id })
-      else {
-        await terminal.line("error: MCP server '\(id)' is not configured.", to: .standardError)
-        return
-      }
-      if !draft.mcpServers[serverIndex].enabled {
-        await terminal.line("MCP server '\(id)' is already disabled.")
-        return
-      }
-      let namespace = mcpNamespace(for: draft.mcpServers[serverIndex])
-      let registeredTools = Set(await runtime.availableTools().map(\.name))
-      let removedTools = registeredTools.filter { $0.hasPrefix("\(namespace)::") }
-      draft.mcpServers[serverIndex].enabled = false
-      for index in draft.agents.indices {
-        draft.agents[index].toolNames.subtract(removedTools)
-      }
-      var profile = session.profile
-      profile.toolNames.subtract(removedTools)
-      do {
-        try draft.save(to: URL(fileURLWithPath: configurationPath))
-        _ = await runtime.unregisterMCP(serverID: id)
-        for agent in draft.agents {
-          try await runtime.register(agent: agent, replacingExisting: true)
-        }
-        session.profile = profile
-        configuration = draft
-        catalogs.removeAll { $0.serverID == id }
-        await terminal.line("Disabled MCP '\(id)' and removed \(removedTools.count) live tools.")
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-
-    default:
-      await terminal.line(mcpCommandHelp)
-    }
-  }
-
-  private static func mcpNamespace(for server: ConfiguredMCPServer) -> String {
-    let prefix = server.toolNamePrefix?.trimmingCharacters(in: .whitespacesAndNewlines)
-    return prefix.flatMap { $0.isEmpty ? nil : $0 } ?? server.id
-  }
-
-  private static func parseStdioMCPAddArguments(_ arguments: String) throws
-    -> ConfiguredMCPServer
-  {
-    let words = try shellWords(arguments)
-    guard !words.isEmpty else { throw MCPCommandError.missingCommand }
-    var environment: [String: String] = [:]
-    var workingDirectory: String?
-    var timeout: TimeInterval?
-    var prefix: String?
-    var approval = ToolApprovalRequirement.confirm
-    var id: String?
-    let separatorIndex = words.firstIndex(of: "--")
-    let optionWords: ArraySlice<String>
-    let commandWords: ArraySlice<String>
-    if let separatorIndex {
-      var optionsStart = words.startIndex
-      if optionsStart < separatorIndex, !words[optionsStart].hasPrefix("-") {
-        id = words[optionsStart]
-        optionsStart += 1
-      }
-      optionWords = words[optionsStart..<separatorIndex]
-      commandWords = words[words.index(after: separatorIndex)...]
-    } else {
-      optionWords = []
-      commandWords = words[...]
-    }
-
-    var index = optionWords.startIndex
-    while index < optionWords.endIndex {
-      switch optionWords[index] {
-      case "--name":
-        index += 1
-        guard index < optionWords.endIndex else {
-          throw MCPCommandError.missingOptionValue("--name")
-        }
-        id = optionWords[index]
-        index += 1
-      case "--env":
-        index += 1
-        guard index < optionWords.endIndex,
-          let separator = optionWords[index].firstIndex(of: "="),
-          separator != optionWords[index].startIndex
-        else { throw MCPCommandError.invalidEnvironment }
-        environment[String(optionWords[index][..<separator])] = String(
-          optionWords[index][optionWords[index].index(after: separator)...])
-        index += 1
-      case "--cwd":
-        index += 1
-        guard index < optionWords.endIndex else {
-          throw MCPCommandError.missingOptionValue("--cwd")
-        }
-        workingDirectory = optionWords[index]
-        index += 1
-      case "--timeout":
-        index += 1
-        guard index < optionWords.endIndex,
-          let value = TimeInterval(optionWords[index]), value > 0
-        else {
-          throw MCPCommandError.invalidTimeout
-        }
-        timeout = value
-        index += 1
-      case "--prefix":
-        index += 1
-        guard index < optionWords.endIndex else {
-          throw MCPCommandError.missingOptionValue("--prefix")
-        }
-        prefix = optionWords[index]
-        index += 1
-      case "--approval":
-        index += 1
-        guard index < optionWords.endIndex,
-          let value = ToolApprovalRequirement(rawValue: optionWords[index].lowercased())
-        else { throw MCPCommandError.invalidApproval }
-        approval = value
-        index += 1
-      default:
-        throw MCPCommandError.invalidOption(optionWords[index])
-      }
-    }
-    guard let command = commandWords.first, !command.isEmpty else {
-      throw MCPCommandError.missingCommand
-    }
-    let inferredID = URL(fileURLWithPath: command).lastPathComponent
-    let resolvedID = id ?? inferredID
-    guard !resolvedID.isEmpty else { throw MCPCommandError.missingID }
-    guard isValidMCPID(resolvedID) else { throw MCPCommandError.invalidID(resolvedID) }
-    return ConfiguredMCPServer(
-      id: resolvedID,
-      kind: "stdio",
-      command: command,
-      args: Array(commandWords.dropFirst()),
-      env: environment,
-      cwd: workingDirectory,
-      timeout: timeout,
-      toolNamePrefix: prefix,
-      defaultApproval: approval)
-  }
-
-  private static func isValidMCPID(_ id: String) -> Bool {
-    guard id != ".", id != "..",
-      id.first.map({ $0.isLetter || $0.isNumber }) == true
-    else {
-      return false
-    }
-    return id.allSatisfy { $0.isLetter || $0.isNumber || "._-".contains($0) }
-  }
-
-  private static func resolvedSystemPromptName(
-    _ requested: String,
-    configuration: MaiConfiguration?
-  ) -> String? {
-    let names = configuration?.prompts?.system.keys ?? [String: String]().keys
-    if names.contains(requested) { return requested }
-    let matches = names.filter { $0.caseInsensitiveCompare(requested) == .orderedSame }
-    return matches.count == 1 ? matches[0] : nil
-  }
-
-  /// `/todo` in full: the same list the `todo_*` tools drive, for the person
-  /// at the keyboard. Every action reads the file afresh, so the list an
-  /// agent just changed is what gets shown or edited.
-  private static func handleTodoCommand(
-    _ argument: String,
-    todo: TodoState,
-    terminal: TerminalWriter
-  ) async {
-    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    let action = fields.first?.lowercased() ?? ""
-    let rest = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-    var list = todo.current
-
-    switch action {
-    case "", "show", "list":
-      await terminal.line(list.listing)
-
-    case "add":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /todo add TEXT")
-        return
-      }
-      await terminal.line(
-        MaiTodoTools.execute(
-          name: MaiTodoTools.addName, arguments: ["title": .string(rest)], list: &list))
-      await storeTodo(list, in: todo, terminal: terminal)
-
-    case "done", "check":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /todo done NUMBER|TEXT")
-        return
-      }
-      await terminal.line(
-        MaiTodoTools.execute(
-          name: MaiTodoTools.doneName, arguments: ["task": .string(rest)], list: &list))
-      await storeTodo(list, in: todo, terminal: terminal)
-
-    case "remove", "rm", "delete", "del":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /todo remove NUMBER|TEXT")
-        return
-      }
-      guard let index = list.index(matching: rest) else {
-        await terminal.line(
-          list.isEmpty ? "The todo list is empty." : "No todo matched '\(rest)'.\n\(list.listing)")
-        return
-      }
-      guard let removed = list.remove(at: index) else { return }
-      await terminal.line("Removed: \(removed.title)\n\(list.listing)")
-      await storeTodo(list, in: todo, terminal: terminal)
-
-    case "sweep":
-      let removed = list.removeCompleted()
-      guard removed > 0 else {
-        await terminal.line("No completed todo items.")
-        return
-      }
-      await terminal.line("Removed \(removed) completed todo item\(removed == 1 ? "" : "s").")
-      await storeTodo(list, in: todo, terminal: terminal)
-
-    case "edit":
-      guard
-        let edited = await editTemporaryText(
-          list.markdown, suffix: AgentTodoList.filename, terminal: terminal)
-      else { return }
-      await storeTodo(AgentTodoList(markdown: edited), in: todo, terminal: terminal)
-
-    case "clear":
-      await storeTodo(AgentTodoList(), in: todo, terminal: terminal)
-
-    case "path":
-      await terminal.line(todo.url?.path ?? AgentTodoList.filename)
-
-    default:
-      await terminal.line(todoHelp)
-    }
-  }
-
-  private static func storeTodo(
-    _ list: AgentTodoList,
-    in todo: TodoState,
-    terminal: TerminalWriter
-  ) async {
-    do {
-      try todo.save(list)
-      await terminal.line(
-        list.isEmpty
-          ? "Todo list cleared."
-          : "Todo list saved to \(todo.url?.path ?? AgentTodoList.filename) (\(list.pendingCount) pending, \(list.doneCount) done)."
-      )
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  /// `/memory` in full: read it, edit it, extend it from what was said, and
-  /// decide how far the chat tools may look.
-  private static func handleMemoryCommand(
-    _ argument: String,
-    session: REPLSession,
-    runtime: AgentRuntime,
-    memory: MemoryState,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    let action = fields.first?.lowercased() ?? ""
-    let rest = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-    let settings = memory.configuration
-
-    switch action {
-    case "", "show":
-      let current = memory.current
-      let state = settings.enabled ? "on" : "off"
-      await terminal.line(
-        "Memory: \(state) Â· scope \(settings.scope.rawValue) Â· \(current.lineCount) line\(current.lineCount == 1 ? "" : "s")"
-      )
-      await terminal.line(current.isEmpty ? "(empty)" : current.text)
-
-    case "edit":
-      guard
-        let edited = await editTemporaryText(
-          memory.current.text, suffix: "memory.md", terminal: terminal)
-      else { return }
-      await store(
-        AgentMemory(text: edited), in: memory, runtime: runtime, terminal: terminal)
-
-    case "set", "replace":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /memory set TEXT")
-        return
-      }
-      await store(AgentMemory(text: rest), in: memory, runtime: runtime, terminal: terminal)
-
-    case "add", "append":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /memory add TEXT")
-        return
-      }
-      var updated = memory.current
-      updated.append(rest)
-      await store(updated, in: memory, runtime: runtime, terminal: terminal)
-
-    case "clear", "forget":
-      await store(AgentMemory(), in: memory, runtime: runtime, terminal: terminal)
-
-    case "reload":
-      memory.reload()
-      await runtime.configureMemory(memory.promptSection)
-      await terminal.line("Reloaded \(memory.url?.path ?? AgentMemory.filename).")
-
-    case "learn":
-      await learnMemory(
-        rest,
-        session: session,
-        runtime: runtime,
-        memory: memory,
-        promptTemplate: configuration?.prompts?.memory,
-        terminal: terminal)
-
-    case "scope":
-      guard !rest.isEmpty else {
-        await terminal.line("Memory scope: \(settings.scope.rawValue)")
-        return
-      }
-      guard let scope = MemoryScope(rawValue: rest.lowercased()) else {
-        await terminal.line("Usage: /memory scope <none|project|all>")
-        return
-      }
-      await persistMemorySettings(
-        ConfiguredMemory(enabled: settings.enabled, scope: scope),
-        memory: memory,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        note:
-          "The chat tools now read \(scope == .none ? "nothing" : scope.displayName.lowercased()).",
-        terminal: terminal)
-
-    case "on", "off":
-      await persistMemorySettings(
-        ConfiguredMemory(enabled: action == "on", scope: settings.scope),
-        memory: memory,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        note:
-          action == "on"
-          ? "Memory is added to the system prompt again."
-          : "Memory is kept but no longer sent to the model.",
-        terminal: terminal)
-      await runtime.configureMemory(memory.promptSection)
-
-    default:
-      await terminal.line(memoryHelp)
-    }
-  }
-
-  private static func store(
-    _ updated: AgentMemory,
-    in memory: MemoryState,
-    runtime: AgentRuntime,
-    terminal: TerminalWriter
-  ) async {
-    do {
-      try memory.save(updated)
-      await runtime.configureMemory(memory.promptSection)
-      await terminal.line(
-        updated.isEmpty
-          ? "Memory cleared."
-          : "Memory saved to \(memory.url?.path ?? AgentMemory.filename) (\(updated.lineCount) line\(updated.lineCount == 1 ? "" : "s"))."
-      )
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  private static func persistMemorySettings(
-    _ settings: ConfiguredMemory,
-    memory: MemoryState,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    note: String,
-    terminal: TerminalWriter
-  ) async {
-    memory.apply(settings)
-    guard var draft = configuration, let configurationPath else {
-      await terminal.line("\(note) (not saved: no writable configuration is active.)")
-      return
-    }
-    draft.memory = settings
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-      await terminal.line(note)
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  /// Folds conversations into the notes. The model is given what is already
-  /// known and returns the merged set, so learning never silently forgets.
-  private static func learnMemory(
-    _ argument: String,
-    session: REPLSession,
-    runtime: AgentRuntime,
-    memory: MemoryState,
-    promptTemplate: String?,
-    terminal: TerminalWriter
-  ) async {
-    var focus = argument
-    var everyChat = false
-    for flag in ["--all", "-a"] where focus == flag || focus.hasPrefix(flag + " ") {
-      everyChat = true
-      focus = String(focus.dropFirst(flag.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-    let chats =
-      everyChat ? memory.projectChats() : [MemoryChat(session.chat, scope: session.title)]
-    let transcript = AgentMemoryPrompt.transcript(of: chats)
-    guard !transcript.isEmpty else {
-      await terminal.line(
-        everyChat ? "No conversations in this project yet." : "Nothing said in this chat yet.")
-      return
-    }
-    if let template = promptTemplate,
-      let missing = AgentMemoryPrompt.missingPlaceholder(in: template)
-    {
-      await terminal.line(
-        "error: The memory prompt must contain \(missing). Edit it with /edit memory-prompt.",
-        to: .standardError)
-      return
-    }
-
-    let existing = memory.current
-    let profile = session.profile
-    let request = AgentRequest(
-      agentID: profile.agentID,
-      provider: profile.provider,
-      model: profile.model,
-      messages: [
-        .user(
-          AgentMemoryPrompt.render(
-            existing: existing,
-            transcript: transcript,
-            focus: focus,
-            template: promptTemplate))
-      ],
-      toolChoice: .none,
-      options: profile.options,
-      limits: profile.limits,
-      stream: false,
-      sessionID: session.sessionID)
-    await terminal.line(
-      "Learning from \(everyChat ? "\(chats.count) chat\(chats.count == 1 ? "" : "s")" : "this chat")â€¦"
-    )
-    do {
-      let result = try await runtime.run(request) { _ in }
-      let learned = MessageContentFilter.promptSafeText(from: result.response.text)
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !learned.isEmpty else {
-        await terminal.line("Nothing durable to remember; memory is unchanged.")
-        return
-      }
-      await store(AgentMemory(text: learned), in: memory, runtime: runtime, terminal: terminal)
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  /// `/prompts`: every prompt a name can run here, by kind, then the
-  /// templates that are not run by name.
-  private static func showPrompts(
-    session: REPLSession,
-    configuration: MaiConfiguration?,
-    skills: AgentSkillCatalog,
-    terminal: TerminalWriter
-  ) async {
-    let catalog =
-      configuration?.promptCatalog(skills: skills.skills) ?? PromptCatalog(skills: skills.skills)
-    let width = max(10, catalog.entries.map { $0.commandName.count }.max() ?? 0)
-    func row(_ marker: String, _ name: String, _ detail: String) -> String {
-      "\(marker) \(name.padding(toLength: width, withPad: " ", startingAt: 0))  \(detail)"
-    }
-    var lines = [
-      "System prompts â€” an agent's instructions (/prompt manages them; $NAME switches this agent to one):"
-    ]
-    let system = catalog.entries(of: .system)
-    for entry in system {
-      let selected = session.profile.systemPrompt == entry.name ? "*" : " "
-      let agents = configuration?.agentsUsingSystemPrompt(entry.name) ?? []
-      lines.append(
-        row(
-          selected, entry.commandName,
-          agents.isEmpty ? "unused" : "agents: \(agents.joined(separator: ", "))"))
-    }
-    if system.isEmpty { lines.append("  None; /prompt add NAME TEXT creates one.") }
-    lines.append(
-      "User prompts â€” messages sent by name (prompts.user; /prompts add NAME TEXT, /edit user NAME):"
-    )
-    let user = catalog.entries(of: .user)
-    for entry in user { lines.append(row(" ", entry.commandName, entry.summary)) }
-    if user.isEmpty { lines.append("  None yet.") }
-    let userCommands = Set(user.map { PromptSlashCommand.normalized($0.commandName) })
-    lines.append("Builtin prompts â€” MaiCore's; a user prompt of the same name replaces one:")
-    for entry in catalog.entries(of: .builtin) {
-      let replaced = userCommands.contains(PromptSlashCommand.normalized(entry.commandName))
-      lines.append(
-        row(" ", entry.commandName, replaced ? "replaced by the user prompt above" : entry.summary))
-    }
-    lines.append("Skills â€” /skills; $NAME sends one whether or not this agent may call it:")
-    let skillEntries = catalog.entries(of: .skill)
-    for entry in skillEntries { lines.append(row(" ", entry.commandName, entry.summary)) }
-    if skillEntries.isEmpty { lines.append("  None found; /skills path lists the folders read.") }
-    let templates: [(String, String?)] = [
-      ("compact", configuration?.prompts?.compact),
-      ("delegation", configuration?.prompts?.delegation),
-      ("worker", configuration?.prompts?.worker),
-      ("memory", configuration?.prompts?.memory),
-    ]
-    lines.append(
-      "Templates â€” not sent by name; /edit compact, /edit delegation, /edit worker, /edit memory-prompt:"
-    )
-    for (name, text) in templates {
-      let custom = text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-      lines.append(row(" ", name, custom ? "custom" : "built-in"))
-    }
-    lines.append(
-      "$NAME [TEXT] sends a prompt with TEXT after it (/prompts NAME [TEXT] is the long form); /prompts show NAME prints one."
-    )
-    await terminal.line(lines.joined(separator: "\n"))
-  }
-
-  /// What the REPL loop does after `/prompts`: nothing more, send a
-  /// message, or switch the agent to a system prompt and then send one.
-  private enum PromptsCommandOutcome {
-    case handled
-    case send(String, title: String)
-    case selectSystemPrompt(String, then: String?)
-  }
-
-  /// `/prompts` â€” and `$`, its short form â€” in full: the catalog listed, one
-  /// prompt shown, user prompts kept from one line, and a name with words
-  /// after it sent as a message. A system prompt is not a message: the agent
-  /// is switched to it, and the words after the name are sent as they are.
-  private static func handlePromptsCommand(
-    _ argument: String,
-    session: REPLSession,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    skills: AgentSkillCatalog,
-    terminal: TerminalWriter
-  ) async -> PromptsCommandOutcome {
-    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    let action = fields.first ?? ""
-    let rest = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-    let catalog =
-      configuration?.promptCatalog(skills: skills.skills) ?? PromptCatalog(skills: skills.skills)
-
-    switch action.lowercased() {
-    case "", "list", "ls":
-      await showPrompts(
-        session: session, configuration: configuration, skills: skills, terminal: terminal)
-
-    case "help":
-      await terminal.line(promptHelp)
-
-    case "show", "cat":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /prompts show NAME")
-        return .handled
-      }
-      guard let entry = catalog.entry(named: rest) else {
-        await terminal.line("Unknown prompt '\(rest)'. /prompts lists them.")
-        return .handled
-      }
-      let heading: String
-      let text: String
-      switch entry.kind {
-      case .system:
-        let users = configuration?.agentsUsingSystemPrompt(entry.name) ?? []
-        heading =
-          "System prompt '\(entry.name)' â€” \(users.isEmpty ? "unused" : "agents: \(users.joined(separator: ", "))"); $\(entry.commandName) [TEXT] switches this agent to it."
-        text = entry.text
-      case .skill:
-        heading = "Skill '\(entry.name)' â€” \(entry.summary); $\(entry.commandName) [TEXT] sends:"
-        text = entry.message(arguments: "") ?? entry.text
-      case .user, .builtin:
-        let label = entry.kind.label.prefix(1).uppercased() + entry.kind.label.dropFirst()
-        heading = "\(label) '\(entry.name)'; $\(entry.commandName) [TEXT] sends:"
-        text = entry.text
-      }
-      await terminal.line(heading)
-      await terminal.line(text.isEmpty ? "(empty)" : text)
-
-    case "add", "set", "new", "create":
-      let parts = rest.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(String.init)
-      guard parts.count == 2 else {
-        await terminal.line("Usage: /prompts \(action) NAME TEXT")
-        return .handled
-      }
-      await storeUserPrompt(
-        named: parts[0],
-        text: parts[1].trimmingCharacters(in: .whitespacesAndNewlines),
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "edit":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /prompts edit NAME   (/edit user NAME is the same)")
-        return .handled
-      }
-      await editUserPrompt(
-        named: rest,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "remove", "rm", "delete", "del":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /prompts rm NAME")
-        return .handled
-      }
-      guard var draft = configuration, let configurationPath else {
-        await terminal.line("error: No writable configuration is active.", to: .standardError)
-        return .handled
-      }
-      guard let name = draft.userPromptName(matching: rest) else {
-        let hint =
-          catalog.entry(named: rest).map {
-            switch $0.kind {
-            case .system: " '\(rest)' is a system prompt: /prompt rm drops one."
-            case .builtin:
-              " '\(rest)' is a builtin prompt, which stays; a user prompt of that name replaces it."
-            case .skill: " '\(rest)' is a skill: remove its folder (/skills path)."
-            case .user: ""
-            }
-          } ?? ""
-        await terminal.line("Unknown user prompt '\(rest)'. /prompts lists them.\(hint)")
-        return .handled
-      }
-      draft.removeUserPrompt(name)
-      do {
-        try draft.save(to: URL(fileURLWithPath: configurationPath))
-        configuration = draft
-        let command = PromptSlashCommand.commandName(for: name)
-        let uncovered = UserPrompt.builtins.contains {
-          PromptSlashCommand.normalized($0.commandName) == PromptSlashCommand.normalized(command)
-        }
-        await terminal.line(
-          "Removed user prompt '\(name)'."
-            + (uncovered ? " The builtin prompt of that name is back." : ""))
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-
-    default:
-      guard let entry = catalog.entry(named: action) else {
-        await terminal.line(
-          "Unknown prompt '\(action)'. /prompts lists them; a message that starts with $ can be sent inside <<EOF."
-        )
-        return .handled
-      }
-      switch entry.kind {
-      case .system:
-        return .selectSystemPrompt(entry.name, then: rest.isEmpty ? nil : rest)
-      case .user, .builtin, .skill:
-        return .send(entry.message(arguments: rest) ?? rest, title: "\(entry.name) \(rest)")
-      }
-    }
-    return .handled
-  }
-
-  @discardableResult
-  private static func storeUserPrompt(
-    named name: String,
-    text: String,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async -> Bool {
-    guard var draft = configuration, let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return false
-    }
-    let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmedName.isEmpty else {
-      await terminal.line("A user prompt needs a name.")
-      return false
-    }
-    let created = draft.setUserPrompt(trimmedName, text: text)
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-      let command = PromptSlashCommand.commandName(for: trimmedName)
-      let replaces = UserPrompt.builtins.contains {
-        PromptSlashCommand.normalized($0.commandName) == PromptSlashCommand.normalized(command)
-      }
-      await terminal.line(
-        "\(created ? "Created" : "Saved") user prompt '\(trimmedName)': $\(command) [TEXT] sends it"
-          + (replaces ? " instead of the builtin prompt of that name." : "."))
-      return true
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      return false
-    }
-  }
-
-  /// Opens a user prompt in the editor; a new one named like a builtin
-  /// prompt starts from the builtin's text, which is how one is adjusted.
-  private static func editUserPrompt(
-    named requested: String,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard configuration != nil, configurationPath != nil else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return
-    }
-    let trimmed = requested.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else {
-      await terminal.line("Usage: /edit user NAME")
-      return
-    }
-    let name = configuration?.userPromptName(matching: trimmed) ?? trimmed
-    let command = PromptSlashCommand.normalized(PromptSlashCommand.commandName(for: name))
-    let previous =
-      configuration?.prompts?.user[name]
-      ?? UserPrompt.builtins.first { PromptSlashCommand.normalized($0.commandName) == command }?
-      .text ?? ""
-    guard
-      let edited = await editTemporaryText(previous, suffix: "user-prompt.md", terminal: terminal)
-    else { return }
-    await storeUserPrompt(
-      named: name,
-      text: edited.trimmingCharacters(in: .whitespacesAndNewlines),
-      configuration: &configuration,
-      configurationPath: configurationPath,
-      terminal: terminal)
-  }
-
-  /// `/prompt` in full: named system prompts are created, edited, dropped,
-  /// and pointed at from one line each; the bare name still selects one for
-  /// the current agent.
-  private static func handlePromptCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    skills: AgentSkillCatalog,
-    terminal: TerminalWriter
-  ) async {
-    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    let action = fields.first?.lowercased() ?? ""
-    let rest = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-
-    switch action {
-    case "":
-      let name = session.profile.systemPrompt ?? "inline"
-      await terminal.line("System prompt for agent '\(session.profile.agentID)': \(name)")
-      await terminal.line(
-        session.profile.instructions.isEmpty ? "(empty)" : session.profile.instructions)
-
-    case "list", "ls":
-      await showPrompts(
-        session: session, configuration: configuration, skills: skills, terminal: terminal)
-
-    case "show", "cat":
-      let requested = rest.isEmpty ? session.profile.systemPrompt ?? "" : rest
-      guard let name = resolvedSystemPromptName(requested, configuration: configuration),
-        let text = configuration?.prompts?.system[name]
-      else {
-        await terminal.line("Unknown system prompt '\(requested)'. /prompts lists them.")
-        return
-      }
-      let users = configuration?.agentsUsingSystemPrompt(name) ?? []
-      await terminal.line(
-        "System prompt '\(name)' â€” \(users.isEmpty ? "unused" : "agents: \(users.joined(separator: ", "))")"
-      )
-      await terminal.line(text.isEmpty ? "(empty)" : text)
-
-    case "add", "set", "new", "create":
-      let parts = rest.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(String.init)
-      guard parts.count == 2 else {
-        await terminal.line("Usage: /prompt \(action) NAME TEXT")
-        return
-      }
-      await storeSystemPrompt(
-        named: parts[0],
-        text: parts[1].trimmingCharacters(in: .whitespacesAndNewlines),
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "edit":
-      await editSystemPrompt(
-        named: rest.isEmpty ? session.profile.systemPrompt ?? session.profile.agentID : rest,
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "remove", "rm", "delete", "del":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /prompt rm NAME")
-        return
-      }
-      guard var draft = configuration, let configurationPath else {
-        await terminal.line("error: No writable configuration is active.", to: .standardError)
-        return
-      }
-      guard let name = resolvedSystemPromptName(rest, configuration: draft) else {
-        await terminal.line("Unknown system prompt '\(rest)'. /prompts lists them.")
-        return
-      }
-      let users = draft.agentsUsingSystemPrompt(name)
-      guard users.isEmpty else {
-        await terminal.line(
-          "System prompt '\(name)' is used by \(users.joined(separator: ", ")). Point them elsewhere first: /agent prompt ID OTHER."
-        )
-        return
-      }
-      draft.removeSystemPrompt(name)
-      do {
-        try draft.save(to: URL(fileURLWithPath: configurationPath))
-        configuration = draft
-        await terminal.line("Removed system prompt '\(name)'.")
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-
-    case "use", "select":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /prompt use NAME")
-        return
-      }
-      await selectSystemPrompt(
-        rest,
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "help":
-      await terminal.line(promptHelp)
-
-    default:
-      // `/prompt NAME` keeps selecting a prompt for the current agent.
-      await selectSystemPrompt(
-        argument.trimmingCharacters(in: .whitespacesAndNewlines),
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-    }
-  }
-
-  /// Points the current agent at a named prompt and saves the association.
-  private static func selectSystemPrompt(
-    _ requested: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard
-      let name = resolvedSystemPromptName(requested, configuration: configuration),
-      let instructions = configuration?.prompts?.system[name]
-    else {
-      await terminal.line(
-        "Unknown system prompt '\(requested)'. /prompts lists them; /prompt add NAME TEXT creates one."
-      )
-      return
-    }
-    let previous = session.profile.instructions
-    do {
-      try applySystemInstructions(instructions, replacing: previous, session: &session)
-      session.profile.systemPrompt = name
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      return
-    }
-    if await persistAgentProfile(
-      session: session,
-      configuration: &configuration,
-      configurationPath: configurationPath,
-      runtime: runtime,
-      terminal: terminal)
-    {
-      await terminal.line(
-        "Agent '\(session.profile.agentID)' now uses system prompt '\(name)'.")
-    }
-  }
-
-  /// Writes one named system prompt and refreshes every agent that uses it,
-  /// in the file, in the live runtime, and in this chat when it is one of
-  /// them. Answers false, having said why, when nothing was saved.
-  @discardableResult
-  private static func storeSystemPrompt(
-    named name: String,
-    text: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async -> Bool {
-    guard var draft = configuration, let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return false
-    }
-    guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-      await terminal.line("A system prompt needs a name.")
-      return false
-    }
-    let created = draft.prompts?.system[name] == nil
-    let refreshed = draft.setSystemPrompt(name, text: text)
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-      for agent in draft.agents where refreshed.contains(agent.id) {
-        try await runtime.register(agent: agent, replacingExisting: true)
-      }
-      if session.profile.systemPrompt == name {
-        try applySystemInstructions(
-          text, replacing: session.profile.instructions, session: &session)
-      }
-      let usage =
-        refreshed.isEmpty
-        ? "no agent uses it yet; /agent prompt ID \(name) or /agent add picks it"
-        : "used by \(refreshed.joined(separator: ", "))"
-      await terminal.line("\(created ? "Created" : "Saved") system prompt '\(name)' (\(usage)).")
-      return true
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      return false
-    }
-  }
-
-  private static func applySystemInstructions(
-    _ instructions: String,
-    replacing previous: String,
-    session: inout REPLSession
-  ) throws {
-    session.profile.instructions = instructions
-    if let index = session.history.messages.firstIndex(where: {
-      $0.role == .system && $0.text == previous
-    }) {
-      if instructions.isEmpty {
-        _ = try session.history.removeMessage(at: index)
-      } else {
-        try session.history.editMessage(at: index, text: instructions)
-      }
-    } else if !instructions.isEmpty {
-      session.history.replaceAll(with: [.system(instructions)] + session.history.messages)
-    }
-    session.touch()
-  }
-
-  private static func editSystemPrompt(
-    named requested: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard configuration != nil, configurationPath != nil else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return
-    }
-    let trimmed = requested.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else {
-      await terminal.line("Usage: /prompt edit [NAME]")
-      return
-    }
-    let name = resolvedSystemPromptName(trimmed, configuration: configuration) ?? trimmed
-    let previous = configuration?.prompts?.system[name] ?? ""
-    guard
-      let edited = await editTemporaryText(
-        previous, suffix: "system-prompt.md", terminal: terminal)
-    else { return }
-    await storeSystemPrompt(
-      named: name,
-      text: edited.trimmingCharacters(in: .whitespacesAndNewlines),
-      session: &session,
-      runtime: runtime,
-      configuration: &configuration,
-      configurationPath: configurationPath,
-      terminal: terminal)
-  }
-
-  private static func shellWords(_ input: String) throws -> [String] {
-    enum Quote { case single, double }
-    var words: [String] = []
-    var word = ""
-    var quote: Quote?
-    var escaped = false
-    var started = false
-    for character in input {
-      if escaped {
-        word.append(character)
-        escaped = false
-        started = true
-        continue
-      }
-      if character == "\\", quote != .single {
-        escaped = true
-        started = true
-        continue
-      }
-      if character == "'", quote != .double {
-        quote = quote == .single ? nil : .single
-        started = true
-        continue
-      }
-      if character == "\"", quote != .single {
-        quote = quote == .double ? nil : .double
-        started = true
-        continue
-      }
-      if character.isWhitespace, quote == nil {
-        if started {
-          words.append(word)
-          word = ""
-          started = false
-        }
-        continue
-      }
-      word.append(character)
-      started = true
-    }
-    guard quote == nil else { throw MCPCommandError.unterminatedQuote }
-    guard !escaped else { throw MCPCommandError.danglingEscape }
-    if started { words.append(word) }
-    return words
-  }
-
-  /// Opens a text value from the active REPL session in the user's terminal
-  /// editor. Transcript and configuration edits deliberately go through the
-  /// same core types used by the iOS app and the persistent chat workspace.
-  private static func handleEditCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    memory: MemoryState,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    providerBaseURLs: ProviderBaseURLStore,
-    terminal: TerminalWriter
-  ) async {
-    let target = argument.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !target.isEmpty else {
-      await terminal.line(editHelp)
-      return
-    }
-    let fields = target.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    let action = fields[0].lowercased()
-    let actionArgument = fields.count == 2 ? fields[1] : ""
-
-    switch action {
-    case "system":
-      await editSystemPrompt(
-        named: actionArgument.isEmpty
-          ? session.profile.systemPrompt ?? session.profile.agentID : actionArgument,
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "user", "userprompt":
-      guard !actionArgument.isEmpty else {
-        await terminal.line("Usage: /edit user NAME")
-        return
-      }
-      await editUserPrompt(
-        named: actionArgument,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "prompt":
-      // Without a name, the current agent's system prompt. With one, the
-      // prompt of that name, whichever kind it is; a system prompt and a
-      // user prompt are different things, so a new one is created with
-      // /edit system NAME or /edit user NAME.
-      guard !actionArgument.isEmpty else {
-        await editSystemPrompt(
-          named: session.profile.systemPrompt ?? session.profile.agentID,
-          session: &session,
-          runtime: runtime,
-          configuration: &configuration,
-          configurationPath: configurationPath,
-          terminal: terminal)
-        return
-      }
-      let wanted = PromptSlashCommand.normalized(actionArgument)
-      if let name = resolvedSystemPromptName(actionArgument, configuration: configuration) {
-        await editSystemPrompt(
-          named: name,
-          session: &session,
-          runtime: runtime,
-          configuration: &configuration,
-          configurationPath: configurationPath,
-          terminal: terminal)
-      } else if let name = configuration?.userPromptName(matching: actionArgument) {
-        await editUserPrompt(
-          named: name,
-          configuration: &configuration,
-          configurationPath: configurationPath,
-          terminal: terminal)
-      } else if UserPrompt.builtins.contains(where: {
-        PromptSlashCommand.normalized($0.commandName) == wanted
-      }) {
-        await editUserPrompt(
-          named: actionArgument,
-          configuration: &configuration,
-          configurationPath: configurationPath,
-          terminal: terminal)
-      } else {
-        await terminal.line(
-          "No prompt named '\(actionArgument)'. /edit system NAME creates a system prompt, /edit user NAME a user prompt; /prompts lists both."
-        )
-      }
-
-    case "agent":
-      await editAgentDefinition(
-        named: actionArgument.isEmpty ? session.profile.agentID : actionArgument,
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "provider":
-      await editConfiguredProvider(
-        named: actionArgument.isEmpty ? session.profile.provider.rawValue : actionArgument,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        providerBaseURLs: providerBaseURLs,
-        terminal: terminal)
-
-    case "input":
-      // The chat prompt intercepts this one, because the message it writes is
-      // sent from there; here it can only say where it works.
-      await terminal.line(
-        "Use /edit input at the chat prompt; it opens an empty file and sends what you write in it."
-      )
-
-    case "compact":
-      guard var draft = configuration, let configurationPath else {
-        await terminal.line("error: No writable configuration is active.", to: .standardError)
-        return
-      }
-      let previous = draft.prompts?.compact ?? defaultCompactPrompt
-      guard
-        let edited = await editTemporaryText(
-          previous, suffix: "compact-prompt.md", terminal: terminal)
-      else { return }
-      let candidate = edited.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard candidate.isEmpty || candidate.contains("{{transcript}}") else {
-        await terminal.line(
-          "error: The compact prompt must contain {{transcript}}; no changes were saved.",
-          to: .standardError)
-        return
-      }
-      let customPrompt =
-        candidate.isEmpty || candidate == defaultCompactPrompt ? nil : candidate
-      var prompts = draft.prompts ?? ConfiguredPrompts()
-      prompts.compact = customPrompt
-      draft.prompts = prompts
-      do {
-        try draft.save(to: URL(fileURLWithPath: configurationPath))
-        await runtime.configureCompaction(prompt: customPrompt)
-        configuration = draft
-        await terminal.line(
-          customPrompt == nil
-            ? "Compact prompt restored to the built-in default."
-            : "Compact prompt saved to \(configurationPath).")
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-
-    case "memory":
-      guard
-        let edited = await editTemporaryText(
-          memory.current.text, suffix: "memory.md", terminal: terminal)
-      else { return }
-      await store(AgentMemory(text: edited), in: memory, runtime: runtime, terminal: terminal)
-
-    case "memory-prompt", "learn":
-      guard var draft = configuration, let configurationPath else {
-        await terminal.line("error: No writable configuration is active.", to: .standardError)
-        return
-      }
-      var prompts = draft.prompts ?? ConfiguredPrompts()
-      guard
-        let edited = await editTemporaryText(
-          prompts.memory ?? AgentMemoryPrompt.template,
-          suffix: "memory-prompt.md",
-          terminal: terminal)
-      else { return }
-      let candidate = edited.trimmingCharacters(in: .whitespacesAndNewlines)
-      if let missing = AgentMemoryPrompt.missingPlaceholder(in: candidate) {
-        await terminal.line(
-          "error: The memory prompt must contain \(missing); no changes were saved.",
-          to: .standardError)
-        return
-      }
-      prompts.memory =
-        candidate.isEmpty || candidate == AgentMemoryPrompt.template ? nil : candidate
-      draft.prompts = prompts
-      do {
-        try draft.save(to: URL(fileURLWithPath: configurationPath))
-        configuration = draft
-        await terminal.line(
-          prompts.memory == nil
-            ? "The memory prompt was restored to the built-in default."
-            : "The memory prompt was saved to \(configurationPath).")
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-
-    case "delegation", "worker":
-      guard var draft = configuration, let configurationPath else {
-        await terminal.line("error: No writable configuration is active.", to: .standardError)
-        return
-      }
-      var prompts = draft.prompts ?? ConfiguredPrompts()
-      let isBrief = action == "delegation"
-      let builtIn =
-        isBrief ? AgentDelegationPrompt.template : AgentDelegationPrompt.workerInstructions
-      let previous = (isBrief ? prompts.delegation : prompts.worker) ?? builtIn
-      guard
-        let edited = await editTemporaryText(
-          previous, suffix: "\(action)-prompt.md", terminal: terminal)
-      else { return }
-      let candidate = edited.trimmingCharacters(in: .whitespacesAndNewlines)
-      if isBrief, let missing = AgentDelegationPrompt.missingPlaceholder(in: candidate) {
-        await terminal.line(
-          "error: The delegation prompt must contain \(missing); no changes were saved.",
-          to: .standardError)
-        return
-      }
-      let custom = candidate.isEmpty || candidate == builtIn ? nil : candidate
-      if isBrief { prompts.delegation = custom } else { prompts.worker = custom }
-      draft.prompts = prompts
-      do {
-        try draft.save(to: URL(fileURLWithPath: configurationPath))
-        await runtime.configureDelegation(
-          prompt: prompts.delegation, workerInstructions: prompts.worker)
-        configuration = draft
-        await terminal.line(
-          custom == nil
-            ? "The \(action) prompt was restored to the built-in default."
-            : "The \(action) prompt was saved to \(configurationPath).")
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-
-    case "config":
-      guard let configurationPath else {
-        await terminal.line("error: No writable configuration is active.", to: .standardError)
-        return
-      }
-      let url = URL(fileURLWithPath: configurationPath)
-      guard await launchEditor(at: url, terminal: terminal) else { return }
-      do {
-        var editedConfiguration = try MaiConfiguration.load(from: url)
-        if editedConfiguration.associateSystemPrompts() {
-          try editedConfiguration.save(to: url)
-        }
-        for agent in editedConfiguration.agents {
-          try await runtime.register(agent: agent, replacingExisting: true)
-        }
-        await runtime.configureDelegation(
-          prompt: editedConfiguration.prompts?.delegation,
-          workerInstructions: editedConfiguration.prompts?.worker)
-        await runtime.configureCompaction(prompt: editedConfiguration.prompts?.compact)
-        if let agent = editedConfiguration.agents.first(where: {
-          $0.id == session.profile.agentID
-        }) {
-          session.profile.limits = agent.limits
-          session.profile.toolCallingStrategy = agent.toolCallingStrategy
-          session.profile.toolDelegation = agent.toolDelegation
-          session.profile.retry = agent.retry
-          session.profile.autocompact = agent.autocompact
-          session.profile.systemPrompt = agent.systemPrompt
-          try applySystemInstructions(
-            agent.instructions,
-            replacing: session.profile.instructions,
-            session: &session)
-        }
-        configuration = editedConfiguration
-        await terminal.line(
-          "Configuration saved. Agent limits and tool-calling strategy were applied; "
-            + "restart pmai to apply provider, plugin, tool, or MCP changes.")
-      } catch {
-        await terminal.line(
-          "error: The edited configuration was not loaded: \(error.localizedDescription)",
-          to: .standardError)
-      }
-
-    case "mcps", "mcp":
-      guard var draft = configuration, let configurationPath else {
-        await terminal.line("error: No writable configuration is active.", to: .standardError)
-        return
-      }
-      do {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(draft.mcpServers)
-        guard let edited = await editTemporaryData(data, suffix: "mcps.json", terminal: terminal)
-        else {
-          return
-        }
-        draft.mcpServers = try JSONDecoder().decode([ConfiguredMCPServer].self, from: edited)
-        try draft.save(to: URL(fileURLWithPath: configurationPath))
-        configuration = draft
-        await terminal.line("MCP configuration saved. Restart pmai to reconnect MCP servers.")
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-
-    default:
-      if let name = resolvedSystemPromptName(target, configuration: configuration) {
-        await editSystemPrompt(
-          named: name,
-          session: &session,
-          runtime: runtime,
-          configuration: &configuration,
-          configurationPath: configurationPath,
-          terminal: terminal)
-        return
-      }
-      if let name = configuration?.userPromptName(matching: target) {
-        await editUserPrompt(
-          named: name,
-          configuration: &configuration,
-          configurationPath: configurationPath,
-          terminal: terminal)
-        return
-      }
-      guard let index = editableMessageIndex(target, in: session.history) else {
-        await terminal.line("Unknown edit target '\(target)'.\n\n\(editHelp)")
-        return
-      }
-      let message = session.history[index]
-      guard
-        let edited = await editTemporaryText(message.text, suffix: "message.md", terminal: terminal)
-      else { return }
-      do {
-        try session.history.editMessage(at: index, text: edited)
-        await terminal.line("Edited message \(index + 1) (id: \(message.id)).")
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-    }
-  }
-
-  private static func editableMessageIndex(_ target: String, in transcript: AgentTranscript) -> Int?
-  {
-    if let index = chatIndex(target, count: transcript.count) { return index }
-    return transcript.index(ofMessageID: target)
-  }
-
-  private static func editTemporaryText(
-    _ text: String, suffix: String, terminal: TerminalWriter
-  ) async -> String? {
-    guard let data = text.data(using: .utf8),
-      let edited = await editTemporaryData(data, suffix: suffix, terminal: terminal)
-    else { return nil }
-    guard let result = String(data: edited, encoding: .utf8) else {
-      await terminal.line("error: Editor output must be UTF-8 text.", to: .standardError)
-      return nil
-    }
-    return result
-  }
-
-  private static func editTemporaryData(
-    _ data: Data, suffix: String, terminal: TerminalWriter
-  ) async -> Data? {
-    let url = FileManager.default.temporaryDirectory
-      .appendingPathComponent("pmai-edit-\(UUID().uuidString)-\(suffix)")
-    do {
-      try data.write(to: url, options: .atomic)
-      defer { try? FileManager.default.removeItem(at: url) }
-      guard await launchEditor(at: url, terminal: terminal) else { return nil }
-      return try Data(contentsOf: url)
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      return nil
-    }
-  }
-
-  /// The editor every `/edit` hands the terminal to: `/set ui.editor` when it
-  /// is set, then `$EDITOR`, `$VISUAL`, and vim as the last resort.
-  private static let editorLock = NSLock()
-  nonisolated(unsafe) private static var configuredEditor = ""
-
-  static func configureEditor(_ command: String) {
-    editorLock.withLock {
-      configuredEditor = command.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-  }
-
-  static func resolvedEditor(
-    environment: [String: String] = ProcessInfo.processInfo.environment
-  ) -> String {
-    let configured = editorLock.withLock { configuredEditor }
-    for candidate in [configured, environment["EDITOR"] ?? "", environment["VISUAL"] ?? ""] {
-      let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !trimmed.isEmpty { return trimmed }
-    }
-    return "vim"
-  }
-
-  private static func launchEditor(at url: URL, terminal: TerminalWriter) async -> Bool {
-    let command = resolvedEditor()
-    let shellCommand = "\(command) \(shellQuote(url.path))"
-    var waitStatus: CInt = -1
-    let launch = { waitStatus = shellCommand.withCString(posixSystem) }
-    if let screen = TerminalScreen.current {
-      screen.suspendTerminal(launch)
-    } else {
-      launch()
-    }
-    guard waitStatus != -1 else {
-      await terminal.line(
-        "error: Could not launch editor '\(command)': \(String(cString: strerror(errno)))",
-        to: .standardError)
-      return false
-    }
-    let exitStatus = waitStatus & 0x7f == 0 ? (waitStatus >> 8) & 0xff : 128 + (waitStatus & 0x7f)
-    guard exitStatus == 0 else {
-      await terminal.line(
-        "error: Editor exited with status \(exitStatus).", to: .standardError)
-      return false
-    }
-    return true
-  }
-
-  private static func shellQuote(_ value: String) -> String {
-    "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
-  }
-
-  private static func handleProviderCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    providerBaseURLs: ProviderBaseURLStore,
-    terminal: TerminalWriter
-  ) async {
-    let fields = argument.split(whereSeparator: \Character.isWhitespace).map(String.init)
-    guard !fields.isEmpty else {
-      let configured = configuration?.providers.first {
-        $0.id == session.profile.provider.rawValue
-      }
-      let baseURL =
-        providerBaseURLs.url(for: session.profile.provider.rawValue)?.absoluteString
-        ?? configured?.baseURL?.absoluteString ?? "-"
-      await terminal.line("Current provider: \(session.profile.provider) â€” \(baseURL)")
-      if let configured {
-        let names = (Array(configured.headers.keys) + Array(configured.headerEnvironment.keys))
-          .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-        if !names.isEmpty {
-          await terminal.line("Headers: \(names.joined(separator: ", "))")
-        }
-      }
-      await terminal.line(
-        "Use /baseurl URL to change its endpoint, or /edit provider to edit it as JSON.")
-      return
-    }
-
-    if ["baseurl", "url"].contains(fields[0].lowercased()) {
-      await handleBaseURLCommand(
-        fields.dropFirst().joined(separator: " "),
-        currentProvider: session.profile.provider,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        providerBaseURLs: providerBaseURLs,
-        terminal: terminal)
-      return
-    }
-
-    let selectedID = fields[0].lowercased() == "use" && fields.count == 2 ? fields[1] : fields[0]
-    let id = ProviderID(selectedID)
-    guard await runtime.availableProviders().contains(where: { $0.id == id }) else {
-      await terminal.line("Unknown provider '\(selectedID)'. Use /providers.")
-      return
-    }
-    session.profile.provider = id
-    let saved = await persistAgentProfile(
-      session: session,
-      configuration: &configuration,
-      configurationPath: configurationPath,
-      runtime: runtime,
-      terminal: terminal)
-    if saved {
-      await terminal.line("Provider: \(id) (saved for agent \(session.profile.agentID))")
-    }
-  }
-
-  private static func handleBaseURLCommand(
-    _ argument: String,
-    currentProvider: ProviderID,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    providerBaseURLs: ProviderBaseURLStore,
-    terminal: TerminalWriter
-  ) async {
-    let fields = argument.split(whereSeparator: \Character.isWhitespace).map(String.init)
-    guard !fields.isEmpty else {
-      let configuredURL = configuration?.providers.first {
-        $0.id == currentProvider.rawValue
-      }?.baseURL
-      let effectiveURL = providerBaseURLs.url(for: currentProvider.rawValue) ?? configuredURL
-      var detail = effectiveURL?.absoluteString ?? "-"
-      if let effectiveURL, let configuredURL, effectiveURL != configuredURL {
-        detail += " (runtime override; configured: \(configuredURL.absoluteString))"
-      }
-      await terminal.line("Base URL for '\(currentProvider)': \(detail)")
-      await terminal.line("Usage: /baseurl URL")
-      return
-    }
-
-    guard fields.count == 1 else {
-      await terminal.line("Usage: /baseurl URL")
-      return
-    }
-    let providerID = currentProvider
-    let rawURL = fields[0]
-    guard let baseURL = URL(string: rawURL),
-      ["http", "https"].contains(baseURL.scheme?.lowercased() ?? ""),
-      baseURL.host != nil
-    else {
-      await terminal.line("Invalid provider URL '\(rawURL)'; use an http:// or https:// URL.")
-      return
-    }
-    guard var draft = configuration,
-      let index = draft.providers.firstIndex(where: { $0.id == providerID.rawValue })
-    else {
-      await terminal.line("Unknown configured provider '\(providerID)'. Use /providers.")
-      return
-    }
-    guard let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return
-    }
-    draft.providers[index].baseURL = baseURL
-    do {
-      let provider = try await plugins.makeProvider(
-        from: draft.providers[index],
-        environment: ProcessInfo.processInfo.environment)
-      try await runtime.register(provider, replacingExisting: true)
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-      providerBaseURLs.set(baseURL, for: providerID.rawValue)
-      await terminal.line("Provider '\(providerID)' base URL set to \(baseURL.absoluteString).")
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  /// `/agents` covers both halves of the model: the definitions people switch
-  /// between, and the processes started from them.
-  private static func handleAgentsCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    providerBaseURLs: ProviderBaseURLStore,
-    terminal: TerminalWriter
-  ) async {
-    let fields = argument.split(maxSplits: 2, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    let action = fields.first?.lowercased() ?? ""
-
-    switch action {
-    case "", "list":
-      await listAgentDefinitions(
-        session: session,
-        runtime: runtime,
-        configuration: configuration,
-        providerBaseURLs: providerBaseURLs,
-        terminal: terminal)
-      if action.isEmpty {
-        let lines = await agentTreeLines(runtime: runtime)
-        if !lines.isEmpty {
-          await terminal.line("")
-          await terminal.line(lines.joined(separator: "\n"))
-        }
-      }
-
-    case "enable", "disable":
-      guard fields.count >= 2 else {
-        await terminal.line("Usage: /agents \(action) ID")
-        return
-      }
-      await setAgentEnabled(
-        fields[1],
-        enabled: action == "enable",
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "describe":
-      guard fields.count >= 2 else {
-        await terminal.line("Usage: /agents describe ID [TEXT]")
-        return
-      }
-      await describeAgent(
-        fields[1],
-        text: fields.count > 2 ? fields[2] : nil,
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "use", "show", "add", "new", "create", "acp", "tools", "model", "prompt", "provider",
-      "remove", "rm", "delete", "del":
-      await handleAgentCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        providerBaseURLs: providerBaseURLs.snapshot(),
-        terminal: terminal)
-
-    default:
-      if await !handleProcessCommand(argument, runtime: runtime, terminal: terminal) {
-        await terminal.line(agentsHelp)
-      }
-    }
-  }
-
-  /// The `/agents` subcommands that act on a running process rather than on
-  /// a definition; `/agent` accepts them too, and they stay usable while a
-  /// turn runs. `focus` is not here because it lives in the REPL loop's state.
-  private static let processActions: Set<String> = [
-    "tree", "ps", "log", "kill", "stop", "pause", "suspend", "continue", "cont", "resume",
-    "clear",
-  ]
-
-  static func isProcessCommand(_ argument: String) -> Bool {
-    let action = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).first
-    return action.map { processActions.contains($0.lowercased()) } ?? false
-  }
-
-  /// Runs one process subcommand. Answers false when the argument is not one,
-  /// so the caller can fall back to its own handling.
-  private static func handleProcessCommand(
-    _ argument: String,
-    runtime: AgentRuntime,
-    terminal: TerminalWriter
-  ) async -> Bool {
-    let fields = argument.split(maxSplits: 2, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    let action = fields.first?.lowercased() ?? ""
-    guard processActions.contains(action) else { return false }
-
-    switch action {
-    case "tree", "ps":
-      let lines = await agentTreeLines(runtime: runtime)
-      await terminal.line(lines.isEmpty ? "No agents are running." : lines.joined(separator: "\n"))
-
-    case "clear":
-      // The REPL loop handles this itself so its chat pids follow; this is
-      // the path from visual mode, which holds no pids.
-      let cleared = await runtime.supervisor.clearFinished()
-      await terminal.line(
-        cleared.isEmpty
-          ? "No finished agents to clear."
-          : "Cleared \(cleared.count) finished agent\(cleared.count == 1 ? "" : "s").")
-
-    case "log":
-      guard fields.count >= 2, let pid = AgentPID(text: fields[1]) else {
-        await terminal.line("Usage: /agents log PID")
-        return true
-      }
-      let messages = await runtime.supervisor.transcript(pid)
-      guard !messages.isEmpty else {
-        let known = await runtime.supervisor.info(pid) != nil
-        await terminal.line(
-          known ? "\(pid) has not produced a transcript yet." : "No agent \(pid).")
-        return true
-      }
-      var lines: [String] = []
-      for (index, message) in messages.enumerated() {
-        lines.append("## [\(index + 1)] \(message.role.rawValue.capitalized)")
-        lines.append(message.content.map { renderFullContent($0) }.joined(separator: "\n"))
-      }
-      await terminal.line(lines.joined(separator: "\n"))
-
-    case "kill":
-      guard fields.count >= 2, let pid = AgentPID(text: fields[1]) else {
-        await terminal.line("Usage: /agents kill PID [REASON]")
-        return true
-      }
-      guard await runtime.supervisor.info(pid) != nil else {
-        await terminal.line("No agent \(pid).")
-        return true
-      }
-      let reason = fields.count > 2 ? fields[2] : "Stopped from the REPL"
-      let stopped = await runtime.supervisor.stop(pid, reason: reason)
-      await terminal.line(
-        "Stopped \(stopped.map(\.description).joined(separator: ", ")).")
-
-    case "stop", "pause", "suspend":
-      guard fields.count == 2, let pid = AgentPID(text: fields[1]) else {
-        await terminal.line("Usage: /agents stop PID")
-        return true
-      }
-      guard let info = await runtime.supervisor.info(pid) else {
-        await terminal.line("No agent \(pid).")
-        return true
-      }
-      guard info.depth > 0 else {
-        await terminal.line("\(pid) is this chat; Ctrl+C cancels its turn.")
-        return true
-      }
-      guard !info.state.isTerminal else {
-        await terminal.line(
-          "\(pid) (\(info.agentID)) has finished; /agents log \(pid.rawValue) shows what it did.")
-        return true
-      }
-      let held = await runtime.supervisor.pause(pid)
-      guard !held.isEmpty else {
-        await terminal.line(
-          "\(pid) (\(info.agentID)) is already paused; /agents continue \(pid.rawValue) lets it go on."
-        )
-        return true
-      }
-      await terminal.line(
-        "Paused \(held.map(\.description).joined(separator: ", ")): it finishes the step it is in, then waits. Messages queued meanwhile are read when /agents continue \(pid.rawValue) lets it go on."
-      )
-
-    case "continue", "cont", "resume":
-      guard fields.count == 2, let pid = AgentPID(text: fields[1]) else {
-        await terminal.line("Usage: /agents continue PID")
-        return true
-      }
-      guard let info = await runtime.supervisor.info(pid) else {
-        await terminal.line("No agent \(pid).")
-        return true
-      }
-      let released = await runtime.supervisor.resume(pid)
-      guard !released.isEmpty else {
-        await terminal.line(
-          info.state.isTerminal
-            ? "\(pid) (\(info.agentID)) has finished; /agents log \(pid.rawValue) shows what it did."
-            : "\(pid) (\(info.agentID)) is not paused.")
-        return true
-      }
-      await terminal.line("Continued \(released.map(\.description).joined(separator: ", ")).")
-
-    default:
-      return false
-    }
-    return true
-  }
-
-  private static func listAgentDefinitions(
-    session: REPLSession,
-    runtime: AgentRuntime,
-    configuration: MaiConfiguration?,
-    providerBaseURLs: ProviderBaseURLStore,
-    terminal: TerminalWriter
-  ) async {
-    let agents: [AgentDefinition]
-    if let configured = configuration?.agents {
-      agents = configured
-    } else {
-      agents = await runtime.availableAgents()
-    }
-    guard !agents.isEmpty else {
-      await terminal.line("No configured agents.")
-      return
-    }
-    for agent in agents {
-      let isCurrent = agent.id == session.profile.agentID
-      let displayed = isCurrent ? session.profile.agentDefinition : agent
-      let baseURL =
-        providerBaseURLs.url(for: displayed.provider.rawValue)?.absoluteString
-        ?? configuration?.providers.first { $0.id == displayed.provider.rawValue }?.baseURL?
-        .absoluteString ?? "-"
-      let marker = isCurrent ? "*" : (displayed.isEnabled ? " " : "-")
-      var line =
-        "\(marker) \(displayed.id) â€” \(displayed.displayName) [\(displayed.provider) \(baseURL) \(displayed.model)]"
-      if displayed.toolDelegation.delegatesTools { line += " delegating" }
-      if !displayed.isEnabled { line += " (disabled)" }
-      await terminal.line(line)
-      if !displayed.description.isEmpty {
-        await terminal.line("    \(displayed.description)")
-      }
-    }
-  }
-
-  private static func agentTreeLines(runtime: AgentRuntime) async -> [String] {
-    let tree = await runtime.supervisor.tree()
-    guard !tree.isEmpty else { return [] }
-    return ["Running agents:"] + tree.lines() + [agentTreeTotal(tree)]
-  }
-
-  /// One row summing what the whole tree has spent so far. Tokens are every
-  /// model call's input and output added up, the way a provider bills them,
-  /// formatted like the rows above it.
-  static func agentTreeTotal(_ tree: AgentProcessTree) -> String {
-    let turns = tree.processes.reduce(0) { $0 + $1.modelTurns }
-    let tools = tree.processes.reduce(0) { $0 + $1.toolCalls }
-    let tokens = tree.processes.reduce(0) { $0 + ($1.usage?.totalTokens ?? 0) }
-    let estimated = tree.processes.contains { $0.usage?.isEstimated == true }
-    return
-      "Total: \(turns) turn\(turns == 1 ? "" : "s"), \(tools) tool\(tools == 1 ? "" : "s"), \(ModelUsageFormat.tokens(tokens, estimated: estimated))"
-  }
-
-  private static func setAgentEnabled(
-    _ id: String,
-    enabled: Bool,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard var draft = configuration, let configurationPath,
-      let index = draft.agents.firstIndex(where: { $0.id == id })
-    else {
-      await terminal.line("Unknown agent '\(id)', or no writable configuration is active.")
-      return
-    }
-    guard enabled || draft.agents[index].id != session.profile.agentID else {
-      await terminal.line(
-        "Agent '\(id)' is the one this chat uses. Switch with /agent use ID before disabling it.")
-      return
-    }
-    draft.agents[index].isEnabled = enabled
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      try await runtime.register(agent: draft.agents[index], replacingExisting: true)
-      configuration = draft
-      await terminal.line("Agent '\(id)' \(enabled ? "enabled" : "disabled").")
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  private static func describeAgent(
-    _ id: String,
-    text: String?,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard var draft = configuration, let configurationPath,
-      let index = draft.agents.firstIndex(where: { $0.id == id })
-    else {
-      await terminal.line("Unknown agent '\(id)', or no writable configuration is active.")
-      return
-    }
-    guard let text else {
-      let existing = draft.agents[index].description
-      await terminal.line(existing.isEmpty ? "Agent '\(id)' has no description." : existing)
-      return
-    }
-    draft.agents[index].description = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      try await runtime.register(agent: draft.agents[index], replacingExisting: true)
-      if session.profile.agentID == id { session.touch() }
-      configuration = draft
-      await terminal.line("Described agent '\(id)'.")
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  /// `/agent acp` registers an external ACP agent as a provider-backed agent,
-  /// so it is selectable and spawnable like any other. `list` shows the builtin
-  /// catalog and what is installed; `add NAME [COMMAND ARGS...]` persists one,
-  /// defaulting the command from the catalog when only a known name is given.
-  private static func handleAgentACPCommand(
-    _ fields: [String],
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    let sub = fields.first?.lowercased() ?? "list"
-    switch sub {
-    case "list", "":
-      for agent in ACPCatalog.agents {
-        let mark = agent.isInstalled ? "\u{2705}" : "\u{274C}"
-        let configured = configuration?.providers.contains { $0.id == agent.id } == true
-        await terminal.line(
-          "\(mark) \(agent.id) â€” \(agent.summary)\(configured ? " [configured]" : "")")
-      }
-      await terminal.line(
-        "Add one with /agent acp add NAME [COMMAND ARG ...]; a known name needs no command.")
-
-    case "add":
-      let rest = Array(fields.dropFirst())
-      guard let name = rest.first else {
-        await terminal.line("Usage: /agent acp add NAME [COMMAND ARG ...]")
-        return
-      }
-      let provider: ConfiguredProvider
-      if rest.count >= 2 {
-        var options: [String: JSONValue] = ["command": .string(rest[1])]
-        let args = Array(rest.dropFirst(2))
-        if !args.isEmpty { options["args"] = .array(args.map(JSONValue.string)) }
-        provider = ConfiguredProvider(
-          id: name, kind: ACPConfiguredProviderFactory.providerKind, displayName: name,
-          options: options)
-      } else if let catalog = ACPCatalog.agent(name) {
-        provider = catalog.configuredProvider()
-        if !catalog.isInstalled, let install = catalog.install {
-          await terminal.line("note: '\(name)' is not installed. Install it with: \(install)")
-        }
-      } else {
-        await terminal.line(
-          "Unknown ACP agent '\(name)'. Give a command, or use a catalog name (/agent acp list).")
-        return
-      }
-      await registerACPAgent(
-        provider,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    default:
-      await terminal.line("Usage: /agent acp [list|add NAME [COMMAND ARG ...]]")
-    }
-  }
-
-  /// Persists an ACP provider and a same-named agent, registers both live, and
-  /// selects the agent for the current chat â€” the same shape `/agent add` uses.
-  private static func registerACPAgent(
-    _ provider: ConfiguredProvider,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard var draft = configuration, let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return
-    }
-    if let index = draft.providers.firstIndex(where: { $0.id == provider.id }) {
-      draft.providers[index] = provider
-    } else {
-      draft.providers.append(provider)
-    }
-    let definition = AgentDefinition(
-      id: provider.id,
-      displayName: provider.displayName ?? provider.id,
-      description: ACPCatalog.agent(provider.id)?.summary ?? "External ACP agent.",
-      instructions: "",
-      provider: ProviderID(provider.id),
-      model: provider.id)
-    if let index = draft.agents.firstIndex(where: { $0.id == definition.id }) {
-      draft.agents[index] = definition
-    } else {
-      draft.agents.append(definition)
-    }
-    do {
-      let built = try await plugins.makeProvider(
-        from: provider, environment: ProcessInfo.processInfo.environment)
-      try await runtime.register(built, replacingExisting: true)
-      try await runtime.register(agent: definition, replacingExisting: true)
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-      session.reset(profile: SessionProfile(definition: definition))
-      await terminal.line(
-        "ACP agent '\(provider.id)' registered and selected for this chat. It runs like any other agent."
-      )
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  /// `/agent` in full: switch the chat's agent, or create and maintain saved
-  /// definitions with one line each. Process subcommands are accepted too.
-  private static func handleAgentCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    providerBaseURLs: [String: URL],
-    terminal: TerminalWriter
-  ) async {
-    let words = argument.split(whereSeparator: \Character.isWhitespace).map(String.init)
-    guard let action = words.first?.lowercased() else {
-      await showAgent(
-        session.profile.agentID,
-        session: session,
-        configuration: configuration,
-        providerBaseURLs: providerBaseURLs,
-        terminal: terminal)
-      await terminal.line(
-        "Usage: /agent [use] ID Â· /agent add NAME MODEL GROUPS PROMPT Â· /help agents")
-      return
-    }
-
-    if await handleProcessCommand(argument, runtime: runtime, terminal: terminal) {
-      return
-    }
-
-    if action == "acp" {
-      let fields = argument.split(maxSplits: 5, whereSeparator: \Character.isWhitespace).map(
-        String.init)
-      await handleAgentACPCommand(
-        Array(fields.dropFirst()),
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-      return
-    }
-
-    switch action {
-    case "add", "new", "create":
-      await addAgent(
-        Array(words.dropFirst()),
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "show":
-      await showAgent(
-        words.count > 1 ? words[1] : session.profile.agentID,
-        session: session,
-        configuration: configuration,
-        providerBaseURLs: providerBaseURLs,
-        terminal: terminal)
-
-    case "tools":
-      guard words.count == 3 else {
-        await terminal.line(
-          "Usage: /agent tools ID GROUPS   (a,b,c replaces; +a,-b adjusts; - clears)")
-        return
-      }
-      guard
-        let selection = await resolveToolGroupSpec(
-          words[2], runtime: runtime, plugins: plugins, configuration: configuration,
-          terminal: terminal)
-      else { return }
-      let saved = await updateAgent(
-        words[1],
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal
-      ) { definition, _ in
-        selection.apply(to: &definition)
-        return nil
-      }
-      if let saved {
-        let groups = saved.toolGroupNames.sorted()
-        await terminal.line(
-          "Agent '\(saved.id)' tool groups: \(groups.isEmpty ? "none" : groups.joined(separator: ", ")) (\(saved.toolNames.count) tools)."
-        )
-      }
-
-    case "model":
-      guard words.count == 3 else {
-        await terminal.line("Usage: /agent model ID MODEL   (- keeps the provider's default)")
-        return
-      }
-      let model = words[2] == "-" ? "" : words[2]
-      let saved = await updateAgent(
-        words[1],
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal
-      ) { definition, _ in
-        definition.model = model
-        return nil
-      }
-      if let saved {
-        await terminal.line(
-          "Agent '\(saved.id)' model: \(saved.model.isEmpty ? "-" : saved.model).")
-      }
-
-    case "provider":
-      guard words.count == 3 else {
-        await terminal.line("Usage: /agent provider ID PROVIDER")
-        return
-      }
-      let providerID = ProviderID(words[2])
-      let saved = await updateAgent(
-        words[1],
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal
-      ) { definition, draft in
-        guard draft.providers.contains(where: { $0.id == providerID.rawValue }) else {
-          return
-            "Unknown provider '\(providerID)'. /providers lists them; /agent add NAME MODEL GROUPS PROMPT PROVIDER BASE_URL registers a new endpoint."
-        }
-        definition.provider = providerID
-        return nil
-      }
-      if let saved { await terminal.line("Agent '\(saved.id)' provider: \(saved.provider).") }
-
-    case "prompt":
-      guard words.count == 3 else {
-        await terminal.line("Usage: /agent prompt ID PROMPT")
-        return
-      }
-      let requested = words[2]
-      let saved = await updateAgent(
-        words[1],
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal
-      ) { definition, draft in
-        guard let name = resolvedSystemPromptName(requested, configuration: draft),
-          let text = draft.prompts?.system[name]
-        else {
-          return
-            "Unknown system prompt '\(requested)'. /prompts lists them; /prompt add NAME TEXT creates one."
-        }
-        definition.systemPrompt = name
-        definition.instructions = text
-        return nil
-      }
-      if let saved {
-        await terminal.line(
-          "Agent '\(saved.id)' uses system prompt '\(saved.systemPrompt ?? "-")'.")
-      }
-
-    case "remove", "rm", "delete", "del":
-      guard words.count == 2 else {
-        await terminal.line("Usage: /agent remove ID")
-        return
-      }
-      await removeAgent(
-        words[1],
-        session: session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-
-    case "use":
-      guard words.count == 2 else {
-        await terminal.line("Usage: /agent use ID")
-        return
-      }
-      await selectAgent(
-        words[1], session: &session, configuration: configuration, terminal: terminal)
-
-    default:
-      await selectAgent(
-        words[0], session: &session, configuration: configuration, terminal: terminal)
-    }
-  }
-
-  /// Makes a saved definition this chat's agent, starting the conversation over.
-  private static func selectAgent(
-    _ id: String,
-    session: inout REPLSession,
-    configuration: MaiConfiguration?,
-    terminal: TerminalWriter
-  ) async {
-    guard let definition = configuration?.agents.first(where: { $0.id == id }) else {
-      await terminal.line("Unknown agent '\(id)'. Use /agents.")
-      return
-    }
-    session.reset(profile: SessionProfile(definition: definition))
-    await terminal.line(
-      "Agent: \(id). It is now the primary agent for chat '\(session.title)'; conversation cleared."
-    )
-  }
-
-  /// `/agent add NAME MODEL GROUPS PROMPT [PROVIDER [BASE_URL]]`: one line
-  /// saves a definition out of things that already exist â€” a provider, a
-  /// named system prompt, tool groups â€” and a base URL registers a new
-  /// OpenAI-compatible provider on the way. Saving does not switch the chat.
-  private static func addAgent(
-    _ words: [String],
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    let usage = """
-      Usage: /agent add NAME MODEL GROUPS PROMPT [PROVIDER [BASE_URL]]
-        MODEL     a model name, or - for the provider's default
-        GROUPS    tool groups as a,b,c (see /tools), or - for none
-        PROMPT    a named system prompt (see /prompts; /prompt add NAME TEXT creates one)
-        PROVIDER  defaults to this chat's provider; with BASE_URL a new OpenAI-compatible one
-      """
-    guard (4...6).contains(words.count) else {
-      await terminal.line(usage)
-      return
-    }
-    guard let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return
-    }
-    var draft = configuration ?? MaiConfiguration()
-    let name = words[0]
-    let model = words[1] == "-" ? "" : words[1]
-    let providerID = words.count >= 5 ? ProviderID(words[4]) : session.profile.provider
-
-    var providerChanged = false
-    if words.count == 6 {
-      guard let baseURL = URL(string: words[5]),
-        ["http", "https"].contains(baseURL.scheme?.lowercased() ?? ""),
-        baseURL.host != nil
-      else {
-        await terminal.line("BASE_URL must be an http(s) URL.\n\(usage)")
-        return
-      }
-      if let index = draft.providers.firstIndex(where: { $0.id == providerID.rawValue }) {
-        if let configuredURL = draft.providers[index].baseURL, configuredURL != baseURL {
-          await terminal.line(
-            "Provider '\(providerID)' already uses \(configuredURL.absoluteString). Use a unique provider ID for \(baseURL.absoluteString).",
-            to: .standardError)
-          return
-        }
-        if draft.providers[index].baseURL == nil {
-          draft.providers[index].baseURL = baseURL
-          providerChanged = true
-        }
-      } else {
-        draft.providers.append(
-          ConfiguredProvider(
-            id: providerID.rawValue,
-            kind: .openAICompatible,
-            baseURL: baseURL,
-            apiKeyEnvironment: apiKeyEnvironmentName(for: providerID.rawValue)))
-        providerChanged = true
-      }
-    } else if !draft.providers.contains(where: { $0.id == providerID.rawValue }) {
-      await terminal.line(
-        "Unknown provider '\(providerID)'. /providers lists the configured ones; add BASE_URL to register a new OpenAI-compatible endpoint."
-      )
-      return
-    }
-
-    guard let promptName = resolvedSystemPromptName(words[3], configuration: draft),
-      let instructions = draft.prompts?.system[promptName]
-    else {
-      let known = draft.prompts?.system.keys.sorted() ?? []
-      await terminal.line(
-        "Unknown system prompt '\(words[3])'. Create it first: /prompt add \(words[3]) TEXT, or /prompt edit \(words[3])."
-          + (known.isEmpty ? "" : " Known: \(known.joined(separator: ", ")).")
-      )
-      return
-    }
-    guard
-      let selection = await resolveToolGroupSpec(
-        words[2], runtime: runtime, plugins: plugins, configuration: draft, terminal: terminal)
-    else { return }
-
-    let isNew = !draft.agents.contains { $0.id == name }
-    var definition =
-      draft.agents.first { $0.id == name }
-      ?? AgentDefinition(id: name, instructions: instructions, provider: providerID, model: model)
-    definition.provider = providerID
-    definition.model = model
-    definition.systemPrompt = promptName
-    definition.instructions = instructions
-    definition.toolGroupNames = []
-    definition.toolNames = []
-    selection.apply(to: &definition)
-    let changed = draft.upsertAgent(definition)
-
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      if providerChanged,
-        let provider = draft.providers.first(where: { $0.id == providerID.rawValue })
-      {
-        try await runtime.register(
-          plugins.makeProvider(from: provider, environment: ProcessInfo.processInfo.environment),
-          replacingExisting: true)
-      }
-      for agent in draft.agents where changed.contains(agent.id) {
-        try await runtime.register(agent: agent, replacingExisting: true)
-      }
-      configuration = draft
-      if session.profile.agentID == name {
-        try applyDefinition(definition, to: &session)
-      }
-      let groups = definition.toolGroupNames.sorted()
-      let summary =
-        "\(providerID)\(model.isEmpty ? "" : " \(model)"), "
-        + (groups.isEmpty ? "no tool groups" : "tool groups \(groups.joined(separator: ", "))")
-        + ", system prompt '\(promptName)'"
-      let hint =
-        session.profile.agentID == name ? "" : " /agent use \(name) switches this chat to it."
-      await terminal.line("\(isNew ? "Added" : "Updated") agent '\(name)': \(summary).\(hint)")
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  /// What `a,b,c`, `+a,-b`, or `-` asks for, resolved against the tool
-  /// group catalog.
-  private struct ToolGroupSelection {
-    var replaces: Bool
-    var added: [ToolGroupDefinition] = []
-    var removed: [ToolGroupDefinition] = []
-
-    func apply(to definition: inout AgentDefinition) {
-      if replaces {
-        definition.toolGroupNames = Set(added.map(\.id))
-        definition.toolNames = added.reduce(into: Set<String>()) { $0.formUnion($1.toolNames) }
-        return
-      }
-      for group in removed {
-        definition.toolGroupNames.remove(group.id)
-        definition.toolNames.subtract(group.toolNames)
-      }
-      for group in added {
-        definition.toolGroupNames.insert(group.id)
-        definition.toolNames.formUnion(group.toolNames)
-      }
-    }
-  }
-
-  /// Parses a tool group spec, saying which name was not found.
-  private static func resolveToolGroupSpec(
-    _ spec: String,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: MaiConfiguration?,
-    terminal: TerminalWriter
-  ) async -> ToolGroupSelection? {
-    let catalog: [ToolGroupDefinition]
-    do {
-      catalog = try await toolGroupCatalog(
-        runtime: runtime, plugins: plugins, configuration: configuration)
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      return nil
-    }
-    if spec == "-" || spec.lowercased() == "none" { return ToolGroupSelection(replaces: true) }
-    let entries = spec.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-      .filter { !$0.isEmpty }
-    let relative = !entries.isEmpty && entries.allSatisfy { $0.hasPrefix("+") || $0.hasPrefix("-") }
-    var selection = ToolGroupSelection(replaces: !relative)
-    for entry in entries {
-      let name = relative ? String(entry.dropFirst()) : entry
-      guard let group = resolveToolGroup(name, in: catalog) else {
-        await terminal.line(
-          "Unknown tool group '\(name)'. Available: \(catalog.map(\.id).sorted().joined(separator: ", "))."
-        )
-        return nil
-      }
-      if relative, entry.hasPrefix("-") {
-        selection.removed.append(group)
-      } else {
-        selection.added.append(group)
-      }
-    }
-    return selection
-  }
-
-  /// Applies one change to a saved definition, writes it back, and keeps the
-  /// current chat in step when it is the agent edited â€” without clearing
-  /// the conversation. `change` answers a message to refuse the edit.
-  private static func updateAgent(
-    _ id: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter,
-    change: (inout AgentDefinition, MaiConfiguration) -> String?
-  ) async -> AgentDefinition? {
-    guard let draft = configuration, configurationPath != nil else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return nil
-    }
-    guard var definition = draft.agents.first(where: { $0.id == id }) else {
-      await terminal.line("Unknown agent '\(id)'. /agents lists the saved ones.")
-      return nil
-    }
-    if let refusal = change(&definition, draft) {
-      await terminal.line(refusal)
-      return nil
-    }
-    guard
-      await persistAgentDefinition(
-        definition,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        runtime: runtime,
-        terminal: terminal)
-    else { return nil }
-    if session.profile.agentID == id {
-      do {
-        try applyDefinition(definition, to: &session)
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-    }
-    return definition
-  }
-
-  /// Brings the current chat in step with a definition just saved, without
-  /// clearing the conversation: the system message is rewritten in place.
-  private static func applyDefinition(
-    _ definition: AgentDefinition,
-    to session: inout REPLSession
-  ) throws {
-    let previous = session.profile.instructions
-    session.profile = SessionProfile(definition: definition)
-    try applySystemInstructions(definition.instructions, replacing: previous, session: &session)
-  }
-
-  private static func removeAgent(
-    _ id: String,
-    session: REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard var draft = configuration, let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return
-    }
-    guard let removed = draft.agents.first(where: { $0.id == id }) else {
-      await terminal.line("Unknown agent '\(id)'. /agents lists the saved ones.")
-      return
-    }
-    guard id != session.profile.agentID else {
-      await terminal.line("Agent '\(id)' is this chat's agent; switch with /agent use OTHER first.")
-      return
-    }
-    let parents = draft.agents.filter { $0.subagentNames.contains(id) }.map(\.id)
-    let previousDefault = draft.defaultAgent
-    draft.removeAgent(id)
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      await runtime.unregister(agentID: id)
-      configuration = draft
-      var notes = ["Removed agent '\(id)'."]
-      if !parents.isEmpty {
-        notes.append("It is no longer a subagent of \(parents.joined(separator: ", ")).")
-      }
-      if let current = draft.defaultAgent, current != previousDefault {
-        notes.append("The default agent is now '\(current)'.")
-      }
-      if let prompt = removed.systemPrompt, draft.agentsUsingSystemPrompt(prompt).isEmpty,
-        draft.prompts?.system[prompt] != nil
-      {
-        notes.append("Its system prompt '\(prompt)' is now unused; /prompt rm \(prompt) drops it.")
-      }
-      await terminal.line(notes.joined(separator: " "))
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  /// Opens one saved definition as JSON. `instructions` is the text of the
-  /// prompt named in `systemPrompt`: changing the text changes that prompt
-  /// for every agent using it; naming another existing prompt without
-  /// touching the text switches to that prompt.
-  private static func editAgentDefinition(
-    named id: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard let draft = configuration, let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return
-    }
-    guard let current = draft.agents.first(where: { $0.id == id }) else {
-      await terminal.line("Unknown agent '\(id)'. /agents lists the saved ones.")
-      return
-    }
-    do {
-      let encoder = JSONEncoder()
-      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-      let data = try encoder.encode(current)
-      guard
-        let edited = await editTemporaryData(data, suffix: "agent-\(id).json", terminal: terminal)
-      else { return }
-      var definition = try JSONDecoder().decode(AgentDefinition.self, from: edited)
-      guard definition.id == id else {
-        await terminal.line("Keep the id '\(id)'; /agent add creates another agent.")
-        return
-      }
-      if let name = definition.systemPrompt, name != current.systemPrompt,
-        definition.instructions == current.instructions,
-        let text = draft.prompts?.system[name]
-      {
-        definition.instructions = text
-      }
-      guard
-        await persistAgentDefinition(
-          definition,
-          configuration: &configuration,
-          configurationPath: configurationPath,
-          runtime: runtime,
-          terminal: terminal)
-      else { return }
-      if session.profile.agentID == id {
-        try applyDefinition(definition, to: &session)
-      }
-      await terminal.line("Agent '\(id)' saved to \(configurationPath).")
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  /// Opens one configured provider as JSON, the way `/edit agent` opens an
-  /// agent, and rebuilds it in the live runtime once the file is saved, so a
-  /// new header or base URL takes effect without a restart.
-  private static func editConfiguredProvider(
-    named id: String,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    providerBaseURLs: ProviderBaseURLStore,
-    terminal: TerminalWriter
-  ) async {
-    guard var draft = configuration, let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return
-    }
-    guard let index = draft.providers.firstIndex(where: { $0.id == id }) else {
-      await terminal.line("Unknown configured provider '\(id)'. /providers lists them.")
-      return
-    }
-    do {
-      let encoder = JSONEncoder()
-      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-      let data = try encoder.encode(draft.providers[index])
-      guard
-        let edited = await editTemporaryData(
-          data, suffix: "provider-\(id).json", terminal: terminal)
-      else { return }
-      let provider = try JSONDecoder().decode(ConfiguredProvider.self, from: edited)
-      guard provider.id == id else {
-        await terminal.line("Keep the id '\(id)'; /edit config adds providers.")
-        return
-      }
-      let built = try await plugins.makeProvider(
-        from: provider, environment: ProcessInfo.processInfo.environment)
-      try await runtime.register(built, replacingExisting: true)
-      draft.providers[index] = provider
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-      if let baseURL = provider.baseURL {
-        providerBaseURLs.set(baseURL, for: id)
-      }
-      await terminal.line("Provider '\(id)' saved to \(configurationPath) and reloaded.")
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  private static func showAgent(
-    _ id: String,
-    session: REPLSession,
-    configuration: MaiConfiguration?,
-    providerBaseURLs: [String: URL],
-    terminal: TerminalWriter
-  ) async {
-    let definition =
-      session.profile.agentID == id
-      ? session.profile.agentDefinition : configuration?.agents.first(where: { $0.id == id })
-    guard let definition else {
-      await terminal.line("Unknown agent '\(id)'. Use /agents.")
-      return
-    }
-    let baseURL =
-      providerBaseURLs[definition.provider.rawValue]
-      ?? configuration?.providers.first { $0.id == definition.provider.rawValue }?.baseURL
-    let groups = definition.toolGroupNames.sorted()
-    let subagents = definition.subagentNames.sorted()
-    let parked = definition.isEnabled ? "" : " [disabled]"
-    await terminal.line("Agent: \(definition.id) (\(definition.displayName))\(parked)")
-    if !definition.description.isEmpty {
-      await terminal.line("Description: \(definition.description)")
-    }
-    await terminal.line("Provider: \(definition.provider)")
-    await terminal.line("Base URL: \(baseURL?.absoluteString ?? "-")")
-    await terminal.line("Model: \(definition.model.isEmpty ? "-" : definition.model)")
-    await terminal.line(
-      "Tool groups: \(groups.isEmpty ? "-" : groups.joined(separator: ", ")) (\(definition.toolNames.count) tools)"
-    )
-    await terminal.line("Subagents: \(subagents.isEmpty ? "-" : subagents.joined(separator: ", "))")
-    await terminal.line(
-      "Delegation: \(definition.toolDelegation.rawValue) Â· limits \(definition.limits.maxModelTurns) turns, \(definition.limits.maxToolCalls) tools, \(definition.limits.maxSubagents) subagents"
-    )
-    await terminal.line("Tool calling: \(definition.toolCallingStrategy.rawValue)")
-    await terminal.line("System prompt: \(definition.systemPrompt ?? "inline")")
-    await terminal.line(
-      "Instructions: \(definition.instructions.isEmpty ? "-" : definition.instructions)")
-  }
-
-  @discardableResult
-  private static func persistAgentProfile(
-    session: REPLSession,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    runtime: AgentRuntime,
-    terminal: TerminalWriter
-  ) async -> Bool {
-    await persistAgentDefinition(
-      session.profile.agentDefinition,
-      configuration: &configuration,
-      configurationPath: configurationPath,
-      runtime: runtime,
-      terminal: terminal)
-  }
-
-  /// Writes one definition to the configuration and the live runtime, along
-  /// with every agent sharing its named prompt. Answers false, having said
-  /// why, when nothing could be saved.
-  @discardableResult
-  private static func persistAgentDefinition(
-    _ definition: AgentDefinition,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    runtime: AgentRuntime,
-    terminal: TerminalWriter
-  ) async -> Bool {
-    guard var draft = configuration, let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return false
-    }
-    let changed = draft.upsertAgent(definition)
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      for agent in draft.agents where changed.contains(agent.id) {
-        try await runtime.register(agent: agent, replacingExisting: true)
-      }
-      configuration = draft
-      return true
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      return false
-    }
-  }
-
-  private static func apiKeyEnvironmentName(for providerID: String) -> String {
-    if providerID.lowercased() == "openai" { return "OPENAI_API_KEY" }
-    let stem = providerID.uppercased().map { character in
-      character.isLetter || character.isNumber ? character : "_"
-    }
-    return String(stem) + "_API_KEY"
-  }
-
-  private static func handleToolsCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    let fields = argument.split(maxSplits: 3, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    let action = fields.first?.lowercased() ?? "list"
-    let groups: [ToolGroupDefinition]
-    do {
-      groups = try await toolGroupCatalog(
-        runtime: runtime,
-        plugins: plugins,
-        configuration: configuration)
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      return
-    }
-
-    if action == "list" || fields.isEmpty {
-      if session.profile.useToolProxy {
-        await terminal.line(
-          "Tool proxy \(toolProxySetting(session.profile)): models see \(session.profile.proxyExposedTools?.isEmpty == true ? "only" : "the common tools plus") list-tools and call-tool."
-        )
-      }
-      for group in groups {
-        let enabled = isToolGroupEnabled(group, profile: session.profile) ? "*" : " "
-        await terminal.line(
-          "\(enabled) \(group.id) â€” \(group.displayName) [\(group.toolNames.count) tool\(group.toolNames.count == 1 ? "" : "s")]"
-        )
-      }
-      await terminal.line(
-        "Use /tools show GROUP to see what a group is for, each tool with its parameters, and its settings."
-      )
-      return
-    }
-
-    guard fields.count >= 2, let group = resolveToolGroup(fields[1], in: groups) else {
-      await terminal.line(toolHelp)
-      return
-    }
-    switch action {
-    case "enable", "on":
-      session.profile.toolGroupNames.insert(group.id)
-      session.profile.toolNames.formUnion(group.toolNames)
-      if await persistAgentProfile(
-        session: session,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        runtime: runtime,
-        terminal: terminal)
-      {
-        await terminal.line(
-          "Enabled tool group '\(group.id)' for agent \(session.profile.agentID).")
-      }
-    case "disable", "off":
-      session.profile.toolGroupNames.remove(group.id)
-      session.profile.toolNames.subtract(group.toolNames)
-      if await persistAgentProfile(
-        session: session,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        runtime: runtime,
-        terminal: terminal)
-      {
-        await terminal.line(
-          "Disabled tool group '\(group.id)' for agent \(session.profile.agentID).")
-      }
-    case "show":
-      let count = group.toolNames.count
-      let enabled = isToolGroupEnabled(group, profile: session.profile)
-      // Names in the bold cyan of headings, traits yellow, parameter names
-      // green with their type dim, so the eye can jump from tool to tool and
-      // the descriptions read as prose in between.
-      let colors = await terminal.paintsOutput
-      func paint(_ text: String, _ code: String?) -> String {
-        guard colors, let code else { return text }
-        return "\u{1B}[\(code)m\(text)\u{1B}[0m"
-      }
-      await terminal.line(
-        paint(group.displayName, "1;36") + " " + paint("(\(group.catalogID))", "2")
-          + ": \(count) tool\(count == 1 ? "" : "s"), "
-          + paint(enabled ? "enabled" : "disabled", enabled ? "32" : "31")
-          + " for agent \(session.profile.agentID)")
-      // The agent family is synthesized per run rather than registered, so
-      // its help comes from the definitions the model would see.
-      var tools = await runtime.availableTools()
-      if group.id == AgentRuntime.agentToolGroup.id {
-        tools += AgentProcessTools.definitions(
-          offering: [], delegating: true, planFirst: configuration?.use.plan ?? true)
-      }
-      let helpLines = ToolGroupHelp.lines(for: group, tools: tools) { text, style in
-        switch style {
-        case .group: return paint(text, "36")
-        case .tool: return paint(text, "1;36")
-        case .trait: return paint(text, "33")
-        case .description, .parameterDetail: return text
-        case .parameter: return paint(text, "32")
-        case .parameterType, .note: return paint(text, "2")
-        case .missing: return paint(text, "31")
-        }
-      }
-      for line in helpLines {
-        await terminal.line(line)
-      }
-      guard !group.options.isEmpty else { return }
-      let options = configuredOptions(for: group, configuration: configuration)
-      await terminal.line("")
-      await terminal.line(
-        paint("Settings", "1;36")
-          + paint(", changed with /tools set \(group.id) OPTION VALUE:", "2"))
-      for option in group.options {
-        let value = options[option.id] ?? option.defaultValue
-        var line =
-          "  " + paint(option.id, "32") + " = "
-          + paint(displayedOption(value, kind: option.kind), "1")
-          + "  " + paint("\(option.label).", "2")
-        if let help = option.help?.trimmingCharacters(in: .whitespacesAndNewlines), !help.isEmpty {
-          line += " " + paint(help, "2")
-        }
-        await terminal.line(line)
-      }
-    case "set", "config":
-      guard fields.count == 4,
-        let option = group.options.first(where: { $0.id == fields[2] }),
-        let value = parseToolOption(fields[3], definition: option)
-      else {
-        await terminal.line("Usage: /tools set GROUP OPTION VALUE")
-        return
-      }
-      await reconfigureToolGroup(
-        group,
-        option: option.id,
-        value: value,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-    case "unset":
-      guard fields.count == 3,
-        group.options.contains(where: { $0.id == fields[2] })
-      else {
-        await terminal.line("Usage: /tools unset GROUP OPTION")
-        return
-      }
-      await reconfigureToolGroup(
-        group,
-        option: fields[2],
-        value: nil,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-    default:
-      await terminal.line(toolHelp)
-    }
-  }
-
-  // MARK: Effort
-
-  /// `/set effort` shows the reasoning level and guidance of the current
-  /// agent; `/set effort LEVEL [TEXT]` sets them and `/set effort auto` clears
-  /// them. The level
-  /// reaches the provider as the field its API family takes and, with the
-  /// guidance, the system prompt; both persist on the agent like /set does.
-  private static func handleEffortCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    guard let first = fields.first?.lowercased() else {
-      await terminal.line(effortDescription(session.profile.options))
-      return
-    }
-    let guidance = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-    if ["auto", "automatic", "default", "clear"].contains(first) {
-      session.profile.options.reasoningEffort = nil
-      session.profile.options.reasoningGuidance = nil
-    } else if let effort = ReasoningEffort(name: first) {
-      session.profile.options.reasoningEffort = effort.rawValue
-      session.profile.options.reasoningGuidance = guidance.isEmpty ? nil : guidance
-    } else {
-      await terminal.line(effortHelp)
-      return
-    }
-    session.touch()
-    let summary = effortDescription(session.profile.options)
-    let endpoint = configuration?.providers.first { $0.id == session.profile.provider.rawValue }
-    if let effort = session.profile.options.reasoningEffort.flatMap(ReasoningEffort.init(name:)),
-      let note = effort.limitation(
-        model: session.profile.model,
-        provider: session.profile.provider.rawValue,
-        baseURL: endpoint?.baseURL?.absoluteString ?? "")
-    {
-      await terminal.line(note)
-    }
-    guard configuration != nil, configurationPath != nil else {
-      await terminal.line("Set \(summary) for this chat.")
-      return
-    }
-    if await persistAgentProfile(
-      session: session,
-      configuration: &configuration,
-      configurationPath: configurationPath,
-      runtime: runtime,
-      terminal: terminal)
-    {
-      await terminal.line("Set \(summary) for agent '\(session.profile.agentID)'.")
-    }
-  }
-
-  /// `effort = high â€” Check every edge case.`, or `effort = off`.
-  private static func effortDescription(_ options: GenerationOptions) -> String {
-    let level = options.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    let guidance = options.reasoningGuidance?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    var text = "effort = \(level.isEmpty ? "auto" : level)"
-    if !guidance.isEmpty { text += " â€” \(guidance)" }
-    return text
-  }
-
-  // MARK: Skills
-
-  /// Registers a `skills_*` tool for every skill the state can see. Called
-  /// at startup, before agents are filtered against the known tool names.
-  private static func registerSkillTools(
-    in runtime: AgentRuntime,
-    state: SkillState
-  ) async throws {
-    for tool in MaiSkillTools.makeTools(catalog: { state.catalog }) {
-      try await runtime.register(tool: tool, replacingExisting: true)
-    }
-  }
-
-  /// Brings the runtime's skill tools in line with the folders on disk: new
-  /// skills are registered, edited ones re-described, removed ones dropped.
-  @discardableResult
-  private static func synchronizeSkillTools(
-    runtime: AgentRuntime,
-    state: SkillState
-  ) async -> (catalog: AgentSkillCatalog, added: [String], removed: [String]) {
-    let catalog = state.catalog
-    let wanted = catalog.modelInvocable
-    let wantedNames = Set(wanted.map(\.toolName))
-    let registered = Set(
-      await runtime.availableTools().map(\.name).filter(MaiSkillTools.isSkillTool))
-    var removed: [String] = []
-    for name in registered.subtracting(wantedNames).sorted() {
-      await runtime.unregister(toolNamed: name)
-      removed.append(name)
-    }
-    var added: [String] = []
-    for skill in wanted {
-      let tool = MaiSkillTools.makeTool(for: skill) { state.catalog }
-      guard (try? await runtime.register(tool: tool, replacingExisting: true)) != nil else {
-        continue
-      }
-      if !registered.contains(skill.toolName) { added.append(skill.name) }
-    }
-    return (catalog, added, removed)
-  }
-
-  private static func isSkillEnabled(_ skill: AgentSkill, profile: SessionProfile) -> Bool {
-    profile.toolNames.contains(skill.toolName)
-      || profile.toolGroupNames.contains(MaiSkillTools.groupID)
-  }
-
-  /// The name and extra text of a `/skills prompt NAME [TEXT]` line; nil for
-  /// any other /skills action.
-  private static func skillPromptRequest(_ argument: String)
-    -> (name: String, arguments: String)?
-  {
-    let pieces = argument.split(maxSplits: 2, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    guard let action = pieces.first?.lowercased(), ["prompt", "send", "use"].contains(action)
-    else { return nil }
-    let name = pieces.count > 1 ? pieces[1] : ""
-    let arguments =
-      pieces.count > 2 ? pieces[2].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-    return (name, arguments)
-  }
-
-  private static func resolveSkill(
-    _ selector: String,
-    in catalog: AgentSkillCatalog,
-    terminal: TerminalWriter
-  ) async -> AgentSkill? {
-    guard !selector.isEmpty else {
-      await terminal.line("Usage: /skills show|enable|disable|prompt NAME   (/skills lists them)")
-      return nil
-    }
-    guard let skill = catalog.skill(named: selector) else {
-      await terminal.line("Unknown skill '\(selector)'. /skills lists them.")
-      return nil
-    }
-    return skill
-  }
-
-  private static func handleSkillsCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    skills: SkillState,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    let action = fields.first?.lowercased() ?? "list"
-    let rest = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-    let synced = await synchronizeSkillTools(runtime: runtime, state: skills)
-    let catalog = synced.catalog
-    let agentID = session.profile.agentID
-
-    switch action {
-    case "", "list", "ls":
-      guard !catalog.isEmpty else {
-        let places = skills.directories.map { abbreviatedPath($0.path, width: 60) }
-        await terminal.line(
-          "No skills. A skill is a folder with a SKILL.md under \(places.joined(separator: " or ")); /help skills explains."
-        )
-        return
-      }
-      for skill in catalog.skills {
-        let mark =
-          skill.isModelInvocable && isSkillEnabled(skill, profile: session.profile) ? "*" : " "
-        var note = skill.rootURL.path == skills.userDirectory.path ? "user" : "project"
-        if !skill.isModelInvocable { note += ", prompt only" }
-        await terminal.line("\(mark) \(skill.name) â€” \(skill.description) [\(note)]")
-      }
-      await terminal.line(
-        "* marks the skills agent \(agentID) may call. /skills enable NAME offers one; /skills prompt NAME [TEXT] sends one now."
-      )
-
-    case "show", "cat":
-      guard let skill = await resolveSkill(rest, in: catalog, terminal: terminal) else { return }
-      let state =
-        !skill.isModelInvocable
-        ? "not offered to the model"
-        : isSkillEnabled(skill, profile: session.profile)
-          ? "enabled for \(agentID)" : "disabled for \(agentID)"
-      await terminal.line("\(skill.name): \(skill.description)")
-      await terminal.line("File: \(skill.fileURL.path)")
-      await terminal.line("Tool: \(skill.toolName) (\(state))")
-      await terminal.line("")
-      await terminal.line(skill.body)
-
-    case "enable", "on", "disable", "off":
-      let enabling = action == "enable" || action == "on"
-      if rest.lowercased() == "all" {
-        let names = catalog.modelInvocable.map(\.toolName)
-        if enabling {
-          session.profile.toolGroupNames.insert(MaiSkillTools.groupID)
-          session.profile.toolNames.formUnion(names)
-        } else {
-          session.profile.toolGroupNames.remove(MaiSkillTools.groupID)
-          session.profile.toolNames = session.profile.toolNames.filter {
-            !MaiSkillTools.isSkillTool($0)
-          }
-        }
-        guard
-          await persistAgentProfile(
-            session: session, configuration: &configuration,
-            configurationPath: configurationPath, runtime: runtime, terminal: terminal)
-        else { return }
-        await terminal.line(
-          enabling
-            ? "Enabled all \(names.count) skill\(names.count == 1 ? "" : "s") for agent \(agentID); skills added later are offered too."
-            : "Disabled every skill for agent \(agentID); /skills prompt NAME still sends one.")
-        return
-      }
-      guard let skill = await resolveSkill(rest, in: catalog, terminal: terminal) else { return }
-      guard skill.isModelInvocable else {
-        await terminal.line(
-          "Skill '\(skill.name)' says disable-model-invocation, so the model never calls it; /skills prompt \(skill.name) sends it."
-        )
-        return
-      }
-      if enabling {
-        session.profile.toolNames.insert(skill.toolName)
-      } else {
-        session.profile.toolNames.remove(skill.toolName)
-        // The group means "every skill, present and future"; one dropped
-        // out of it has to be listed by name from now on.
-        session.profile.toolGroupNames.remove(MaiSkillTools.groupID)
-      }
-      guard
-        await persistAgentProfile(
-          session: session, configuration: &configuration,
-          configurationPath: configurationPath, runtime: runtime, terminal: terminal)
-      else { return }
-      await terminal.line(
-        enabling
-          ? "Enabled skill '\(skill.name)' for agent \(agentID): the model may call \(skill.toolName)."
-          : "Disabled skill '\(skill.name)' for agent \(agentID); /skills prompt \(skill.name) still sends it."
-      )
-
-    case "prompt", "send", "use":
-      await terminal.line(
-        "Use /skills prompt NAME [TEXT] at the chat prompt; /skills show NAME prints what it sends."
-      )
-
-    case "path", "paths", "dirs", "dir":
-      for directory in skills.directories {
-        var isDirectory: ObjCBool = false
-        let exists =
-          FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory)
-          && isDirectory.boolValue
-        let count = AgentSkillCatalog.load(directory: directory).count
-        await terminal.line(
-          "\(directory.path)  \(exists ? "\(count) skill\(count == 1 ? "" : "s")" : "(missing)")")
-      }
-
-    case "reload", "sync", "rescan":
-      var parts: [String] = []
-      if !synced.added.isEmpty { parts.append("added \(synced.added.joined(separator: ", "))") }
-      if !synced.removed.isEmpty {
-        parts.append("removed \(synced.removed.joined(separator: ", "))")
-      }
-      await terminal.line(
-        "\(catalog.skills.count) skill\(catalog.skills.count == 1 ? "" : "s")"
-          + (parts.isEmpty ? ", unchanged." : ": " + parts.joined(separator: "; ") + "."))
-
-    default:
-      await terminal.line(skillsHelp)
-    }
-  }
-
-  private static func toolGroupCatalog(
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: MaiConfiguration?
-  ) async throws -> [ToolGroupDefinition] {
-    let tools = await runtime.availableTools()
-    var groups = AgentRuntime.builtInToolGroups(for: tools)
-    for source in configuration?.toolSources.filter(\.enabled) ?? [] {
-      groups.append(
-        contentsOf: try await plugins.toolGroups(
-          kind: source.kind,
-          context: source.context(environment: ProcessInfo.processInfo.environment)))
-    }
-    return ToolGroupDefinition.catalog(known: groups, tools: tools)
-  }
-
-  private static func resolveToolGroup(
-    _ selector: String,
-    in groups: [ToolGroupDefinition]
-  ) -> ToolGroupDefinition? {
-    let matches = groups.filter {
-      $0.id.caseInsensitiveCompare(selector) == .orderedSame
-        || $0.catalogID.caseInsensitiveCompare(selector) == .orderedSame
-    }
-    return matches.count == 1 ? matches[0] : nil
-  }
-
-  private static func isToolGroupEnabled(
-    _ group: ToolGroupDefinition,
-    profile: SessionProfile
-  ) -> Bool {
-    profile.toolGroupNames.contains(group.id) || group.toolNames.isSubset(of: profile.toolNames)
-  }
-
-  private static func configuredOptions(
-    for group: ToolGroupDefinition,
-    configuration: MaiConfiguration?
-  ) -> [String: JSONValue] {
-    let source = configuration?.toolSources.first { $0.id == group.sourceID }
-    return Dictionary(
-      uniqueKeysWithValues: group.options.compactMap { option in
-        source?.options[option.id].map { (option.id, $0) }
-          ?? option.defaultValue.map { (option.id, $0) }
-      })
-  }
-
-  private static func displayedOption(
-    _ value: JSONValue?,
-    kind: ToolGroupOptionKind
-  ) -> String {
-    guard let value else { return "-" }
-    if kind == .secret { return value.stringValue?.isEmpty == false ? "(configured)" : "-" }
-    if let string = value.stringValue { return string }
-    if let integer = value.intValue { return String(integer) }
-    if let number = value.numberValue { return String(number) }
-    if let boolean = value.boolValue { return String(boolean) }
-    return value.compactJSONString
-  }
-
-  private static func parseToolOption(
-    _ rawValue: String,
-    definition: ToolGroupOptionDefinition
-  ) -> JSONValue? {
-    switch definition.kind {
-    case .text, .secret:
-      return .string(rawValue)
-    case .boolean:
-      return booleanSetting(rawValue).map(JSONValue.bool)
-    case .number:
-      return Double(rawValue).map(JSONValue.number)
-    case .choice:
-      guard definition.choices.contains(rawValue) else { return nil }
-      return .string(rawValue)
-    }
-  }
-
-  private static func reconfigureToolGroup(
-    _ group: ToolGroupDefinition,
-    option: String,
-    value: JSONValue?,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard var draft = configuration, let configurationPath,
-      let sourceIndex = draft.toolSources.firstIndex(where: { $0.id == group.sourceID })
-    else {
-      await terminal.line("This runtime-only group has no persistent settings.")
-      return
-    }
-    if let value {
-      draft.toolSources[sourceIndex].options[option] = value
-    } else {
-      draft.toolSources[sourceIndex].options.removeValue(forKey: option)
-    }
-    let source = draft.toolSources[sourceIndex]
-    do {
-      let context = source.context(environment: ProcessInfo.processInfo.environment)
-      let tools = try await plugins.makeTools(kind: source.kind, context: context)
-      let groups = try await plugins.toolGroups(kind: source.kind, context: context)
-      let replacement = groups.first(where: { $0.id == group.id })
-      for index in draft.agents.indices
-      where draft.agents[index].toolGroupNames.contains(group.id)
-        || group.toolNames.isSubset(of: draft.agents[index].toolNames)
-      {
-        draft.agents[index].toolGroupNames.insert(group.id)
-        draft.agents[index].toolNames.subtract(group.toolNames)
-        if let replacement {
-          draft.agents[index].toolNames.formUnion(replacement.toolNames)
-        }
-      }
-      if isToolGroupEnabled(group, profile: session.profile),
-        let replacement
-      {
-        session.profile.toolGroupNames.insert(group.id)
-        session.profile.toolNames.subtract(group.toolNames)
-        session.profile.toolNames.formUnion(replacement.toolNames)
-      }
-      let definition = session.profile.agentDefinition
-      if let index = draft.agents.firstIndex(where: { $0.id == definition.id }) {
-        draft.agents[index] = definition
-      } else {
-        draft.agents.append(definition)
-      }
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      for tool in tools {
-        try await runtime.register(tool: tool, replacingExisting: true)
-      }
-      for agent in draft.agents {
-        try await runtime.register(agent: agent, replacingExisting: true)
-      }
-      configuration = draft
-      await terminal.line("Saved \(group.id).\(option).")
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  private static func handleSetCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    approvalHandler: TerminalApprovalHandler,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    let parts = argument.replacingOccurrences(of: "=", with: " ")
-      .split(whereSeparator: \Character.isWhitespace)
-      .map(String.init)
-    guard !parts.isEmpty else {
-      let enabled = await approvalHandler.isYOLOEnabled()
-      await terminal.line("yolo = \(enabled ? "on" : "off")")
-      await listLimitSettings(session.profile.limits, terminal: terminal)
-      await listRecoverySettings(session.profile, terminal: terminal)
-      await listToolSettings(session.profile, terminal: terminal)
-      await terminal.line("delegation = \(session.profile.toolDelegation.rawValue)")
-      await terminal.line(effortDescription(session.profile.options))
-      await listUISettings(configuration?.ui ?? .init(), terminal: terminal)
-      await listUseSettings(configuration?.use ?? .init(), terminal: terminal)
-      return
-    }
-    let key = parts[0].lowercased()
-    let displayedKey = key == "ui.toolresultlines" ? "ui.toolResultLines" : key
-    if key == "effort" {
-      await handleEffortCommand(
-        parts.dropFirst().joined(separator: " "),
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-      return
-    }
-    if key == "ui" || key == "ui." {
-      await listUISettings(configuration?.ui ?? .init(), terminal: terminal)
-      return
-    }
-    if key == "use" || key == "use." {
-      await listUseSettings(configuration?.use ?? .init(), terminal: terminal)
-      return
-    }
-    if key == "use.agentsmd" {
-      await setAgentsMarkdown(
-        parts: parts,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-      return
-    }
-    if key == "use.plan" {
-      await setPlanning(
-        parts: parts,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-      return
-    }
-    if key == "limits" || key == "limits." {
-      await listLimitSettings(session.profile.limits, terminal: terminal)
-      return
-    }
-    if let limitKey = limitSettingKeys[key] {
-      await setLimit(
-        limitKey,
-        parts: parts,
-        session: &session,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-      return
-    }
-    if let recoveryKey = recoverySettingKeys[key] {
-      await setRecoverySetting(
-        recoveryKey,
-        parts: parts,
-        session: &session,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-      return
-    }
-    if delegationSettingKeys.contains(key) {
-      await setToolDelegation(
-        parts: parts,
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-      return
-    }
-    if key == "tool" || key == "tool." || key == "tools" || key == "tools." {
-      await listToolSettings(session.profile, terminal: terminal)
-      return
-    }
-    if toolCallingStrategyKeys.contains(key) {
-      await setToolCallingStrategy(
-        parts: parts,
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-      return
-    }
-    if toolProxyKeys.contains(key) {
-      await setToolProxy(
-        parts: parts,
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-      return
-    }
-    if contextModeKeys.contains(key) {
-      await setContextMode(
-        parts: parts,
-        session: &session,
-        runtime: runtime,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-      return
-    }
-    if key == "yolo" {
-      await setYOLO(
-        parts: parts,
-        approvalHandler: approvalHandler,
-        configuration: &configuration,
-        configurationPath: configurationPath,
-        terminal: terminal)
-      return
-    }
-
-    let colorKeys = [
-      "ui.bgline", "ui.fgcolor", "ui.bgcolor", "ui.fgprompt", "ui.bgprompt",
-      "ui.fgtoolresult",
-    ]
-    let booleanKeys = ["ui.bold", "ui.markdown"]
-    let countKeys = ["ui.toolresultlines"]
-    let levelKeys = ["ui.subagents", "ui.thinking"]
-    let textKeys = ["ui.title", "ui.editor"]
-    guard
-      colorKeys.contains(key) || booleanKeys.contains(key) || countKeys.contains(key)
-        || levelKeys.contains(key) || textKeys.contains(key)
-    else {
-      await terminal.line(
-        "Unknown setting '\(parts[0])'. Available settings: effort, yolo, delegation, tool.calling, tool.proxy, limits.maxToolCalls, limits.maxModelTurns, limits.maxSubagents, limits.maxSubagentDepth, limits.maxTotalTokens, limits.maxSeconds, retry.attempts, retry.delay, ctx.compact, ctx.strategy, ui.title, ui.editor, ui.bgline, ui.fgcolor, ui.bgcolor, ui.fgprompt, ui.bgprompt, ui.fgtoolresult, ui.bold, ui.markdown, ui.toolResultLines, ui.subagents, use.agentsmd, use.plan"
-      )
-      return
-    }
-    var ui = configuration?.ui ?? .init()
-    guard parts.count > 1 else {
-      await terminal.line("\(displayedKey) = \(uiSetting(key, in: ui))")
-      return
-    }
-    guard parts.count == 2 || textKeys.contains(key) else {
-      await terminal.line("Usage: /set \(key) VALUE")
-      return
-    }
-    if textKeys.contains(key) {
-      let text = parts.dropFirst().joined(separator: " ")
-      // "none" empties the setting: the title goes away, and the editor falls
-      // back to $EDITOR again.
-      let value = ["none", "off"].contains(text.lowercased()) ? "" : text
-      if key == "ui.editor" {
-        ui.editor = value
-      } else {
-        ui.title = value
-      }
-    } else if countKeys.contains(key) {
-      let value: Int
-      if parts[1].lowercased() == "all" {
-        value = -1
-      } else if let count = Int(parts[1]), count >= 0 {
-        value = count
-      } else {
-        await terminal.line("Usage: /set ui.toolResultLines <all|N>")
-        return
-      }
-      ui.toolResultLines = value
-      await terminal.configureToolResultLines(value)
-    } else if key == "ui.thinking" {
-      guard let mode = ThinkingDisplay(rawValue: parts[1].lowercased()) else {
-        await terminal.line("Usage: /set ui.thinking <status|line|three|full>")
-        return
-      }
-      ui.thinking = mode
-      await terminal.configureThinking(mode)
-    } else if levelKeys.contains(key) {
-      guard let level = SubagentOutputLevel(rawValue: parts[1].lowercased()) else {
-        await terminal.line(
-          "Usage: /set ui.subagents <\(SubagentOutputLevel.allCases.map(\.rawValue).joined(separator: "|"))>"
-        )
-        return
-      }
-      ui.subagentOutput = level
-      await terminal.configureSubagentOutput(level)
-    } else if booleanKeys.contains(key) {
-      guard let enabled = booleanSetting(parts[1]) else {
-        await terminal.line("Usage: /set \(key) <on|off>")
-        return
-      }
-      if key == "ui.bold" {
-        ui.bold = enabled
-      } else {
-        ui.markdown = enabled
-        await terminal.configureMarkdown(
-          markdownRenderer(
-            enabled: enabled, forced: false, environment: ProcessInfo.processInfo.environment))
-      }
-    } else {
-      guard let color = TerminalLineEditor.normalizedColor(parts[1]) else {
-        await terminal.line(
-          "Unknown color '\(parts[1])'. Use a named ANSI color, rgb:RGB, or none.")
-        return
-      }
-      switch key {
-      case "ui.bgline": ui.backgroundLine = color
-      case "ui.fgcolor": ui.foreground = color
-      case "ui.bgcolor": ui.background = color
-      case "ui.fgprompt": ui.promptForeground = color
-      case "ui.bgprompt": ui.promptBackground = color
-      case "ui.fgtoolresult":
-        ui.toolResultForeground = color
-        await terminal.configureToolResultColor(color)
-      default: break
-      }
-    }
-    guard var draft = configuration, let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return
-    }
-    draft.ui = ui
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-      if key == "ui.title" { await terminal.configureTerminalTitle(ui.title) }
-      if key == "ui.editor" { configureEditor(ui.editor) }
-      await terminal.line("Set \(displayedKey) = \(uiSetting(key, in: ui)).")
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  /// Lowercased `/set` keys mapped to their canonical spelling.
-  private static let limitSettingKeys = [
-    "limits.maxtoolcalls": "limits.maxToolCalls",
-    "limits.maxmodelturns": "limits.maxModelTurns",
-    "limits.maxsubagents": "limits.maxSubagents",
-    "limits.maxsubagentdepth": "limits.maxSubagentDepth",
-    "limits.maxtotaltokens": "limits.maxTotalTokens",
-    "limits.maxtokens": "limits.maxTotalTokens",
-    "limits.maxseconds": "limits.maxSeconds",
-    "limits.maxtime": "limits.maxSeconds",
-  ]
-
-  /// Lowercased `/set` keys for retry and context-compaction policies.
-  private static let recoverySettingKeys = [
-    "retry.attempts": "retry.attempts",
-    "retry.count": "retry.attempts",
-    "retries": "retry.attempts",
-    "retry.delay": "retry.delay",
-    "retry.delayseconds": "retry.delay",
-    "ctx.compact": "ctx.compact",
-  ]
-
-  private static let delegationSettingKeys: Set<String> = [
-    "delegation", "tools.delegation", "tooldelegation", "subagents",
-  ]
-
-  private static let toolCallingStrategyKeys: Set<String> = [
-    "tool.calling", "tools.calling", "toolcalling", "toolcallingstrategy",
-  ]
-
-  private static let toolProxyKeys: Set<String> = [
-    "tool.proxy", "tools.proxy", "toolproxy", "usetoolproxy",
-  ]
-
-  private static let contextModeKeys: Set<String> = ["ctx.strategy"]
-
-  private static func listToolSettings(_ profile: SessionProfile, terminal: TerminalWriter) async {
-    await terminal.line("tool.calling = \(profile.toolCallingStrategy.rawValue)")
-    await terminal.line("tool.proxy = \(toolProxySetting(profile))")
-  }
-
-  /// `/set yolo [on|off]`: permits every tool call without asking. The choice
-  /// is saved with the approval rules, so it applies to later runs too.
-  private static func setYOLO(
-    parts: [String],
-    approvalHandler: TerminalApprovalHandler,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard parts.count > 1 else {
-      let enabled = await approvalHandler.isYOLOEnabled()
-      await terminal.line("yolo = \(enabled ? "on" : "off")")
-      return
-    }
-    guard parts.count == 2, let enabled = booleanSetting(parts[1]) else {
-      await terminal.line("Usage: /set yolo <on|off>")
-      return
-    }
-    await approvalHandler.setYOLOEnabled(enabled)
-    let effect =
-      enabled
-      ? "YOLO mode enabled; all tool calls are permitted"
-      : "YOLO mode disabled; configured approval rules restored"
-    guard var draft = configuration, let configurationPath else {
-      await terminal.line("\(effect) for this session; no writable configuration is active.")
-      return
-    }
-    draft.approvals.yolo = enabled
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-      await terminal.line("\(effect), and saved for later runs.")
-    } catch {
-      await terminal.line(
-        "\(effect) for this session; could not save the configuration: \(error.localizedDescription)",
-        to: .standardError)
-    }
-  }
-
-  /// `/set tool.proxy [on|off]`: shows or changes whether models see only the
-  /// shared list-tools and call-tool pair instead of the agent's tools.
-  private static func setToolProxy(
-    parts: [String],
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard parts.count > 1 else {
-      await terminal.line("tool.proxy = \(toolProxySetting(session.profile))")
-      return
-    }
-    // on (or hybrid) keeps the common tools native and proxies the rest;
-    // all hides every tool behind list-tools and call-tool.
-    let value: String
-    switch parts.count == 2 ? parts[1].lowercased() : "" {
-    case "all":
-      session.profile.useToolProxy = true
-      session.profile.proxyExposedTools = []
-      value = "all"
-    case "hybrid":
-      session.profile.useToolProxy = true
-      session.profile.proxyExposedTools = nil
-      value = "on"
-    case let word:
-      guard let enabled = booleanSetting(word) else {
-        await terminal.line("Usage: /set tool.proxy <on|all|off>")
-        return
-      }
-      session.profile.useToolProxy = enabled
-      if enabled { session.profile.proxyExposedTools = nil }
-      value = enabled ? "on" : "off"
-    }
-    session.touch()
-    guard configuration != nil, configurationPath != nil else {
-      await terminal.line("Set tool.proxy = \(value) for this chat.")
-      return
-    }
-    if await persistAgentProfile(
-      session: session,
-      configuration: &configuration,
-      configurationPath: configurationPath,
-      runtime: runtime,
-      terminal: terminal)
-    {
-      await terminal.line("Set tool.proxy = \(value) for agent '\(session.profile.agentID)'.")
-    }
-  }
-
-  /// `/set ctx.strategy <cache|size>`: cache never changes a sent message, size
-  /// replaces consumed file bodies with references before each model call.
-  private static func setContextMode(
-    parts: [String],
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard parts.count > 1 else {
-      await terminal.line("ctx.strategy = \(session.profile.context.rawValue)")
-      return
-    }
-    guard parts.count == 2, let mode = AgentContextMode(rawValue: parts[1].lowercased()) else {
-      await terminal.line("Usage: /set ctx.strategy <cache|size>")
-      return
-    }
-    session.profile.context = mode
-    session.touch()
-    guard configuration != nil, configurationPath != nil else {
-      await terminal.line("Set ctx.strategy = \(mode.rawValue) for this chat.")
-      return
-    }
-    if await persistAgentProfile(
-      session: session,
-      configuration: &configuration,
-      configurationPath: configurationPath,
-      runtime: runtime,
-      terminal: terminal)
-    {
-      await terminal.line(
-        "Set ctx.strategy = \(mode.rawValue) for agent '\(session.profile.agentID)'.")
-    }
-  }
-
-  private static func setToolCallingStrategy(
-    parts: [String],
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard parts.count > 1 else {
-      await terminal.line("tool.calling = \(session.profile.toolCallingStrategy.rawValue)")
-      return
-    }
-    let rawValue = parts[1].lowercased()
-    let strategy =
-      rawValue == "auto" ? ToolCallingStrategy.automatic : ToolCallingStrategy(rawValue: rawValue)
-    guard parts.count == 2, let strategy else {
-      await terminal.line(
-        "Usage: /set tool.calling <automatic|native|text|xml|json>")
-      return
-    }
-    session.profile.toolCallingStrategy = strategy
-    session.touch()
-    guard var draft = configuration, let configurationPath,
-      let index = draft.agents.firstIndex(where: { $0.id == session.profile.agentID })
-    else {
-      await terminal.line("Set tool.calling = \(strategy.rawValue) for this chat.")
-      return
-    }
-    draft.agents[index].toolCallingStrategy = strategy
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      try await runtime.register(agent: session.profile.agentDefinition, replacingExisting: true)
-      configuration = draft
-      await terminal.line(
-        "Set tool.calling = \(strategy.rawValue) for agent '\(session.profile.agentID)'.")
-    } catch {
-      await terminal.line(
-        "Set tool.calling = \(strategy.rawValue) for this chat; could not save the configuration: \(error.localizedDescription)",
-        to: .standardError)
-    }
-  }
-
-  private static let limitSettingOrder = [
-    "limits.maxToolCalls", "limits.maxModelTurns", "limits.maxSubagents",
-    "limits.maxSubagentDepth", "limits.maxTotalTokens", "limits.maxSeconds",
-  ]
-
-  private static func listLimitSettings(_ limits: AgentRunLimits, terminal: TerminalWriter) async {
-    for key in limitSettingOrder {
-      await terminal.line("\(key) = \(limitValue(key, in: limits))")
-    }
-  }
-
-  private static func limitValue(_ key: String, in limits: AgentRunLimits) -> String {
-    switch key {
-    case "limits.maxToolCalls": String(limits.maxToolCalls)
-    case "limits.maxSubagents": String(limits.maxSubagents)
-    case "limits.maxSubagentDepth": String(limits.maxSubagentDepth)
-    case "limits.maxTotalTokens": limits.maxTotalTokens.map(String.init) ?? "off"
-    case "limits.maxSeconds":
-      limits.maxSeconds.map { ModelUsageFormat.duration(Double($0)) } ?? "off"
-    default: String(limits.maxModelTurns)
-    }
-  }
-
-  private static func listRecoverySettings(_ profile: SessionProfile, terminal: TerminalWriter)
-    async
-  {
-    await terminal.line("retry.attempts = \(profile.retry.attempts)")
-    await terminal.line("retry.delay = \(durationSetting(profile.retry.delaySeconds))")
-    await terminal.line("ctx.compact = \(autocompactSetting(profile.autocompact))")
-    await terminal.line("ctx.strategy = \(profile.context.rawValue)")
-  }
-
-  private static func durationSetting(_ seconds: Double) -> String {
-    seconds == seconds.rounded() ? "\(Int(seconds))s" : "\(seconds)s"
-  }
-
-  /// `off`, `on` (the common tools native, the rest proxied) or `all`.
-  private static func toolProxySetting(_ profile: SessionProfile) -> String {
-    guard profile.useToolProxy else { return "off" }
-    return profile.proxyExposedTools?.isEmpty == true ? "all" : "on"
-  }
-
-  private static func autocompactSetting(_ autocompact: AgentAutocompact) -> String {
-    autocompact.isEnabled ? "\(autocompact.tokens) tokens" : "off"
-  }
-
-  /// `90`, `90s`, `10m`, `1h`, `1h30m`: a duration in seconds, or nil.
-  static func parseDurationSeconds(_ raw: String) -> Int? {
-    let text = raw.trimmingCharacters(in: .whitespaces).lowercased()
-    if let plain = Int(text) { return plain > 0 ? plain : nil }
-    var total = 0
-    var digits = ""
-    var units = 0
-    for character in text {
-      if character.isNumber {
-        digits.append(character)
-        continue
-      }
-      guard let value = Int(digits) else { return nil }
-      switch character {
-      case "h": total += value * 3600
-      case "m": total += value * 60
-      case "s": total += value
-      default: return nil
-      }
-      digits = ""
-      units += 1
-    }
-    guard units > 0, digits.isEmpty, total > 0 else { return nil }
-    return total
-  }
-
-  /// `120000`, `120k`, `1.5m`: a token count, or nil.
-  static func parseTokenCount(_ raw: String) -> Int? {
-    var text = raw.trimmingCharacters(in: .whitespaces).lowercased()
-    text.removeAll { $0 == "_" || $0 == "," }
-    if let plain = Int(text) { return plain >= 0 ? plain : nil }
-    let multiplier: Double
-    if text.hasSuffix("k") {
-      multiplier = 1_000
-    } else if text.hasSuffix("m") {
-      multiplier = 1_000_000
-    } else {
-      return nil
-    }
-    guard let value = Double(text.dropLast()), value >= 0 else { return nil }
-    return Int((value * multiplier).rounded())
-  }
-
-  /// Lets the current agent hand tool work to a child, or not. Turning
-  /// delegation on with no subagent budget would silently do nothing, so it
-  /// raises the budget too.
-  private static func setToolDelegation(
-    parts: [String],
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    guard parts.count > 1 else {
-      await terminal.line("delegation = \(session.profile.toolDelegation.rawValue)")
-      return
-    }
-    let raw = parts[1].lowercased()
-    let mode: AgentToolDelegation? =
-      switch raw {
-      case "off", "none", "self", "inline": .inline
-      case "on", "child", "subagent", "subagents": .subagent
-      default: nil
-      }
-    guard parts.count == 2, let mode else {
-      await terminal.line("Usage: /set delegation <off|subagent>")
-      return
-    }
-    session.profile.toolDelegation = mode
-    var raised = false
-    if mode == .subagent, session.profile.limits.maxSubagents < 1 {
-      session.profile.limits.maxSubagents = 1
-      raised = true
-    }
-    session.touch()
-    var notes = [
-      mode == .subagent
-        ? "This agent keeps its tools and can also hand work to a child that has them; only the child's answer lands here."
-        : "This agent runs every tool call itself."
-    ]
-    if raised { notes.append("Raised limits.maxSubagents to 1.") }
-    guard var draft = configuration, let configurationPath,
-      let index = draft.agents.firstIndex(where: { $0.id == session.profile.agentID })
-    else {
-      await terminal.line(
-        (["Set delegation = \(mode.rawValue) for this chat."] + notes).joined(separator: " "))
-      return
-    }
-    draft.agents[index].toolDelegation = mode
-    draft.agents[index].limits = session.profile.limits
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      try await runtime.register(agent: session.profile.agentDefinition, replacingExisting: true)
-      configuration = draft
-      await terminal.line(
-        (["Set delegation = \(mode.rawValue) for agent '\(session.profile.agentID)'."] + notes)
-          .joined(separator: " "))
-    } catch {
-      await terminal.line(
-        "Set delegation = \(mode.rawValue) for this chat; could not save the configuration: \(error.localizedDescription)",
-        to: .standardError)
-    }
-  }
-
-  /// Changes one run limit for the current chat and, when the chat uses a
-  /// configured agent, persists it into that agent's definition. The token
-  /// and time caps take `off`; time takes `10m` and `1h` as well as seconds.
-  private static func setLimit(
-    _ key: String,
-    parts: [String],
-    session: inout REPLSession,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    var limits = session.profile.limits
-    guard parts.count > 1 else {
-      await terminal.line("\(key) = \(limitValue(key, in: limits))")
-      return
-    }
-    let raw = parts.count == 2 ? parts[1].lowercased() : ""
-    let cleared = ["off", "none", "unlimited", "0"].contains(raw)
-    switch key {
-    case "limits.maxSeconds":
-      if cleared {
-        limits.maxSeconds = nil
-      } else if let seconds = parseDurationSeconds(raw) {
-        limits.maxSeconds = seconds
-      } else {
-        await terminal.line(
-          "Usage: /set limits.maxSeconds <off|N|Nm|Nh>  (wall-clock time per run)")
-        return
-      }
-    case "limits.maxTotalTokens":
-      if cleared {
-        limits.maxTotalTokens = nil
-      } else if let tokens = parseTokenCount(raw), tokens > 0 {
-        limits.maxTotalTokens = tokens
-      } else {
-        await terminal.line("Usage: /set limits.maxTotalTokens <off|N|Nk>  (tokens per run)")
-        return
-      }
-    default:
-      guard let value = Int(raw), value >= 0 else {
-        await terminal.line("Usage: /set \(key) N  (a non-negative integer)")
-        return
-      }
-      switch key {
-      case "limits.maxToolCalls": limits.maxToolCalls = value
-      case "limits.maxSubagents": limits.maxSubagents = value
-      case "limits.maxSubagentDepth": limits.maxSubagentDepth = value
-      default: limits.maxModelTurns = max(1, value)
-      }
-    }
-    session.profile.limits = limits
-    session.touch()
-    let applied = limitValue(key, in: limits)
-    guard var draft = configuration, let configurationPath,
-      let index = draft.agents.firstIndex(where: { $0.id == session.profile.agentID })
-    else {
-      await terminal.line("Set \(key) = \(applied) for this chat.")
-      return
-    }
-    draft.agents[index].limits = limits
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-      await terminal.line("Set \(key) = \(applied) for agent '\(session.profile.agentID)'.")
-    } catch {
-      await terminal.line(
-        "Set \(key) = \(applied) for this chat; could not save the configuration: \(error.localizedDescription)",
-        to: .standardError)
-    }
-  }
-
-  /// `retry.attempts`, `retry.delay`, and `ctx.compact`: what a run does when
-  /// a model call fails, and when it summarizes its own conversation. Saved
-  /// on the chat's agent like the limits.
-  private static func setRecoverySetting(
-    _ key: String,
-    parts: [String],
-    session: inout REPLSession,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    var retry = session.profile.retry
-    var autocompact = session.profile.autocompact
-    func current() -> String {
-      switch key {
-      case "retry.attempts": String(retry.attempts)
-      case "retry.delay": durationSetting(retry.delaySeconds)
-      default: autocompactSetting(autocompact)
-      }
-    }
-    guard parts.count > 1 else {
-      await terminal.line("\(key) = \(current())")
-      return
-    }
-    let raw = parts.count == 2 ? parts[1].lowercased() : ""
-    switch key {
-    case "retry.attempts":
-      guard let value = Int(raw), value >= 0 else {
-        await terminal.line("Usage: /set retry.attempts N  (0 fails on the first error)")
-        return
-      }
-      retry.attempts = value
-    case "retry.delay":
-      if let seconds = Double(raw), seconds >= 0 {
-        retry.delaySeconds = seconds
-      } else if let seconds = parseDurationSeconds(raw) {
-        retry.delaySeconds = Double(seconds)
-      } else {
-        await terminal.line("Usage: /set retry.delay SECONDS  (the wait before each retry)")
-        return
-      }
-    default:
-      if ["off", "none", "0"].contains(raw) {
-        autocompact.tokens = 0
-      } else if let tokens = parseTokenCount(raw), tokens > 0 {
-        autocompact.tokens = tokens
-      } else {
-        await terminal.line(
-          "Usage: /set ctx.compact <off|N|Nk>  (summarize the chat once it holds about N tokens)")
-        return
-      }
-    }
-    session.profile.retry = retry
-    session.profile.autocompact = autocompact
-    session.touch()
-    var notes: [String] = []
-    if key == "ctx.compact", autocompact.isEnabled {
-      notes.append(
-        "Older exchanges are summarized before a model turn once the conversation is estimated at \(autocompact.tokens) tokens; the newest exchange is kept verbatim."
-      )
-    }
-    let applied = current()
-    guard var draft = configuration, let configurationPath,
-      let index = draft.agents.firstIndex(where: { $0.id == session.profile.agentID })
-    else {
-      await terminal.line(
-        (["Set \(key) = \(applied) for this chat."] + notes).joined(separator: " "))
-      return
-    }
-    draft.agents[index].retry = retry
-    draft.agents[index].autocompact = autocompact
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-      await terminal.line(
-        (["Set \(key) = \(applied) for agent '\(session.profile.agentID)'."] + notes)
-          .joined(separator: " "))
-    } catch {
-      await terminal.line(
-        "Set \(key) = \(applied) for this chat; could not save the configuration: \(error.localizedDescription)",
-        to: .standardError)
-    }
-  }
-
-  private static func listUseSettings(_ use: ConfiguredUse, terminal: TerminalWriter) async {
-    await terminal.line("use.agentsmd = \(use.agentsmd ? "on" : "off")")
-    await terminal.line("use.plan = \(use.plan ? "on" : "off")")
-  }
-
-  /// `/set use.plan [on|off]`: shows or changes whether an agent that can
-  /// start children is asked to open a multi-step request with a plan before
-  /// its first `agent_start`.
-  private static func setPlanning(
-    parts: [String],
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    let enabled = configuration?.use.plan ?? true
-    guard parts.count > 1 else {
-      await terminal.line("use.plan = \(enabled ? "on" : "off")")
-      return
-    }
-    guard parts.count == 2, let wanted = booleanSetting(parts[1]) else {
-      await terminal.line("Usage: /set use.plan <on|off>")
-      return
-    }
-    guard var draft = configuration, let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return
-    }
-    draft.use.plan = wanted
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      return
-    }
-    await runtime.configurePlanning(wanted)
-    await terminal.line(
-      "Set use.plan = \(wanted ? "on" : "off"). "
-        + (wanted
-          ? "An agent with children opens a request of several steps with a numbered plan."
-          : "Agents delegate without planning first."))
-  }
-
-  /// `/set use.agentsmd [on|off]`: shows or changes whether the working
-  /// tree's AGENTS.md files go into every run's system prompt, and says which
-  /// files that means from here.
-  private static func setAgentsMarkdown(
-    parts: [String],
-    runtime: AgentRuntime,
-    configuration: inout MaiConfiguration?,
-    configurationPath: String?,
-    terminal: TerminalWriter
-  ) async {
-    let directory = URL(
-      fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-    let located = AgentInstructionsFile.locate(from: directory)
-    let enabled = configuration?.use.agentsmd ?? false
-    guard parts.count > 1 else {
-      await terminal.line(
-        "use.agentsmd = \(enabled ? "on" : "off") Â· \(agentsMarkdownSummary(located, directory: directory))"
-      )
-      return
-    }
-    guard parts.count == 2, let wanted = booleanSetting(parts[1]) else {
-      await terminal.line("Usage: /set use.agentsmd <on|off>")
-      return
-    }
-    guard var draft = configuration, let configurationPath else {
-      await terminal.line("error: No writable configuration is active.", to: .standardError)
-      return
-    }
-    draft.use.agentsmd = wanted
-    do {
-      try draft.save(to: URL(fileURLWithPath: configurationPath))
-      configuration = draft
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      return
-    }
-    await runtime.configureProjectInstructions(
-      wanted ? AgentInstructionsFile.promptSection(files: located) : nil)
-    await terminal.line(
-      "Set use.agentsmd = \(wanted ? "on" : "off"). \(agentsMarkdownSummary(located, directory: directory))"
-    )
-  }
-
-  /// Which AGENTS.md files apply from `directory`, as one line, each path
-  /// relative to it: `AGENTS.md`, `../AGENTS.md`, and so on up the tree.
-  private static func agentsMarkdownSummary(_ files: [URL], directory: URL) -> String {
-    guard !files.isEmpty else {
-      return "No AGENTS.md from \(directory.path) up to the repository root."
-    }
-    let base = directory.standardizedFileURL.pathComponents
-    let names = files.map { file -> String in
-      let target = file.standardizedFileURL.pathComponents
-      let shared = zip(base, target).prefix { $0 == $1 }.count
-      let ups = Array(repeating: "..", count: base.count - shared)
-      return (ups + target.dropFirst(shared)).joined(separator: "/")
-    }
-    return "AGENTS.md from here up to the repository root: \(names.joined(separator: ", "))."
-  }
-
-  /// The AGENTS.md block for the working directory, when `use.agentsmd` is on.
-  private static func projectInstructionsSection(_ configuration: MaiConfiguration?) -> String? {
-    guard configuration?.use.agentsmd == true else { return nil }
-    return AgentInstructionsFile.promptSection(
-      from: URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true))
-  }
-
-  private static func listUISettings(_ ui: ConfiguredTerminalUI, terminal: TerminalWriter) async {
-    for key in [
-      "ui.title", "ui.editor", "ui.bgline", "ui.fgcolor", "ui.bgcolor", "ui.fgprompt",
-      "ui.bgprompt", "ui.bold",
-      "ui.fgtoolresult", "ui.markdown", "ui.toolResultLines", "ui.subagents", "ui.thinking",
-    ] {
-      await terminal.line("\(key) = \(uiSetting(key, in: ui))")
-    }
-  }
-
-  private static func uiSetting(_ key: String, in ui: ConfiguredTerminalUI) -> String {
-    let value: String
-    switch key.lowercased() {
-    case "ui.title": value = visibleUITitle(ui.title)
-    // Unset is worth showing as what it resolves to, since that is the editor
-    // that actually opens.
-    case "ui.editor":
-      return ui.editor.isEmpty ? "\(resolvedEditor()) (from the environment)" : ui.editor
-    case "ui.bgline": value = ui.backgroundLine
-    case "ui.fgcolor": value = ui.foreground
-    case "ui.bgcolor": value = ui.background
-    case "ui.fgprompt": value = ui.promptForeground
-    case "ui.bgprompt": value = ui.promptBackground
-    case "ui.fgtoolresult": value = ui.toolResultForeground
-    case "ui.bold": return ui.bold ? "on" : "off"
-    case "ui.markdown": return ui.markdown ? "on" : "off"
-    case "ui.toolresultlines": return ui.toolResultLines < 0 ? "all" : String(ui.toolResultLines)
-    case "ui.thinking": return ui.thinking.rawValue
-    case "ui.subagents": return ui.subagentOutput.rawValue
-    default: return "-"
-    }
-    return value.isEmpty ? "none" : value
-  }
-
-  private static func booleanSetting(_ value: String) -> Bool? {
-    switch value.lowercased() {
-    case "1", "true", "yes", "on": true
-    case "0", "false", "no", "off": false
-    default: nil
-    }
-  }
-
-  /// `/export FORMAT [PATH]` writes this chat as a document, or writes a
-  /// portable archive containing the active configuration, visible skills,
-  /// and current chat. MaiCore owns the archive format used by both hosts.
-  private static func handleExportCommand(
-    _ argument: String,
-    session: REPLSession,
-    runtime: AgentRuntime,
-    process: AgentPID?,
-    configuration: MaiConfiguration?,
-    skills: AgentSkillCatalog,
-    terminal: TerminalWriter
-  ) async {
-    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    guard let first = fields.first else {
-      await terminal.line(exportHelp)
-      return
-    }
-    var chat = session.chat
-    // The agents of this chat's runs as they stand: what the process table
-    // holds now, live or finished, over what was saved with the chat.
-    if chat.hasConversation, let process {
-      chat.subagents = AgentProcessRecord.merging(
-        saved: chat.subagents, current: await runtime.supervisor.records(under: process))
-    }
-    if ["archive", "pack", "portable"].contains(first.lowercased()) {
-      do {
-        let archive = MaiArchive(
-          generator: "pmai",
-          settings: configuration.map { MaiArchiveSettings(configuration: $0) },
-          chats: chat.hasConversation ? [chat] : nil,
-          skills: try skills.skills.map { try MaiArchiveSkill(skill: $0) })
-        let filename =
-          chat.hasConversation
-          ? archiveFilename(for: chat) : "Mai-Archive.\(MaiArchive.fileExtension)"
-        let target = exportTarget(
-          fields.count > 1 ? fields[1] : nil, defaultFilename: filename)
-        let data = try archive.encoded()
-        try data.write(to: target, options: .atomic)
-        await terminal.line(
-          "Exported Mai archive (\(AgentProcessInfo.compactCount(data.count)) bytes) to \(target.path)"
-        )
-      } catch {
-        await terminal.line(
-          "error: Could not export: \(error.localizedDescription)", to: .standardError)
-      }
-      return
-    }
-    guard let format = ChatExportFormat(argument: first) else {
-      await terminal.line(exportHelp)
-      return
-    }
-    guard chat.hasConversation else {
-      await terminal.line("Nothing to export yet: this chat has no messages.")
-      return
-    }
-    var debug: ChatExportDebug?
-    if format == .debug {
-      let profile = session.profile
-      let tools = await runtime.availableTools().filter { profile.toolNames.contains($0.name) }
-      let provider = await runtime.availableProviders().first { $0.id == profile.provider }
-      debug = ChatExportDebug(
-        provider: profile.provider.rawValue,
-        providerDisplayName: provider?.displayName,
-        toolDefinitions: tools,
-        settings: [
-          "workingDirectory": FileManager.default.currentDirectoryPath,
-          "toolCallingStrategy": profile.toolCallingStrategy.rawValue,
-          "toolDelegation": profile.toolDelegation.rawValue,
-          "useToolProxy": profile.useToolProxy ? "true" : "false",
-          "proxyExposedTools": profile.proxyExposedTools.map { $0.sorted().joined(separator: ", ") }
-            ?? "default",
-          "subagentNames": profile.subagentNames.sorted().joined(separator: ", "),
-          "limits.maxToolCalls": String(profile.limits.maxToolCalls),
-          "limits.maxModelTurns": String(profile.limits.maxModelTurns),
-          "limits.maxSubagents": String(profile.limits.maxSubagents),
-          "limits.maxSubagentDepth": String(profile.limits.maxSubagentDepth),
-          "limits.maxTotalTokens": limitValue("limits.maxTotalTokens", in: profile.limits),
-          "limits.maxSeconds": limitValue("limits.maxSeconds", in: profile.limits),
-          "retry.attempts": String(profile.retry.attempts),
-          "retry.delay": durationSetting(profile.retry.delaySeconds),
-          "ctx.compact": autocompactSetting(profile.autocompact),
-          "ctx.strategy": profile.context.rawValue,
-        ],
-        subagents: chat.subagents)
-    }
-    let target = exportTarget(
-      fields.count > 1 ? fields[1] : nil,
-      defaultFilename: ChatExport.filename(for: chat, format: format))
-    do {
-      let data = try ChatExport.data(for: chat, format: format, generator: "pmai", debug: debug)
-      try data.write(to: target, options: .atomic)
-      await terminal.line(
-        "Exported \(format.displayName) (\(AgentProcessInfo.compactCount(data.count)) bytes) to \(target.path)"
-      )
-    } catch {
-      await terminal.line(
-        "error: Could not export: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  private static func exportTarget(_ path: String?, defaultFilename: String) -> URL {
-    let current = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-    guard let path else { return current.appendingPathComponent(defaultFilename) }
-    let raw = path.trimmingCharacters(in: .whitespacesAndNewlines)
-    let expanded = NSString(string: raw).expandingTildeInPath
-    var target = URL(fileURLWithPath: expanded, relativeTo: current).standardizedFileURL
-    var isDirectory: ObjCBool = false
-    let exists = FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory)
-    if raw.hasSuffix("/") || (exists && isDirectory.boolValue) {
-      try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
-      target.appendPathComponent(defaultFilename)
-    }
-    return target
-  }
-
-  private static func archiveFilename(for chat: AgentChat) -> String {
-    let json = ChatExport.filename(for: chat, format: .json)
-    return String(json.dropLast(".json".count)) + "." + MaiArchive.fileExtension
-  }
-
-  /// Imports a Mai archive (standalone or embedded in a PocketMai backup).
-  /// Older pmai JSON chat exports remain valid inputs as a convenience.
-  private static func handleImportCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    workspace: inout AgentChatWorkspace,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    catalogs: inout [MCPServerCatalog],
-    visual: VisualBridge,
-    selectImportedChat: Bool,
-    terminal: TerminalWriter
-  ) async {
-    guard !argument.isEmpty else {
-      await terminal.line(importHelp)
-      return
-    }
-    let expanded = NSString(string: argument).expandingTildeInPath
-    let current = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-    let url = URL(fileURLWithPath: expanded, relativeTo: current).standardizedFileURL
-    do {
-      let archive = try importArchive(from: Data(contentsOf: url))
-      let summary = try await applyImportedArchive(
-        archive,
-        session: &session,
-        workspace: &workspace,
-        runtime: runtime,
-        plugins: plugins,
-        configuration: &configuration,
-        catalogs: &catalogs,
-        visual: visual,
-        selectImportedChat: selectImportedChat,
-        terminal: terminal)
-      await terminal.line("Imported \(summary.joined(separator: ", ")) from \(url.path).")
-      if !selectImportedChat, archive.chats?.isEmpty == false {
-        await terminal.line("The current turn kept its chat; /chat list shows the imported chats.")
-      }
-    } catch {
-      await terminal.line(
-        "error: Could not import: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  private static func importArchive(from data: Data) throws -> MaiArchive {
-    do {
-      return try MaiArchive.decode(from: data)
-    } catch let archiveError {
-      let decoder = MaiJSONCoding.default.makeDecoder()
-      guard let envelope = try? decoder.decode(ChatExportEnvelope.self, from: data),
-        envelope.format == ChatExportEnvelope.format,
-        envelope.version == 1
-      else { throw archiveError }
-      return MaiArchive(
-        generator: envelope.generator, exportedAt: envelope.exportedAt, chats: [envelope.chat])
-    }
-  }
-
-  private static func applyImportedArchive(
-    _ archive: MaiArchive,
-    session: inout REPLSession,
-    workspace: inout AgentChatWorkspace,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    configuration: inout MaiConfiguration?,
-    catalogs: inout [MCPServerCatalog],
-    visual: VisualBridge,
-    selectImportedChat: Bool,
-    terminal: TerminalWriter
-  ) async throws -> [String] {
-    var summary: [String] = []
-    var importedConfiguration = configuration
-    if let settings = archive.settings {
-      guard let path = visual.configurationPath else {
-        throw ArchiveImportError.configurationUnavailable
-      }
-      var draft = configuration ?? MaiConfiguration()
-      let merged = try draft.mergeArchiveSettings(settings)
-      try draft.save(to: URL(fileURLWithPath: path))
-      importedConfiguration = draft
-      configuration = draft
-      summary.append(contentsOf: archiveSettingsSummary(merged))
-    }
-
-    if let skills = archive.skills {
-      for skill in skills { try skill.install(in: visual.skills.userDirectory) }
-      _ = await synchronizeSkillTools(runtime: runtime, state: visual.skills)
-      summary.append("\(skills.count) skill\(skills.count == 1 ? "" : "s")")
-    }
-
-    if let settings = archive.settings, let draft = importedConfiguration {
-      await reloadImportedSettings(
-        settings,
-        configuration: draft,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        catalogs: &catalogs,
-        providerBaseURLs: visual.providerBaseURLs,
-        terminal: terminal)
-    }
-
-    if let chats = archive.chats {
-      var existingIDs = Set(workspace.chats.map(\.id))
-      var firstImported: AgentChat?
-      for var chat in chats {
-        if existingIDs.contains(chat.id) {
-          chat.id = UUID()
-          chat.sessionID = ChatSession.newID()
-        }
-        while !existingIDs.insert(chat.id).inserted { chat.id = UUID() }
-        workspace.upsert(chat)
-        if firstImported == nil { firstImported = chat }
-      }
-      if selectImportedChat, let firstImported {
-        workspace.selectChat(id: firstImported.id)
-        session = REPLSession(chat: firstImported)
-      }
-      summary.append("\(chats.count) chat\(chats.count == 1 ? "" : "s")")
-    }
-    return summary.isEmpty ? ["nothing"] : summary
-  }
-
-  private static func archiveSettingsSummary(_ summary: MaiArchiveMergeSummary) -> [String] {
-    [
-      (summary.providers, "provider"),
-      (summary.prompts, "prompt"),
-      (summary.mcpServers, "MCP server"),
-      (summary.agents, "agent"),
-    ].compactMap { item in
-      let (count, name) = item
-      return count == 0 ? nil : "\(count) \(name)\(count == 1 ? "" : "s")"
-    }
-  }
-
-  private static func reloadImportedSettings(
-    _ imported: MaiArchiveSettings,
-    configuration: MaiConfiguration,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    plugins: PluginRegistry,
-    catalogs: inout [MCPServerCatalog],
-    providerBaseURLs: ProviderBaseURLStore,
-    terminal: TerminalWriter
-  ) async {
-    let environment = ProcessInfo.processInfo.environment
-    for requested in imported.providers ?? [] {
-      guard let provider = configuration.providers.first(where: { $0.id == requested.id }) else {
-        continue
-      }
-      do {
-        try await runtime.register(
-          plugins.makeProvider(from: provider, environment: environment), replacingExisting: true)
-        if let url = provider.baseURL { providerBaseURLs.set(url, for: provider.id) }
-      } catch {
-        await terminal.line(
-          "warning: Provider '\(provider.id)' was saved but could not be loaded: \(error.localizedDescription)",
-          to: .standardError)
-      }
-    }
-
-    for requested in imported.mcpServers ?? [] {
-      guard let server = configuration.mcpServers.first(where: { $0.id == requested.id }) else {
-        continue
-      }
-      _ = await runtime.unregisterMCP(serverID: server.id)
-      catalogs.removeAll { $0.serverID == server.id }
-      guard server.enabled else { continue }
-      do {
-        let source = try await plugins.makeMCPToolSource(
-          kind: server.kind, configuration: server, environment: environment)
-        catalogs.append(try await runtime.register(mcp: source))
-      } catch {
-        await terminal.line(
-          "warning: MCP server '\(server.id)' was saved but could not connect: \(error.localizedDescription)",
-          to: .standardError)
-      }
-    }
-
-    await runtime.configureDelegation(
-      prompt: configuration.prompts?.delegation,
-      workerInstructions: configuration.prompts?.worker)
-    await runtime.configureCompaction(prompt: configuration.prompts?.compact)
-    let knownTools = Set(await runtime.availableTools().map(\.name))
-    for requested in imported.agents ?? [] {
-      guard var agent = configuration.agents.first(where: { $0.id == requested.id }) else {
-        continue
-      }
-      agent.toolNames.formIntersection(knownTools)
-      do {
-        try await runtime.register(agent: agent, replacingExisting: true)
-      } catch {
-        await terminal.line(
-          "warning: Agent '\(agent.id)' was saved but could not be loaded: \(error.localizedDescription)",
-          to: .standardError)
-      }
-    }
-    if let agent = configuration.agents.first(where: { $0.id == session.profile.agentID }) {
-      try? applyDefinition(agent, to: &session)
-    }
-  }
-
-  private enum ArchiveImportError: LocalizedError {
-    case configurationUnavailable
-
-    var errorDescription: String? {
-      "No writable configuration is active; chats and skills were not imported."
-    }
-  }
-
-  /// `/stats`: the usage ledger the runtime fills after every model call,
-  /// printed as one colored bar per provider:model for the combined ranking,
-  /// speed, time in use, and efficiency. `/stats METRIC` shows one ranking; `/stats show TARGET`
-  /// every fact recorded about a model or a provider.
-  private static func handleStatsCommand(
-    _ argument: String,
-    store: ModelUsageStore,
-    terminal: TerminalWriter
-  ) async {
-    let fields = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    let action = fields.first?.lowercased() ?? ""
-    let target = fields.count > 1 ? fields[1].trimmingCharacters(in: .whitespaces) : ""
-    func printReport(_ metrics: [ModelUsageReport.Metric]) async {
-      let report = ModelUsageReport(await store.ledger)
-      let colors = await terminal.paintsOutput
-      // Headings in the cyan of `âœ“ took`, label and bar in the provider's
-      // palette color, the number bold, the rest dim.
-      let lines = report.lines(width: TerminalLineEditor.terminalColumns(), metrics: metrics) {
-        text, style in
-        guard colors else { return text }
-        let code: String
-        switch style {
-        case .heading: code = "1;36"
-        case .headline: code = "36"
-        case .label(let color), .bar(let color):
-          guard let colorCode = TerminalLineEditor.foregroundColorCode(color.hex) else {
-            return text
-          }
-          code = colorCode
-        case .value: code = "1"
-        case .detail, .note: code = "2"
-        }
-        return "\u{1B}[\(code)m\(text)\u{1B}[0m"
-      }
-      await terminal.line(lines.joined(separator: "\n"))
-      if let error = await store.lastPersistenceError {
-        await terminal.line(
-          "warning: statistics could not be saved: \(error)", to: .standardError)
-      }
-    }
-    if let metric = ModelUsageReport.Metric.named(action) {
-      await printReport([metric])
-      return
-    }
-    switch action {
-    case "", "list":
-      await printReport(ModelUsageReport.Metric.displayCases)
-    case "show":
-      guard !target.isEmpty else {
-        await printReport(ModelUsageReport.Metric.displayCases)
-        return
-      }
-      let rows = await store.ledger.totals(matching: target)
-      guard !rows.isEmpty else {
-        await terminal.line(noStatisticsMessage(for: target))
-        return
-      }
-      await terminal.line(
-        rows.map { row in
-          ([row.title] + row.detailLines.map { "  " + $0 }).joined(separator: "\n")
-        }.joined(separator: "\n"))
-    case "reset", "clear":
-      await store.reset()
-      await terminal.line("Usage statistics reset.")
-    case "rm", "remove", "delete", "forget":
-      guard !target.isEmpty else {
-        await terminal.line("Usage: /stats rm PROVIDER[:MODEL]")
-        return
-      }
-      switch await store.remove(matching: target) {
-      case 0: await terminal.line(noStatisticsMessage(for: target))
-      case 1: await terminal.line("Removed the statistics of '\(target)'.")
-      case let count:
-        await terminal.line(
-          "Removed the statistics of \(count) models of provider '\(target)'.")
-      }
-    case "path":
-      await terminal.line(
-        await store.location?.path ?? "Statistics are kept in memory for this session only.")
-    case "help":
-      await terminal.line(statsHelp)
-    default:
-      await terminal.line("Unknown /stats action '\(action)'.\n" + statsHelp)
-    }
-  }
-
-  private static func noStatisticsMessage(for target: String) -> String {
-    "No statistics for '\(target)'. /stats lists the provider:model pairs."
-  }
-
-  private static let statsHelp = """
-    Statistics commands:
-      /stats                 Rank every provider:model by combined ranking, tokens/s, time in use, and efficiency
-      /stats METRIC          One ranking: ranking, speed, time, or efficiency
-      /stats show PROVIDER[:MODEL]  Every fact recorded about one model or a whole provider
-      /stats rm PROVIDER[:MODEL]  Drop the statistics of one model or a whole provider
-      /stats reset           Forget every statistic
-      /stats path            Print the file the statistics are saved in
-    The runtime records tokens (from the provider's usage, or estimated from text
-    length and marked ~) and the wall-clock time of every model call, in the REPL,
-    one-shot runs, and the visual workspace alike. Speed is visible output tokens
-    over the streaming window; time in use adds the wait for the first token;
-    efficiency is total tokens / (seconds in use Ã— requests).
-    """
-
-  private static let exportHelp = """
-    Export this chat as a document, or make a portable Mai archive:
-
-      /export archive [PATH]    Providers, prompts, MCPs, agents, visible skills,
-                                and this chat (.pocketmai.json)
-      /export markdown [PATH]   A Markdown transcript (.md)
-      /export json [PATH]       The chat as stored, in a JSON envelope (.json)
-      /export debug [PATH]      The JSON plus the tools, settings, and every child agent's
-                                transcript from this chat's runs
-      /export html [PATH]       A self-contained HTML document
-      /export epub [PATH]       An EPUB book, one chapter per message
-      /export docx [PATH]       A Word document
-
-    PATH may be a file or a folder; without it the file is named after the
-    chat title and written to the current directory.
-
-    Archives can contain credentials already stored literally in the
-    configuration. Environment-variable and key-file references stay as references.
-    """
-
-  private static let importHelp = """
-    Import a portable Mai archive into this project:
-
-      /import PATH              Merge providers, prompts, MCPs, and agents; install
-                                skills for the current user; add chats to this project
-
-    Standalone .pocketmai.json archives and archives embedded by PocketMai are
-    accepted. Existing settings are replaced only when their stable IDs or prompt
-    names match; existing chats are never overwritten. Older pmai JSON chat exports
-    are accepted too.
-    """
-
-  private static let replyHelp = """
-    Answer the last assistant reply with it quoted above the answer:
-
-      /reply                 Quote the last reply and open $EDITOR on it
-      /reply WIDTH           Wrap the quote at WIDTH columns instead of the screen width
-
-    Every quoted line is wrapped and prefixed with "> ", with a blank line left
-    under it for the answer. Saving and leaving the editor sends the whole text
-    as an ordinary message; leaving the quote untouched sends nothing.
-    """
-
-  private static let copyHelp = """
-    Copy conversation text to the clipboard, or into a file:
-
-      /copy                  The last assistant reply, without its reasoning
-      /copy N                The last N messages, oldest first, labelled by role
-      /copy PATH             The last reply, written to the file PATH
-      /copy N PATH           The last N messages, written to the file PATH
-
-    Tool calls, tool results, images, and other attachments are summarized on
-    their own lines; system instructions are never copied. PATH may start with
-    ~ and is resolved from the current directory; an existing file is replaced,
-    and a folder is refused.
-    """
-
-  /// `/reply` answers the last assistant message the way the reply action in
-  /// the iOS app does: its text is quoted at the terminal width, `$EDITOR` opens on
-  /// the quote with room underneath, and what the editor leaves is sent as if
-  /// it had been typed at the prompt. An optional argument overrides the width.
-  private static func composeReply(
-    _ argument: String,
-    session: REPLSession,
-    terminal: TerminalWriter
-  ) async -> String? {
-    let trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
-    // Leave the terminal's final column unused to avoid an automatic wrap.
-    // MarkdownQuote reserves two more columns for the `> ` marker, leaving
-    // the quoted text itself the requested screen-width-minus-three columns.
-    var width = max(3, TerminalLineEditor.terminalColumns() - 1)
-    if !trimmed.isEmpty {
-      guard let columns = Int(trimmed), columns > 2 else {
-        await terminal.line(
-          "Usage: /reply [WIDTH]   (the quote wraps to the screen width by default)"
-        )
-        return nil
-      }
-      width = columns
-    }
-    let reply: String
-    do {
-      reply = try TranscriptCopy.text(
-        for: .lastAssistantReply, in: session.history.messages
-      ).text
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      return nil
-    }
-    let quoted = MarkdownQuote.quote(reply, lineWidth: width)
-    return await composeMessage(
-      from: quoted + "\n\n",
-      suffix: "reply.md",
-      unchanged: "Reply cancelled: nothing was written under the quote.",
-      terminal: terminal)
-  }
-
-  /// `/edit input` writes the next message in the editor instead of at the
-  /// prompt, which is the room `/reply` gives without a quote to answer.
-  private static func composeInput(terminal: TerminalWriter) async -> String? {
-    await composeMessage(
-      from: "",
-      suffix: "input.md",
-      unchanged: "Nothing to send: the editor left the file empty.",
-      terminal: terminal)
-  }
-
-  /// Opens the editor on a draft message and returns what it left, for the
-  /// caller to send as if it had been typed at the prompt. A file that comes
-  /// back empty, or exactly as it went in, sends nothing.
-  private static func composeMessage(
-    from draft: String,
-    suffix: String,
-    unchanged note: String,
-    terminal: TerminalWriter
-  ) async -> String? {
-    guard let edited = await editTemporaryText(draft, suffix: suffix, terminal: terminal)
-    else { return nil }
-    let message = edited.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !message.isEmpty, message != draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    else {
-      await terminal.line(note)
-      return nil
-    }
-    return message
-  }
-
-  /// `/copy [N] [PATH]`: the last reply or the last N messages, on the system
-  /// clipboard or, when PATH is given, in that file.
-  private static func copyToClipboard(
-    _ argument: String,
-    session: REPLSession,
-    terminal: TerminalWriter
-  ) async {
-    if argument.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "help" {
-      await terminal.line(copyHelp)
-      return
-    }
-    do {
-      let command = try TranscriptCopy.command(parsing: argument)
-      let result = try TranscriptCopy.text(for: command.selection, in: session.history.messages)
-      let count = result.messages.count
-      let subject =
-        command.selection == .lastAssistantReply
-        ? "the last reply" : "\(count) message\(count == 1 ? "" : "s")"
-      let destination: String
-      if let path = command.path {
-        destination = try writeCopiedText(result.text, to: path).path
-      } else {
-        try SystemClipboard.write(result.text)
-        destination = "the clipboard"
-      }
-      await terminal.line(
-        "Copied \(subject) (\(result.text.count) characters) to \(destination).")
-    } catch let error as TranscriptCopyError {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      if case .invalidCount = error { await terminal.line("Usage: /copy [N] [PATH] (/help copy)") }
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  /// Writes `/copy` output to a file: `~` expands, a relative path resolves
-  /// against the working directory, an existing file is replaced, and a folder
-  /// is refused rather than inventing a name inside it. Text files end with a
-  /// newline even though clipboard text does not.
-  private static func writeCopiedText(_ text: String, to path: String) throws -> URL {
-    let current = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-    let expanded = NSString(string: path).expandingTildeInPath
-    let target = URL(fileURLWithPath: expanded, relativeTo: current).standardizedFileURL
-    var isDirectory: ObjCBool = false
-    let exists = FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory)
-    if path.hasSuffix("/") || (exists && isDirectory.boolValue) {
-      throw CLIError.isDirectory(target.path)
-    }
-    let parent = target.deletingLastPathComponent()
-    guard FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDirectory),
-      isDirectory.boolValue
-    else { throw CLIError.missingFolder(parent.path) }
-    let contents = text.hasSuffix("\n") ? text : text + "\n"
-    try contents.write(to: target, atomically: true, encoding: .utf8)
-    return target
-  }
-
-  /// `/attach PATH` converts a document to text the model can read and queues it
-  /// for the next message; `/attach clear` drops everything queued so far.
-  private static func attachDocument(
-    _ argument: String,
-    session: inout REPLSession,
-    ocrProvider: any OCRProvider,
-    editor: TerminalLineEditor?,
-    terminal: TerminalWriter
-  ) async {
-    var trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else {
-      await terminal.line("Usage: /attach [source|markdown|copy] PATH | /attach clear")
-      await terminal.line(
-        "Word, EPUB and PDF files become Markdown, JSON becomes an outline, arbitrary text/source files attach as they are, and images attach at medium size. HTML asks whether to attach its source, convert it to Markdown, or copy it into the working directory."
-      )
-      return
-    }
-    if trimmed.lowercased() == "clear" {
-      let count = session.pendingContent.count
-      session.pendingContent.removeAll()
-      await terminal.line(
-        count == 0
-          ? "No pending attachments."
-          : "Dropped \(count) pending attachment\(count == 1 ? "" : "s").")
-      return
-    }
-    var htmlChoice: String?
-    if trimmed.first != "\"" && trimmed.first != "'" {
-      let fields = trimmed.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
-        String.init)
-      if fields.count == 2,
-        ["source", "markdown", "copy"].contains(fields[0].lowercased())
-      {
-        htmlChoice = fields[0].lowercased()
-        trimmed = fields[1]
-      }
-    }
-    if trimmed.count >= 2, let first = trimmed.first, first == "\"" || first == "'",
-      trimmed.last == first
-    {
-      trimmed = String(trimmed.dropFirst().dropLast())
-    }
-    let path = NSString(string: trimmed).expandingTildeInPath
-    let url = URL(fileURLWithPath: path)
-    do {
-      let data = try DocumentAttachmentImporter.data(at: url)
-      let kind = DocumentAttachmentImporter.kind(for: data, filename: url.lastPathComponent)
-      if kind == .image {
-        session.pendingContent.append(
-          try await imageContent(path: path, mode: .medium, ocrProvider: ocrProvider))
-        await terminal.line(
-          "Image queued at medium size: \(url.lastPathComponent). Use /image for other sizes or OCR."
-        )
-        return
-      }
-      if htmlChoice != nil, kind != .html {
-        await terminal.line(
-          "error: source, markdown, and copy choices apply only to HTML files.",
-          to: .standardError)
-        return
-      }
-      if kind == .html, htmlChoice == nil {
-        guard isatty(STDIN_FILENO) != 0, let editor else {
-          await terminal.line(
-            "HTML needs a choice: /attach source \(trimmed), /attach markdown \(trimmed), or /attach copy \(trimmed).",
-            to: .standardError)
-          return
-        }
-        await terminal.line("Import \(url.lastPathComponent) as HTML source, Markdown, or a working-directory file?")
-        let answer = editor.readLine(
-          prompt: "html [source/markdown/copy/cancel]> ",
-          completions: ["source", "markdown", "copy", "cancel"],
-          rememberInput: false)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !editor.wasInterrupted, let answer, !["cancel", "c", ""].contains(answer) else {
-          await terminal.line("HTML import cancelled.")
-          return
-        }
-        switch answer {
-        case "source", "s", "1": htmlChoice = "source"
-        case "markdown", "md", "m", "2": htmlChoice = "markdown"
-        case "copy", "file", "3": htmlChoice = "copy"
-        default:
-          await terminal.line("HTML import cancelled: unknown choice '\(answer)'.")
-          return
-        }
-      }
-      if htmlChoice == "copy" {
-        let destination = try DocumentAttachmentImporter.copy(
-          data: data,
-          filename: url.lastPathComponent,
-          into: URL(
-            fileURLWithPath: FileManager.default.currentDirectoryPath,
-            isDirectory: true),
-          sourceURL: url)
-        await terminal.line("Copied HTML to \(destination.path).")
-        return
-      }
-      let attachment = try DocumentAttachmentImporter.attachment(
-        data: data,
-        filename: url.lastPathComponent,
-        htmlMode: htmlChoice == "markdown" ? .markdown : .source)
-      session.pendingContent.append(attachment.content)
-      var message = "Attached \(attachment.name) (\(attachment.characterCount) characters"
-      if let note = attachment.note { message += ", \(note)" }
-      message += "); it is sent with the next message."
-      await terminal.line(message)
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  #if PMAI_HAS_VISUAL
-    /// Hands the terminal to the SwiftTUI workspace and adopts its focused
-    /// conversation, registrations, and configuration draft when it returns.
-    private static func runVisualMode(
-      session: inout REPLSession,
-      runtime: AgentRuntime,
-      plugins: PluginRegistry,
-      ocrProvider: any OCRProvider,
-      configuration: inout MaiConfiguration?,
-      catalogs: inout [MCPServerCatalog],
-      visual: VisualBridge,
-      terminal: TerminalWriter
-    ) async {
-      guard isatty(STDIN_FILENO) != 0, isatty(STDOUT_FILENO) != 0 else {
-        await terminal.line("Visual mode needs an interactive terminal.", to: .standardError)
-        return
-      }
-      let screen = TerminalScreen.current
-      screen?.deactivate()
-      defer { screen?.resume() }
-      let launch = VisualLaunch(
-        focusedConversation: session.visualSeed(),
-        snapshot: session.visualSnapshot,
-        configuration: configuration ?? MaiConfiguration(providers: visual.implicitProviders),
-        configurationPath: visual.configurationPath,
-        catalogs: catalogs,
-        environment: ProcessInfo.processInfo.environment,
-        commandHandler: { request in
-          await runVisualCommand(
-            request,
-            runtime: runtime,
-            plugins: plugins,
-            ocrProvider: ocrProvider,
-            visual: visual)
-        })
-      let approvals = VisualApprovalHandler {
-        await visual.approvalHandler.setYOLOEnabled(true)
-      }
-      await visual.approvalHandler.setDelegate(approvals)
-      do {
-        let outcome = try await VisualMode.run(
-          launch,
-          runtime: runtime,
-          plugins: plugins,
-          approvals: approvals)
-        await visual.approvalHandler.setDelegate(nil)
-        session.adopt(outcome.focusedConversation)
-        session.visualSnapshot = outcome.snapshot
-        catalogs = outcome.catalogs
-        if outcome.configurationChanged || configuration != nil {
-          configuration = outcome.configuration
-        }
-        await terminal.line(outcome.summary)
-      } catch {
-        await visual.approvalHandler.setDelegate(nil)
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-    }
-
-    /// Runs a slash command typed into a visual pane exactly as the REPL would,
-    /// on a session built from that pane's conversation, and returns what it
-    /// printed together with the conversation it left behind.
-    private static func runVisualCommand(
-      _ request: VisualCommandRequest,
-      runtime: AgentRuntime,
-      plugins: PluginRegistry,
-      ocrProvider: any OCRProvider,
-      visual: VisualBridge
-    ) async -> VisualCommandOutcome {
-      let command =
-        request.input.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).first.map(
-          String.init) ?? request.input
-      switch command {
-      case "/visual":
-        return VisualCommandOutcome(
-          output: "Already in visual mode. /exit or Ctrl+C returns to the REPL.",
-          conversation: request.conversation)
-      case "/exit", "/quit":
-        return VisualCommandOutcome(
-          output: "Leaving visual mode.",
-          conversation: request.conversation,
-          leavesVisualMode: true)
-      default:
-        break
-      }
-
-      var session = REPLSession(
-        profile: SessionProfile(definition: request.conversation.profile),
-        pendingContent: request.conversation.pendingContent)
-      session.history.replaceAll(with: request.conversation.messages)
-      var configuration: MaiConfiguration? = request.configuration
-      var catalogs = request.catalogs
-      let terminal = TerminalWriter(capturesOutput: true)
-      _ = await handleCommand(
-        request.input,
-        session: &session,
-        runtime: runtime,
-        plugins: plugins,
-        ocrProvider: ocrProvider,
-        configuration: &configuration,
-        catalogs: &catalogs,
-        visual: visual,
-        terminal: terminal)
-      var output = await terminal.drainCaptured()
-      if request.input.trimmingCharacters(in: .whitespacesAndNewlines) == "/help" {
-        output +=
-          "\nIn visual mode, /exit returns to the REPL and the output above closes with Esc."
-      }
-      if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { output = "Done." }
-      var conversation = request.conversation
-      conversation.profile = session.profile.agentDefinition
-      conversation.messages = session.history.messages
-      conversation.pendingContent = session.pendingContent
-      return VisualCommandOutcome(output: output, conversation: conversation)
-    }
-  #endif
-
-  private static func handleWorkspaceChatCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    workspace: inout AgentChatWorkspace,
-    runtime: AgentRuntime,
-    configuration: MaiConfiguration?,
-    chatProcess: AgentPID? = nil,
-    terminal: TerminalWriter
-  ) async {
-    let parts = argument.split(maxSplits: 2, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    guard let action = parts.first?.lowercased(), !action.isEmpty else {
-      await terminal.line(chatHelp)
-      return
-    }
-    let rest = String(argument.dropFirst(action.count)).trimmingCharacters(
-      in: .whitespacesAndNewlines)
-
-    switch action {
-    case "list", "chats", "ls":
-      guard let scope = ChatListScope(rest) else {
-        await terminal.line("Usage: /chat list [active|archived|all]")
-        return
-      }
-      await terminal.line(chatListing(workspace, scope: scope, selectedID: session.id))
-    case "new":
-      var profile = session.profile
-      var title = rest
-      var explicitAgent = false
-      if title.hasPrefix("--agent ") {
-        let values = title.split(maxSplits: 2, whereSeparator: \Character.isWhitespace).map(
-          String.init)
-        guard values.count >= 2,
-          let agent = configuration?.agents.first(where: { $0.id == values[1] })
-        else {
-          await terminal.line("Usage: /chat new [--agent ID] [TITLE]")
-          return
-        }
-        profile = SessionProfile(definition: agent)
-        title = values.count == 3 ? values[2] : ""
-        explicitAgent = true
-      }
-      if title.isEmpty, !explicitAgent, session.chat.isDisposable {
-        await terminal.line("Already in a new chat.")
-        return
-      }
-      let chat = workspace.startNewChat(
-        primaryAgent: profile.agentDefinition,
-        title: title.isEmpty ? nil : title)
-      session = REPLSession(chat: chat)
-      await terminal.line("Started chat '\(chat.displayTitle)' with agent \(profile.agentID).")
-    case "use", "switch", "open":
-      guard !rest.isEmpty, let chat = resolveChat(rest, in: workspace) else {
-        await terminal.line("Usage: /chat use INDEX|ID|TITLE")
-        return
-      }
-      guard chat.id != session.id else {
-        await terminal.line("Already in '\(chat.displayTitle)'.")
-        return
-      }
-      await switchSession(
-        to: chat, session: &session, workspace: &workspace, configuration: configuration,
-        terminal: terminal)
-    case "next", "previous", "prev":
-      let ordered = workspace.orderedChats
-      guard ordered.count > 1,
-        let current = ordered.firstIndex(where: { $0.id == session.id })
-      else {
-        await terminal.line("There is only one chat.")
-        return
-      }
-      let offset = action == "next" ? 1 : -1
-      let chat = ordered[(current + offset + ordered.count) % ordered.count]
-      await switchSession(
-        to: chat, session: &session, workspace: &workspace, configuration: configuration,
-        terminal: terminal)
-    case "info", "show":
-      guard let chat = rest.isEmpty ? session.chat : resolveChat(rest, in: workspace) else {
-        await terminal.line("Usage: /chat info [INDEX|ID|TITLE]")
-        return
-      }
-      await terminal.line(chatInfo(chat, workspace: workspace, selectedID: session.id))
-    case "session":
-      switch rest.lowercased() {
-      case "":
-        await terminal.line("Session: \(session.sessionID)")
-      case "new":
-        // A fresh session for the same chat: a backend that meters by session
-        // sees a new one from the next message on, and nothing else changes.
-        session.sessionID = ChatSession.newID()
-        session.touch()
-        workspace.upsert(session.chat, selecting: true)
-        await terminal.line("Session: \(session.sessionID) (new)")
-      default:
-        await terminal.line("Usage: /chat session [new]")
-      }
-    case "rename":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /chat rename TITLE")
-        return
-      }
-      session.title = rest
-      session.touch()
-      workspace.upsert(session.chat, selecting: true)
-      await terminal.line("Chat renamed to '\(rest)'.")
-    case "archive":
-      guard let chat = rest.isEmpty ? session.chat : resolveChat(rest, in: workspace) else {
-        await terminal.line("Usage: /chat archive [INDEX|ID|TITLE]")
-        return
-      }
-      guard !chat.isArchived else {
-        await terminal.line("'\(chat.displayTitle)' is already archived.")
-        return
-      }
-      guard !chat.isDisposable else {
-        await terminal.line("'\(chat.displayTitle)' is empty; there is nothing to archive.")
-        return
-      }
-      guard chat.id == session.id else {
-        workspace.setArchived(true, id: chat.id)
-        await terminal.line("Archived '\(chat.displayTitle)'.")
-        return
-      }
-      session.isArchived = true
-      session.touch()
-      workspace.upsert(session.chat, selecting: true)
-      session = REPLSession(
-        chat: workspace.startNewChat(primaryAgent: session.profile.agentDefinition))
-      await terminal.line("Archived '\(chat.displayTitle)' and started a new chat.")
-    case "unarchive", "restore":
-      guard let chat = rest.isEmpty ? session.chat : resolveChat(rest, in: workspace) else {
-        await terminal.line("Usage: /chat unarchive INDEX|ID|TITLE")
-        return
-      }
-      guard chat.isArchived else {
-        await terminal.line("'\(chat.displayTitle)' is not archived.")
-        return
-      }
-      if chat.id == session.id {
-        session.isArchived = false
-        session.touch()
-        workspace.upsert(session.chat, selecting: true)
-      } else {
-        workspace.setArchived(false, id: chat.id)
-      }
-      await terminal.line("Restored '\(chat.displayTitle)' to the active chats.")
-    case "close", "delete":
-      guard parts.count == 2, parts[1].lowercased() == "confirm" else {
-        await terminal.line("Closing a chat is permanent. Confirm with: /chat close confirm")
-        return
-      }
-      let closed = session.chat
-      _ = workspace.removeChat(id: closed.id)
-      if let next = workspace.activeChats.first ?? workspace.orderedChats.first {
-        _ = workspace.selectChat(id: next.id)
-        session = REPLSession(
-          chat: chatApplyingConfiguredAgentSettings(next, configuration: configuration))
-        await terminal.line("Closed '\(closed.displayTitle)'; switched to '\(session.title)'.")
-      } else {
-        session = REPLSession(
-          chat: workspace.startNewChat(primaryAgent: session.profile.agentDefinition))
-        await terminal.line("Closed '\(closed.displayTitle)'; started a new chat.")
-      }
-    case "messages":
-      await handleChatCommand(
-        "list",
-        session: &session,
-        runtime: runtime,
-        compactPrompt: configuration?.prompts?.compact,
-        chatProcess: chatProcess,
-        terminal: terminal)
-    case "log", "edit", "remove", "rm", "undo", "trim", "compact", "clear", "help":
-      await handleChatCommand(
-        argument,
-        session: &session,
-        runtime: runtime,
-        compactPrompt: configuration?.prompts?.compact,
-        chatProcess: chatProcess,
-        terminal: terminal)
-    default:
-      await terminal.line("Unknown /chat action '\(action)'.\n\n\(chatHelp)")
-    }
-  }
-
-  private static func switchSession(
-    to chat: AgentChat,
-    session: inout REPLSession,
-    workspace: inout AgentChatWorkspace,
-    configuration: MaiConfiguration?,
-    terminal: TerminalWriter
-  ) async {
-    _ = workspace.selectChat(id: chat.id)
-    session = REPLSession(
-      chat: chatApplyingConfiguredAgentSettings(chat, configuration: configuration))
-    let status = chat.isArchived ? ", archived" : ""
-    await terminal.line(
-      "Switched to '\(chat.displayTitle)' (agent \(chat.primaryAgent.id)\(status)).")
-  }
-
-  private enum ChatListScope {
-    case active, archived, all
-
-    init?(_ raw: String) {
-      switch raw.lowercased() {
-      case "", "all": self = .all
-      case "active", "open": self = .active
-      case "archived", "archive", "old": self = .archived
-      default: return nil
-      }
-    }
-  }
-
-  /// Chats grouped the way the PocketMai sidebar groups them: active chats
-  /// under Today / Yesterday / This week / Last week / date headers, newest
-  /// first, then the archived ones. Indexes match `/chat use N`.
-  private static func handleProjectCommand(
-    _ argument: String,
-    project: inout AgentProject,
-    home: AgentHome,
-    store: AgentChatStore,
-    terminal: TerminalWriter
-  ) async {
-    let parts = argument.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    let action = parts.first?.lowercased() ?? "info"
-    let rest = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-
-    switch action {
-    case "info", "show":
-      await terminal.line(projectInfo(project, home: home, store: store))
-    case "list", "ls", "projects":
-      do {
-        await terminal.line(
-          projectListing(try home.loadProjectIndex(), currentID: project.id, now: Date()))
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-    case "name", "rename":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /project name NAME")
-        return
-      }
-      project.rename(to: rest)
-      await saveProject(
-        project, home: home, terminal: terminal,
-        success: "Project renamed to '\(project.displayName)'.")
-    case "tint", "color", "colour":
-      let presets = AgentProjectTint.presetNames.joined(separator: ", ")
-      guard !rest.isEmpty else {
-        await terminal.line(
-          "Tint: \(project.tint?.rawValue ?? "none"). Presets: \(presets); or #RRGGBB; none clears it."
-        )
-        return
-      }
-      if ["none", "off", "default", "-"].contains(rest.lowercased()) {
-        project.tint = nil
-        await saveProject(project, home: home, terminal: terminal, success: "Project tint cleared.")
-        return
-      }
-      guard let tint = AgentProjectTint(rawValue: rest) else {
-        await terminal.line("Unknown tint '\(rest)'. Use one of \(presets), or #RRGGBB.")
-        return
-      }
-      project.tint = tint
-      await saveProject(
-        project, home: home, terminal: terminal, success: "Project tint set to \(tint.rawValue).")
-    case "forget":
-      guard !rest.isEmpty else {
-        await terminal.line("Usage: /project forget INDEX|PATH|NAME")
-        return
-      }
-      do {
-        let index = try home.loadProjectIndex()
-        guard let target = resolveProject(rest, in: index) else {
-          await terminal.line("No project matches '\(rest)'. /project list shows them.")
-          return
-        }
-        guard target.id != project.id else {
-          await terminal.line("'\(target.displayName)' is the open project; it stays listed.")
-          return
-        }
-        _ = try home.forgetProject(id: target.id)
-        await terminal.line(
-          "Forgot '\(target.displayName)'. Its files in \(target.workingDirectory) were left alone."
-        )
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-    case "help":
-      await terminal.line(projectHelp)
-    default:
-      await terminal.line("Unknown /project action '\(action)'.\n\n\(projectHelp)")
-    }
-  }
-
-  private static func saveProject(
-    _ project: AgentProject,
-    home: AgentHome,
-    terminal: TerminalWriter,
-    success: String
-  ) async {
-    do {
-      try home.saveProject(project)
-      await terminal.line(success)
-    } catch {
-      await terminal.line(
-        "warning: the project was not saved: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  private static func resolveProject(_ selector: String, in index: AgentProjectIndex)
-    -> AgentProject?
-  {
-    let ordered = index.orderedProjects
-    if let number = Int(selector), number >= 1, number <= ordered.count {
-      return ordered[number - 1]
-    }
-    let path = AgentProject.standardizedPath(selector)
-    if let match = index.project(atWorkingDirectory: path) { return match }
-    let lowered = selector.lowercased()
-    if let match = ordered.first(where: { $0.id.uuidString.lowercased().hasPrefix(lowered) }) {
-      return match
-    }
-    return ordered.first { $0.displayName.lowercased() == lowered }
-  }
-
-  private static func projectInfo(
-    _ project: AgentProject,
-    home: AgentHome,
-    store: AgentChatStore
-  ) -> String {
-    let summaries = (try? store.loadSummaries()) ?? []
-    let archived = summaries.filter(\.isArchived).count
-    let nameNote =
-      project.hasCustomName ? "" : " (from the directory; /project name NAME renames it)"
-    return [
-      "Name:      \(project.displayName)\(nameNote)",
-      "Directory: \(project.workingDirectory)",
-      "Tint:      \(project.tint?.rawValue ?? "none")",
-      "Chats:     \(summaries.count - archived) active, \(archived) archived",
-      "Storage:   \(store.directoryURL.path)",
-      "Index:     \(home.projectIndexURL.path)",
-      "ID:        \(project.id.uuidString)",
-      "Created:   \(ChatDatePresentation.timestamp(project.createdAt))",
-      "Opened:    \(ChatDatePresentation.timestamp(project.lastOpenedAt))",
-    ].joined(separator: "\n")
-  }
-
-  private static func projectListing(
-    _ index: AgentProjectIndex,
-    currentID: UUID?,
-    now: Date
-  ) -> String {
-    let projects = index.orderedProjects
-    guard !projects.isEmpty else {
-      return "No projects yet. pmai registers the directory it is started in."
-    }
-    var lines = ["Projects, most recently opened first:"]
-    for (offset, project) in projects.enumerated() {
-      let marker = project.id == currentID ? "*" : " "
-      let number = offset < 9 ? " \(offset + 1)" : "\(offset + 1)"
-      var notes: [String] = []
-      if let tint = project.tint { notes.append(tint.rawValue) }
-      if !project.workingDirectoryExists { notes.append("missing") }
-      lines.append(
-        [
-          "\(marker) \(number)", padded(project.displayName, width: 24),
-          padded(abbreviatedPath(project.workingDirectory), width: 44),
-          padded(notes.joined(separator: ", "), width: 12),
-          ChatDatePresentation.compactTimestamp(project.lastOpenedAt, relativeTo: now),
-        ].joined(separator: "  "))
-    }
-    return lines.joined(separator: "\n")
-  }
-
-  /// Shortens a path the way shells print it: `~` for home, and the head
-  /// elided when it is still too long, keeping the tail people recognize.
-  private static func abbreviatedPath(_ path: String, width: Int = 44) -> String {
-    var shown = path
-    let home = AgentHome.userHomeDirectory().path
-    if shown == home {
-      shown = "~"
-    } else if shown.hasPrefix(home + "/") {
-      shown = "~" + shown.dropFirst(home.count)
-    }
-    guard shown.count > width else { return shown }
-    return "â€¦" + shown.suffix(width - 1)
-  }
-
-  private static func chatListing(
-    _ workspace: AgentChatWorkspace,
-    scope: ChatListScope,
-    selectedID: UUID?,
-    now: Date = Date()
-  ) -> String {
-    let ordered = workspace.orderedChats
-    var lines: [String] = []
-    func append(_ chats: [AgentChat], header: (AgentChat) -> String) {
-      var previous: String?
-      for chat in chats {
-        let title = header(chat)
-        if title != previous {
-          lines.append(title)
-          previous = title
-        }
-        let index = (ordered.firstIndex { $0.id == chat.id } ?? 0) + 1
-        lines.append(chatRow(chat, index: index, selected: chat.id == selectedID, now: now))
-      }
-    }
-    if scope != .archived {
-      let active = workspace.activeChats
-      if active.isEmpty { lines.append("No active chats.") }
-      append(active) { ChatDatePresentation.groupTitle(for: $0.updatedAt, relativeTo: now) }
-    }
-    if scope != .active {
-      let archived = workspace.archivedChats
-      if archived.isEmpty, scope == .archived { lines.append("No archived chats.") }
-      append(archived) { _ in "Archived" }
-    }
-    return lines.joined(separator: "\n")
-  }
-
-  private static func chatRow(_ chat: AgentChat, index: Int, selected: Bool, now: Date) -> String {
-    let marker = selected ? "*" : " "
-    let number = index < 10 ? " \(index)" : "\(index)"
-    let count = chat.conversationMessages.count
-    let size = count == 0 ? "empty" : "\(count) msg"
-    return [
-      "\(marker) \(number)", String(chat.id.uuidString.prefix(8)),
-      padded(chat.displayTitle, width: 40), padded(chat.primaryAgent.id, width: 10),
-      padded(size, width: 8),
-      ChatDatePresentation.compactTimestamp(chat.updatedAt, relativeTo: now),
-    ].joined(separator: "  ")
-  }
-
-  private static func chatInfo(
-    _ chat: AgentChat,
-    workspace: AgentChatWorkspace,
-    selectedID: UUID?
-  ) -> String {
-    let index = (workspace.orderedChats.firstIndex { $0.id == chat.id } ?? 0) + 1
-    let count = chat.conversationMessages.count
-    var status = chat.isArchived ? "archived" : "active"
-    if chat.id == selectedID { status += ", current" }
-    var lines = [
-      "Title:    \(chat.displayTitle)",
-      "Index:    \(index)",
-      "ID:       \(chat.id.uuidString)",
-      "Session:  \(chat.sessionID)",
-      "Agent:    \(chat.primaryAgent.id) (\(chat.primaryAgent.provider) / \(chat.primaryAgent.model))",
-      "Messages: \(count) conversation, \(chat.messages.count) total",
-      "Started:  \(ChatDatePresentation.timestamp(chat.createdAt))",
-      "Updated:  \(ChatDatePresentation.timestamp(chat.updatedAt)) (\(ChatDatePresentation.groupTitle(for: chat.updatedAt)))",
-      "Status:   \(status)",
-    ]
-    if !chat.pendingContent.isEmpty {
-      lines.append("Pending:  \(chat.pendingContent.count) attachment(s) queued")
-    }
-    if !chat.subagents.isEmpty {
-      let running = chat.subagents.filter { !$0.state.isTerminal }.count
-      lines.append(
-        "Agents:   \(chat.subagents.count) started by its runs"
-          + (running > 0 ? ", \(running) still running when last saved" : "")
-          + " (/agents tree lists them)")
-    }
-    return lines.joined(separator: "\n")
-  }
-
-  private static func padded(_ text: String, width: Int) -> String {
-    let count = text.count
-    guard count <= width else { return String(text.prefix(width - 3)) + "..." }
-    return text + String(repeating: " ", count: width - count)
-  }
-
-  private static func resolveChat(
-    _ selector: String,
-    in workspace: AgentChatWorkspace
-  ) -> AgentChat? {
-    let ordered = workspace.orderedChats
-    if let index = Int(selector), ordered.indices.contains(index - 1) {
-      return ordered[index - 1]
-    }
-    if let id = UUID(uuidString: selector) {
-      return ordered.first { $0.id == id }
-    }
-    let idMatches = ordered.filter {
-      $0.id.uuidString.lowercased().hasPrefix(selector.lowercased())
-    }
-    if idMatches.count == 1 { return idMatches[0] }
-    let titleMatches = ordered.filter {
-      $0.displayTitle.caseInsensitiveCompare(selector) == .orderedSame
-    }
-    return titleMatches.count == 1 ? titleMatches[0] : nil
-  }
-
-  private static func handleChatCommand(
-    _ argument: String,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    compactPrompt: String?,
-    chatProcess: AgentPID? = nil,
-    terminal: TerminalWriter
-  ) async {
-    let parts = argument.split(maxSplits: 2, whereSeparator: \Character.isWhitespace).map(
-      String.init)
-    guard let action = parts.first?.lowercased(), !action.isEmpty else {
-      await terminal.line(chatHelp)
-      return
-    }
-    let actionArgument = String(argument.dropFirst(parts[0].count))
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-
-    switch action {
-    case "list":
-      await terminal.line(conversationLog(session: session, full: false))
-    case "log":
-      let renderer = await terminal.markdownRenderer
-      await terminal.line(
-        conversationLog(session: session, full: true) { text in
-          guard let renderer else { return text }
-          var rendered = renderer.render(text)
-          while rendered.hasSuffix("\n") { rendered.removeLast() }
-          return rendered
-        })
-    case "edit":
-      guard parts.count == 3, let index = chatIndex(parts[1], count: session.history.count) else {
-        await terminal.line("Usage: /chat edit INDEX TEXT")
-        return
-      }
-      do {
-        try session.history.editMessage(at: index, text: parts[2])
-        await terminal.line("Edited message \(index + 1).")
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-    case "remove", "delete", "rm":
-      guard parts.count >= 2, let index = chatIndex(parts[1], count: session.history.count) else {
-        await terminal.line("Usage: /chat remove INDEX")
-        return
-      }
-      await removeChatMessage(at: index, session: &session, terminal: terminal)
-    case "undo":
-      let index: Int?
-      if parts.count >= 2 {
-        index = chatIndex(parts[1], count: session.history.count)
-      } else {
-        index = session.history.messages.lastIndex(where: { $0.role != .system })
-      }
-      guard let index else {
-        await terminal.line(
-          session.history.isEmpty ? "No messages to undo." : "No conversation messages to undo.")
-        return
-      }
-      await removeChatMessage(at: index, session: &session, terminal: terminal)
-    case "trim":
-      guard parts.count >= 2, let index = chatIndex(parts[1], count: session.history.count) else {
-        await terminal.line("Usage: /chat trim INDEX")
-        return
-      }
-      do {
-        let removed = try session.history.trim(through: index)
-        if removed.isEmpty {
-          await terminal.line("Nothing follows message \(index + 1).")
-        } else {
-          await terminal.line(
-            "Trimmed \(removed.count) message\(removed.count == 1 ? "" : "s"); kept through message \(session.history.count)."
-          )
-        }
-      } catch {
-        await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-      }
-    case "compact":
-      await compactChat(
-        focus: actionArgument,
-        promptTemplate: compactPrompt,
-        session: &session,
-        runtime: runtime,
-        terminal: terminal)
-    case "clear":
-      session.reset()
-      if let chatProcess { await runtime.supervisor.clearFinished(under: chatProcess) }
-      await terminal.line("Conversation cleared.")
-    case "help":
-      await terminal.line(chatHelp)
-    default:
-      await terminal.line("Unknown /chat action '\(action)'.\n\n\(chatHelp)")
-    }
-  }
-
-  private static func removeChatMessage(
-    at index: Int,
-    session: inout REPLSession,
-    terminal: TerminalWriter
-  ) async {
-    do {
-      let removed = try session.history.removeMessage(at: index)
-      let suffix = removed.count == 1 ? "" : " (including linked tool messages)"
-      await terminal.line(
-        "Removed \(removed.count) message\(removed.count == 1 ? "" : "s")\(suffix).")
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  private static let defaultCompactPrompt = AgentCompactionPrompt.template
-
-  /// Ask the selected model for durable context using the configured prompt
-  /// template, then replace the transcript while retaining system instructions.
-  private static func compactChat(
-    focus: String,
-    promptTemplate: String?,
-    session: inout REPLSession,
-    runtime: AgentRuntime,
-    terminal: TerminalWriter
-  ) async {
-    let spoken = session.history.messages.filter {
-      ($0.role == .user || $0.role == .assistant)
-        && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-    guard spoken.count >= 2 else {
-      await terminal.line("Nothing to compact yet.")
-      return
-    }
-    let configuredTemplate = promptTemplate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    guard configuredTemplate.isEmpty || configuredTemplate.contains("{{transcript}}") else {
-      await terminal.line(
-        "error: The compact prompt must contain {{transcript}}. Edit it with /edit compact.",
-        to: .standardError)
-      return
-    }
-    // The same prompt and transcript rendering autocompact uses, so a summary
-    // reads the same whether a person or the runtime asked for it.
-    let prompt = AgentCompactionPrompt.render(
-      transcript: AgentCompactionPrompt.transcript(of: session.history.messages),
-      focus: focus,
-      template: configuredTemplate)
-    let profile = session.profile
-    let request = AgentRequest(
-      agentID: profile.agentID,
-      provider: profile.provider,
-      model: profile.model,
-      messages: [.user(prompt)],
-      toolNames: [],
-      subagentNames: [],
-      toolChoice: .none,
-      responseFormat: .text,
-      options: profile.options,
-      limits: profile.limits,
-      stream: false,
-      toolCallingStrategy: .automatic,
-      useToolProxy: false,
-      retry: profile.retry,
-      sessionID: session.sessionID)
-    await terminal.line("Compacting conversationâ€¦")
-    do {
-      let result = try await runtime.run(request) { _ in }
-      let summary =
-        result.transcript.last(where: { $0.role == .assistant })?.text
-        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-      guard !summary.isEmpty else {
-        await terminal.line("error: Compact returned an empty summary.", to: .standardError)
-        return
-      }
-      var compacted: [AgentMessage] = []
-      if !profile.instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        compacted.append(.system(profile.instructions))
-      }
-      compacted.append(.system("Conversation summary (compacted):\n\n\(summary)"))
-      session.history.replaceAll(with: compacted)
-      session.pendingContent.removeAll()
-      session.touch()
-      await terminal.line("Conversation compacted into a summary.")
-    } catch {
-      await terminal.line("error: \(error.localizedDescription)", to: .standardError)
-    }
-  }
-
-  private static func chatIndex(_ raw: String, count: Int) -> Int? {
-    guard let value = Int(raw), value != 0 else { return nil }
-    let index = value > 0 ? value - 1 : count + value
-    return (0..<count).contains(index) ? index : nil
-  }
-
-  private static func conversationLog(
-    session: REPLSession,
-    full: Bool,
-    renderText: (String) -> String = { $0 }
-  ) -> String {
-    guard !session.history.isEmpty else { return "No conversation messages yet." }
-    var lines = [full ? "# Full conversation log" : "Conversation log:"]
-    if !full { lines.append("-----------------") }
-    for (index, message) in session.history.messages.enumerated() {
-      let role = message.role.rawValue.capitalized
-      if full {
-        lines.append("\n## [\(index + 1)] \(role) (id: \(message.id))")
-        lines.append(
-          message.content.map { renderFullContent($0, renderText: renderText) }
-            .joined(separator: "\n"))
-        lines.append("--------------------")
-      } else {
-        lines.append("[\(index + 1)] \(role): \(messagePreview(message))")
-      }
-    }
-    lines.append("\nTotal messages: \(session.history.count)")
-    if !session.pendingContent.isEmpty {
-      lines.append(
-        "Pending for next message: \(session.pendingContent.map(renderCompactContent).joined(separator: ", "))"
-      )
-    }
-    return lines.joined(separator: "\n")
-  }
-
-  private static func messagePreview(_ message: AgentMessage) -> String {
-    let rendered = message.content.map(renderCompactContent).joined(separator: " ")
-      .replacingOccurrences(of: "\n", with: " ")
-    guard rendered.count > 120 else { return rendered }
-    return String(rendered.prefix(117)) + "..."
-  }
-
-  private static func renderCompactContent(_ part: ContentPart) -> String {
-    switch part {
-    case .text(let text):
-      text
-    case .image(let image):
-      "[image \(image.name ?? image.mimeType)]"
-    case .file(let file):
-      "[file \(file.name)]"
-    case .audio(let audio):
-      "[audio \(audio.name ?? audio.mimeType)]"
-    case .resource(let resource):
-      "[resource \(resource.name ?? resource.uri)]"
-    case .reasoning(let reasoning):
-      "[reasoning] \(reasoning)"
-    case .toolCall(let call):
-      "[tool call \(call.name) \(call.arguments.compactJSONString)]"
-    case .toolResult(let result):
-      "[tool result \(result.callID)\(result.isError ? " error" : "")] \(result.text)"
-    }
-  }
-
-  private static func renderFullContent(
-    _ part: ContentPart,
-    renderText: (String) -> String = { $0 }
-  ) -> String {
-    switch part {
-    case .text(let text):
-      return renderText(text)
-    case .image(let image):
-      return
-        "[image name=\(image.name ?? "-") mime=\(image.mimeType) source=\(binarySourceSummary(image.source))]"
-    case .file(let file):
-      return
-        "[file name=\(file.name) mime=\(file.mimeType)\(file.source.map { " source=\(binarySourceSummary($0))" } ?? "")]\(file.text.map { "\n\($0)" } ?? "")"
-    case .audio(let audio):
-      return
-        "[audio name=\(audio.name ?? "-") mime=\(audio.mimeType) source=\(binarySourceSummary(audio.source))]"
-    case .resource(let resource):
-      return
-        "[resource name=\(resource.name ?? "-") uri=\(resource.uri) mime=\(resource.mimeType ?? "-")]\(resource.text.map { "\n\($0)" } ?? "")"
-    case .reasoning(let reasoning):
-      return "[reasoning]\n\(reasoning)"
-    case .toolCall(let call):
-      return "[tool call name=\(call.name) id=\(call.id)]\n\(call.arguments.compactJSONString)"
-    case .toolResult(let result):
-      var value = "[tool result call=\(result.callID) status=\(result.isError ? "error" : "ok")]"
-      if !result.content.isEmpty {
-        value += "\n" + result.content.map { renderFullContent($0) }.joined(separator: "\n")
-      }
-      if let structured = result.structuredContent {
-        value += "\n[structured content]\n\(structured.compactJSONString)"
-      }
-      return value
-    }
-  }
-
-  private static func binarySourceSummary(_ source: BinarySource) -> String {
-    switch source {
-    case .data(let data): "inline:\(data.count)-bytes"
-    case .url(let url): url.absoluteString
-    }
-  }
-
-  private static func defaultConfigurationPath(environment: [String: String]) -> String {
-    AgentHome.expandUserPath("~/.config/pmai/config.json", environment: environment)
-  }
-
-  /// Where pmai kept chats and history before projects existed.
-  private static let legacyStateDirectory = "~/.config/pmai"
-
-  private static func resolvedHome(options: CLIOptions, environment: [String: String])
-    -> AgentHome
-  {
-    if let path = options.homePath {
-      return AgentHome(
-        rootURL: URL(
-          fileURLWithPath: AgentHome.expandUserPath(path, environment: environment),
-          isDirectory: true))
-    }
-    return AgentHome.resolve(environment: environment)
-  }
-
-  /// Pre-project state is adopted only into the default home: a relocated
-  /// home is a deliberate fresh setup, and scratch runs must not touch the
-  /// files under the real home directory.
-  private static func usesDefaultHome(options: CLIOptions, environment: [String: String])
-    -> Bool
-  {
-    options.homePath == nil
-      && (environment[AgentHome.environmentVariable] ?? "").trimmingCharacters(
-        in: .whitespacesAndNewlines
-      ).isEmpty
-  }
-
-  private static func resolvedChatStore(
-    options: CLIOptions,
-    home: AgentHome,
-    project: AgentProject,
-    environment: [String: String]
-  ) -> AgentChatStore {
-    if let path = options.statePath {
-      return AgentChatStore(
-        directoryURL: URL(
-          fileURLWithPath: AgentHome.expandUserPath(path, environment: environment),
-          isDirectory: true))
-    }
-    return home.chatStore(for: project)
-  }
-
-  /// The shared input history, copied once from its pre-project location.
-  private static func resolvedHistoryURL(
-    options: CLIOptions,
-    home: AgentHome,
-    environment: [String: String]
-  ) -> URL {
-    if let path = options.historyPath {
-      return URL(fileURLWithPath: AgentHome.expandUserPath(path, environment: environment))
-    }
-    let url = home.historyURL
-    let legacy = URL(
-      fileURLWithPath: AgentHome.expandUserPath(
-        "\(legacyStateDirectory)/history.json", environment: environment))
-    if usesDefaultHome(options: options, environment: environment),
-      !FileManager.default.fileExists(atPath: url.path),
-      FileManager.default.fileExists(atPath: legacy.path)
-    {
-      try? FileManager.default.createDirectory(at: home.rootURL, withIntermediateDirectories: true)
-      try? FileManager.default.copyItem(at: legacy, to: url)
-    }
-    return url
-  }
-
-  /// Adopts the single-file workspace pmai kept before projects existed into
-  /// the first project started afterwards, then sets the file aside so it is
-  /// imported only once.
-  private static func importLegacyChats(
-    into store: AgentChatStore,
-    project: AgentProject,
-    options: CLIOptions,
-    environment: [String: String]
-  ) {
-    guard options.statePath == nil, usesDefaultHome(options: options, environment: environment)
-    else { return }
-    let legacy = URL(
-      fileURLWithPath: AgentHome.expandUserPath(
-        "\(legacyStateDirectory)/chats.json", environment: environment))
-    guard FileManager.default.fileExists(atPath: legacy.path) else { return }
-    do {
-      var workspace = try AgentChatWorkspace.load(from: legacy)
-      let count = workspace.chats.filter { !$0.isDisposable }.count
-      try store.commit(&workspace)
-      let imported = legacy.appendingPathExtension("imported")
-      try? FileManager.default.removeItem(at: imported)
-      try FileManager.default.moveItem(at: legacy, to: imported)
-      FileHandle.standardError.write(
-        Data(
-          "Imported \(count) earlier chat\(count == 1 ? "" : "s") from \(legacy.path) into project '\(project.displayName)'.\n"
-            .utf8))
-    } catch {
-      FileHandle.standardError.write(
-        Data(
-          "warning: earlier chats in \(legacy.path) were not imported: \(error.localizedDescription)\n"
-            .utf8))
-    }
-  }
-
-  /// A project tint colors the prompt so the terminal shows which project is open.
-  private static func tintedUI(_ ui: ConfiguredTerminalUI, project: AgentProject)
-    -> ConfiguredTerminalUI
-  {
-    guard let tint = project.tint else { return ui }
-    var tinted = ui
-    tinted.promptForeground = tint.hex
-    return tinted
-  }
-
-  private static func loadChatWorkspace(
-    from store: AgentChatStore,
-    initialProfile: SessionProfile,
-    configuredAgents: [AgentDefinition],
-    providerOverride: ProviderID?,
-    modelOverride: String?,
-    options: CLIOptions
-  ) throws -> AgentChatWorkspace {
-    var workspace = try store.loadWorkspace { error in
-      FileHandle.standardError.write(
-        Data("warning: skipped a chat file. \(error.localizedDescription)\n".utf8))
-    }
-    synchronizeConfiguredAgentSettings(in: &workspace, agents: configuredAgents)
-    let overridesLimits =
-      options.maxToolCalls != nil || options.maxModelTurns != nil
-      || options.maxSubagents != nil
-    if providerOverride != nil || modelOverride != nil || overridesLimits {
-      for var chat in workspace.chats {
-        if let providerOverride { chat.primaryAgent.provider = providerOverride }
-        if let modelOverride { chat.primaryAgent.model = modelOverride }
-        options.applyLimitOverrides(to: &chat.primaryAgent.limits)
-        workspace.upsert(chat)
-      }
-    }
-    // Like the PocketMai app, every launch opens a fresh chat and keeps the
-    // earlier ones one `/chat use` away; `--resume` reopens a saved chat instead.
-    if options.resume {
-      if let selector = options.resumeSelector {
-        guard let chat = resolveChat(selector, in: workspace) else {
-          throw CLIError.unknownChat(selector)
-        }
-        workspace.selectChat(id: chat.id)
-        return workspace
-      }
-      if let recent = workspace.mostRecentChat {
-        workspace.selectChat(id: recent.id)
-        return workspace
-      }
-    }
-    workspace.startNewChat(primaryAgent: initialProfile.agentDefinition)
-    return workspace
-  }
-
-  /// Chat files retain an agent snapshot for portability, but reusable agent
-  /// controls are configured in pmai.json. Refreshing them prevents an old
-  /// chat from masking or overwriting newer `/edit config` and `/set` values.
-  private static func synchronizeConfiguredAgentSettings(
-    in workspace: inout AgentChatWorkspace,
-    agents: [AgentDefinition]
-  ) {
-    let configuredByID = Dictionary(uniqueKeysWithValues: agents.map { ($0.id, $0) })
-    for var chat in workspace.chats {
-      guard let configured = configuredByID[chat.primaryAgent.id] else { continue }
-      applyConfiguredAgentSettings(configured, to: &chat)
-      workspace.upsert(chat)
-    }
-  }
-
-  private static func applyConfiguredAgentSettings(
-    _ configured: AgentDefinition,
-    to chat: inout AgentChat
-  ) {
-    let previousInstructions = chat.primaryAgent.instructions
-    chat.primaryAgent.limits = configured.limits
-    chat.primaryAgent.toolCallingStrategy = configured.toolCallingStrategy
-    chat.primaryAgent.instructions = configured.instructions
-    chat.primaryAgent.systemPrompt = configured.systemPrompt
-    // The chat keeps a copy of its agent, and every tool change made from the
-    // REPL is saved into the configuration, so the configuration is the truth:
-    // a chat opened after a group was enabled must see the new tools too.
-    chat.primaryAgent.toolNames = configured.toolNames
-    chat.primaryAgent.toolGroupNames = configured.toolGroupNames
-    chat.primaryAgent.subagentNames = configured.subagentNames
-    chat.primaryAgent.toolDelegation = configured.toolDelegation
-    chat.primaryAgent.useToolProxy = configured.useToolProxy
-    chat.primaryAgent.proxyExposedTools = configured.proxyExposedTools
-    chat.primaryAgent.context = configured.context
-    guard previousInstructions != configured.instructions else { return }
-    var transcript = AgentTranscript(messages: chat.messages)
-    if let index = transcript.messages.firstIndex(where: {
-      $0.role == .system && $0.text == previousInstructions
-    }) {
-      if configured.instructions.isEmpty {
-        _ = try? transcript.removeMessage(at: index)
-      } else {
-        _ = try? transcript.editMessage(at: index, text: configured.instructions)
-      }
-    } else if !configured.instructions.isEmpty {
-      transcript.replaceAll(with: [.system(configured.instructions)] + transcript.messages)
-    }
-    chat.messages = transcript.messages
-  }
-
-  private static func chatApplyingConfiguredAgentSettings(
-    _ chat: AgentChat,
-    configuration: MaiConfiguration?
-  ) -> AgentChat {
-    guard
-      let configured = configuration?.agents.first(where: { $0.id == chat.primaryAgent.id })
-    else { return chat }
-    var chat = chat
-    applyConfiguredAgentSettings(configured, to: &chat)
-    return chat
-  }
-
-  /// Commits the workspace to the project's chat store. The selected
-  /// placeholder stays in memory while the REPL runs and is dropped when it
-  /// closes; the store never writes a placeholder, so an empty chat leaves no
-  /// file behind however the process ends.
-  private static func saveWorkspace(
-    _ workspace: inout AgentChatWorkspace,
-    store: AgentChatStore,
-    terminal: TerminalWriter,
-    closing: Bool = false
-  ) async {
-    workspace.removeDisposableChats(keeping: closing ? nil : workspace.selectedChatID)
-    do {
-      try store.commit(&workspace)
-    } catch {
-      await terminal.line(
-        "warning: chats were not saved: \(error.localizedDescription)",
-        to: .standardError)
-    }
-  }
-
-  #if PMAI_HAS_VISUAL
-    private static func visualSnapshot(for workspace: AgentChatWorkspace) -> VisualWorkspaceSnapshot
-    {
-      let conversations = workspace.chats.map { chat in
-        VisualConversationSeed(
-          id: chat.id,
-          title: chat.title,
-          profile: chat.primaryAgent,
-          messages: chat.messages,
-          pendingContent: chat.pendingContent,
-          sessionID: chat.sessionID)
-      }
-      return VisualWorkspaceSnapshot(
-        conversations: conversations,
-        layout: PaneLayout(conversation: workspace.selectedChatID ?? conversations[0].id))
-    }
-
-    private static func chatWorkspace(
-      from snapshot: VisualWorkspaceSnapshot,
-      focusedID: UUID,
-      previous: AgentChatWorkspace
-    ) -> AgentChatWorkspace {
-      let previousByID = Dictionary(uniqueKeysWithValues: previous.chats.map { ($0.id, $0) })
-      let chats = snapshot.conversations.map { conversation in
-        let old = previousByID[conversation.id]
-        let untouched =
-          old.map {
-            $0.title == conversation.title && $0.primaryAgent == conversation.profile
-              && $0.messages == conversation.messages
-              && $0.pendingContent == conversation.pendingContent
-          } ?? false
-        return AgentChat(
-          id: conversation.id,
-          title: conversation.title,
-          primaryAgent: conversation.profile,
-          messages: conversation.messages,
-          pendingContent: conversation.pendingContent,
-          createdAt: old?.createdAt ?? Date(),
-          updatedAt: untouched ? old!.updatedAt : Date(),
-          isArchived: old?.isArchived ?? false,
-          sessionID: conversation.sessionID,
-          subagents: old?.subagents ?? [])
-      }
-      return AgentChatWorkspace(chats: chats, selectedChatID: focusedID)
-    }
-  #endif
-
-  private static func completionCandidates(
-    workspace: AgentChatWorkspace,
-    configuration: MaiConfiguration?,
-    skills: [AgentSkill] = []
-  ) -> [String] {
-    var values = [
-      "/help", "/help set", "/exit", "/quit", "/set yolo on", "/set yolo off",
-      "/set ui.", "/set effort", "/set effort off", "/set effort auto", "/nothink",
-      "/set ui.thinking status", "/set ui.thinking line", "/set ui.thinking three",
-      "/set ui.thinking full",
-      "/btw ",
-      "/help memory", "/help agents", "/help chat", "/help edit", "/help tools",
-      "/agent acp list", "/agent acp add ", "/agents acp list",
-      "/memory", "/memory edit", "/memory learn", "/memory learn --all", "/memory add ",
-      "/memory clear", "/memory on", "/memory off", "/memory scope none",
-      "/memory scope project", "/memory scope all", "/edit memory", "/edit memory-prompt",
-      "/help todo", "/todo", "/todo add ", "/todo done ", "/todo edit", "/todo sweep",
-      "/todo clear", "/todo path",
-      "/set limits.", "/set limits.maxToolCalls ", "/set limits.maxModelTurns ",
-      "/set limits.maxSubagents ", "/set limits.maxSeconds ", "/set limits.maxTotalTokens ",
-      "/set retry.attempts ", "/set retry.delay ", "/set ctx.strategy ", "/set ctx.compact ",
-      "/set ctx.compact off",
-      "/continue", "/stop",
-      "/set tool.", "/set tool.calling automatic", "/set tool.calling native",
-      "/set tool.calling text", "/set tool.calling xml", "/set tool.calling json",
-      "/set tool.proxy on", "/set tool.proxy off",
-      "/set ui.title ", "/set ui.title none", "/set ui.editor ", "/set ui.editor none",
-      "/set ui.bgline rgb:024", "/set ui.bgline none",
-      "/set ui.fgprompt yellow",
-      "/set ui.fgcolor none", "/set ui.bgcolor none", "/set ui.bgprompt none",
-      "/set ui.fgtoolresult yellow", "/set use.", "/set use.agentsmd on", "/set use.agentsmd off",
-      "/set use.plan on", "/set use.plan off",
-      "/set ui.bold on", "/set ui.bold off", "/set ui.markdown on", "/set ui.markdown off",
-      "/set ui.toolResultLines all", "/set ui.toolResultLines ",
-      "/cwd", "/pwd", "/cd ", "/plugins",
-      "/providers", "/models ", "/provider ", "/baseurl ", "/model ", "/prompts", "/prompt",
-      "/prompt list", "/prompt show ", "/prompt add ", "/prompt set ", "/prompt edit ",
-      "/prompt rm ", "/prompt use ", "/help prompts", "/prompts list", "/prompts show ",
-      "/prompts add ", "/prompts edit ", "/prompts rm ", "/edit user ", "/edit system ",
-      "/agents", "/agents tree", "/agents clear", "/agents log ", "/agents kill ", "/agents focus ",
-      "/agents focus main", "/queue", "/queue push ", "/queue pop", "/queue drop",
-      "/help queue", "/help export", "/help import", "/export archive ", "/import ",
-      "/export markdown ", "/export html ", "/export json ", "/export debug ",
-      "/stats", "/stats ranking", "/stats speed", "/stats time", "/stats efficiency",
-      "/stats show ",
-      "/stats reset", "/stats rm ", "/stats path", "/help stats",
-      "/export epub ", "/export docx ", "/set ui.subagents all", "/set ui.subagents tools",
-      "/set ui.subagents stats", "/set ui.subagents none",
-      "/agent use ",
-      "/agent show ", "/agent add ", "/agent tools ", "/agent model ", "/agent prompt ",
-      "/agent provider ", "/agent remove ", "/edit agent", "/tools",
-      "/skills", "/skills list", "/skills show ", "/skills enable ", "/skills disable ",
-      "/skills enable all", "/skills disable all", "/skills prompt ", "/skills path",
-      "/skills reload", "/help skills",
-      "/mcp list",
-      "/mcp add ", "/mcp enable ", "/mcp disable ",
-      "/edit prompt", "/edit compact", "/edit config", "/edit mcps", "/edit provider",
-      "/edit input",
-      "/chat compact ",
-      "/image tiny ", "/image small ", "/image medium ", "/image big ", "/image full ",
-      "/image ocr ", "/attach ", "/attach source ", "/attach markdown ", "/attach copy ",
-      "/attach clear", "/copy", "/help copy", "/reply", "/help reply",
-      "/clear", "/chat list",
-      "/chat list active", "/chat list archived", "/chat list all", "/chat new ",
-      "/chat use ", "/chat next", "/chat previous", "/chat info", "/chat session",
-      "/chat session new", "/chat rename ",
-      "/chat archive", "/chat unarchive ", "/chat close confirm", "/chat messages",
-      "/chat log", "/chat edit ", "/chat remove ", "/chat undo", "/chat trim ",
-      "/chat clear", "/project", "/project info", "/project list", "/project name ",
-      "/project tint ", "/project tint none", "/project forget ",
-    ]
-    for tint in AgentProjectTint.presetNames {
-      values.append("/project tint \(tint)")
-    }
-    #if PMAI_HAS_VISUAL
-      values.append("/visual")
-    #endif
-    for (index, chat) in workspace.orderedChats.enumerated() {
-      values.append("/chat use \(index + 1)")
-      values.append("/chat use \(chat.id.uuidString.prefix(8))")
-      values.append("/chat use \(chat.displayTitle)")
-      values.append("/chat info \(index + 1)")
-      values.append(chat.isArchived ? "/chat unarchive \(index + 1)" : "/chat archive \(index + 1)")
-    }
-    for agent in configuration?.agents ?? [] {
-      values.append("/agent use \(agent.id)")
-      values.append("/agent show \(agent.id)")
-      values.append("/chat new --agent \(agent.id) ")
-    }
-    for name in configuration?.prompts?.system.keys.sorted() ?? [] {
-      values.append("/prompt \(name)")
-      values.append("/edit prompt \(name)")
-      values.append("/edit \(name)")
-    }
-    for provider in configuration?.providers ?? [] {
-      values.append("/provider \(provider.id)")
-      values.append("/models \(provider.id)")
-      values.append("/edit provider \(provider.id)")
-    }
-    for skill in skills {
-      values.append("/skills show \(skill.name)")
-      values.append("/skills prompt \(skill.name) ")
-      if skill.isModelInvocable {
-        values.append("/skills enable \(skill.name)")
-        values.append("/skills disable \(skill.name)")
-      }
-    }
-    let catalog = configuration?.promptCatalog(skills: skills) ?? PromptCatalog(skills: skills)
-    for entry in catalog.entries {
-      values.append("$\(entry.commandName) ")
-      values.append("/prompts \(entry.commandName) ")
-      values.append("/prompts show \(entry.commandName)")
-    }
-    for name in (configuration?.prompts?.user ?? [:]).keys.sorted() {
-      values.append("/prompts edit \(name)")
-      values.append("/prompts rm \(name)")
-      values.append("/edit user \(name)")
-    }
-    var groupNames = Set(workspace.chats.flatMap(\.primaryAgent.toolGroupNames))
-    if skills.contains(where: \.isModelInvocable) { groupNames.insert(MaiSkillTools.groupID) }
-    if configuration?.toolSources.contains(where: {
-      $0.enabled && $0.kind == MaiStandardToolsPlugin.factoryKind
-    }) == true {
-      groupNames.formUnion(
-        [
-          "echo", "datetime", "calc", "files", "run", "weather", "web", "mastodon", "github",
-          "todo", "context",
-        ])
-    }
-    for level in ReasoningEffort.names {
-      values.append("/set effort \(level)")
-    }
-    for group in groupNames {
-      values.append("/tools show \(group)")
-      values.append("/tools enable \(group)")
-      values.append("/tools disable \(group)")
-      values.append("/tools set \(group) ")
-    }
-    return Array(Set(values))
-  }
-
-  private static func loadConfiguration(
-    options: CLIOptions,
-    environment: [String: String]
-  ) throws -> (configuration: MaiConfiguration, path: String)? {
-    if let explicit = options.configPath {
-      let expanded = AgentHome.expandUserPath(explicit, environment: environment)
-      guard FileManager.default.fileExists(atPath: expanded) else {
-        throw CLIError.configNotFound(expanded)
-      }
-      return (try MaiConfiguration.load(from: URL(fileURLWithPath: expanded)), expanded)
-    }
-    let candidates = [
-      FileManager.default.currentDirectoryPath + "/pmai.json",
-      defaultConfigurationPath(environment: environment),
-    ]
-    for path in candidates where FileManager.default.fileExists(atPath: path) {
-      return (try MaiConfiguration.load(from: URL(fileURLWithPath: path)), path)
-    }
-    return nil
-  }
-
-  /// Reads standard input to its end and attaches it as a text file, the way
-  /// `/attach` does with a file on disk. With a message on the command line
-  /// the run is one-shot; without one the REPL follows, so the terminal takes
-  /// over as standard input, which needs one to exist.
-  private static func stdinAttachment(reopeningTerminal: Bool) throws -> ContentPart {
-    let data = FileHandle.standardInput.readDataToEndOfFile()
-    let attachment = try DocumentAttachmentImporter.attachment(data: data, filename: "stdin.txt")
-    if reopeningTerminal {
-      #if os(Windows)
-        guard WindowsConsole.reopenStandardInputOnConsole() else {
-          throw CLIError.stdinWithoutTerminal
-        }
-      #else
-        let tty = open("/dev/tty", O_RDONLY)
-        guard tty >= 0 else { throw CLIError.stdinWithoutTerminal }
-        defer { close(tty) }
-        guard dup2(tty, STDIN_FILENO) >= 0 else { throw CLIError.stdinWithoutTerminal }
-      #endif
-    }
-    return attachment.content
-  }
-
-  private static func imageContent(path: String) throws -> ContentPart {
-    let loaded = try loadImage(path: path)
-    return .image(
-      ImageContent(
-        source: .data(loaded.data),
-        mimeType: loaded.mimeType,
-        name: loaded.url.lastPathComponent))
-  }
-
-  private static func imageContent(
-    path: String,
-    mode: ImageAttachmentMode,
-    ocrProvider: any OCRProvider
-  ) async throws -> ContentPart {
-    let loaded = try loadImage(path: path)
-    return try await ImageAttachmentImporter.content(
-      data: loaded.data,
-      mimeType: loaded.mimeType,
-      filename: loaded.url.lastPathComponent,
-      mode: mode,
-      ocrProvider: mode == .ocr ? ocrProvider : nil)
-  }
-
-  private static func loadImage(path: String) throws -> (data: Data, url: URL, mimeType: String) {
-    let expanded = NSString(string: path).expandingTildeInPath
-    let url = URL(fileURLWithPath: expanded)
-    guard let data = try? Data(contentsOf: url), !data.isEmpty else {
-      throw CLIError.invalidImage(path)
-    }
-    let mimeType: String
-    switch url.pathExtension.lowercased() {
-    case "png": mimeType = "image/png"
-    case "gif": mimeType = "image/gif"
-    case "webp": mimeType = "image/webp"
-    case "heic", "heif": mimeType = "image/heic"
-    default: mimeType = "image/jpeg"
-    }
-    return (data, url, mimeType)
-  }
-
-  private static func sampleConfiguration() -> MaiConfiguration {
-    MaiConfiguration(
-      defaultAgent: "hello",
-      plugins: [
-        ConfiguredPlugin(path: "./plugins/example.dylib", enabled: false)
-      ],
-      providers: [
-        ConfiguredProvider(id: "hello", kind: .hello),
-        ConfiguredProvider(
-          id: "openai",
-          kind: .openAICompatible,
-          baseURL: URL(string: "https://api.openai.com/v1"),
-          apiKeyEnvironment: "OPENAI_API_KEY"),
-      ],
-      toolSources: [
-        ConfiguredToolSource(
-          id: "standard-tools",
-          kind: MaiStandardToolsPlugin.factoryKind,
-          options: [
-            "webSearchProvider": .string(MaiWebSearchProvider.exa.rawValue),
-            "weatherLocation": .string(""),
-            "mastodonInstance": .string("mastodon.social"),
-            "mastodonAPIKeyEnvironment": .string("MASTODON_API_KEY"),
-            "mastodonWriteEnabled": .bool(false),
-          ]),
-        ConfiguredToolSource(id: "example-tools", kind: "example", enabled: false),
-      ],
-      ocrProviders: [
-        ConfiguredOCRProvider(
-          id: MaiVisionOCRPlugin.preferredFactoryKind,
-          kind: MaiVisionOCRPlugin.preferredFactoryKind)
-      ],
-      mcpServers: [
-        ConfiguredMCPServer(
-          id: "remote",
-          enabled: false,
-          displayName: "Example MCP",
-          url: URL(string: "https://your-mcp.example/mcp")!,
-          bearerTokenEnvironment: "MCP_API_KEY",
-          toolNamePrefix: "remote",
-          defaultApproval: .confirm),
-        ConfiguredMCPServer(
-          id: "local",
-          kind: "stdio",
-          enabled: false,
-          displayName: "Example local MCP",
-          command: "your-mcp-server",
-          args: ["--stdio"],
-          cwd: ".",
-          toolNamePrefix: "local",
-          defaultApproval: .confirm),
-      ],
-      agents: [
-        AgentDefinition(
-          id: "hello",
-          description: "Offline smoke test; no tools and no network.",
-          instructions: "Exercise the offline MaiCore provider.",
-          systemPrompt: "hello",
-          provider: "hello",
-          model: ""),
-        AgentDefinition(
-          id: "main",
-          description: "General assistant with the full tool set.",
-          instructions: "You are a helpful assistant. Use tools when needed.",
-          systemPrompt: "main",
-          provider: "openai",
-          model: "your-model",
-          toolNames: Set(
-            [
-              MaiCalculatorTool.name,
-              MaiCurrentTimeTool.name,
-              MaiEchoTool.name,
-              MaiWeatherTool.name,
-              MaiWebSearchTool.name,
-              MaiWebFetchTool.name,
-              MaiMastodonTool.name,
-            ] + MaiFileWorkspaceTool.toolNames + MaiRunTool.toolNames + MaiGitHubTool.toolNames
-              + MaiTodoTools.toolNames + MaiContextTools.toolNames),
-          toolGroupNames: [
-            "echo", "datetime", "calc", "files", "run", "weather", "web", "mastodon",
-            "github", "todo", "context",
-          ],
-          subagentNames: ["researcher"],
-          limits: AgentRunLimits(),
-          useToolProxy: true),
-        AgentDefinition(
-          id: "researcher",
-          description: "Investigates one question and answers in a few lines.",
-          instructions: "Investigate the delegated task and return a concise result.",
-          systemPrompt: "researcher",
-          provider: "openai",
-          model: "your-model",
-          toolNames: [MaiCurrentTimeTool.name],
-          toolGroupNames: ["datetime"]),
-      ],
-      prompts: ConfiguredPrompts(
-        delegation: AgentDelegationPrompt.template,
-        worker: AgentDelegationPrompt.workerInstructions,
-        memory: AgentMemoryPrompt.template,
-        system: [
-          "hello": "Exercise the offline MaiCore provider.",
-          "main": "You are a helpful assistant. Use tools when needed.",
-          "researcher": "Investigate the delegated task and return a concise result.",
-        ]),
-      memory: ConfiguredMemory(),
-      approvals: ConfiguredApprovals(confirm: .ask, dangerous: .ask))
-  }
-
-  private static let visualHelp: String = {
-    #if PMAI_HAS_VISUAL
-      "/visual                Open the terminal workspace: split chats, providers, MCPs, tools\n"
-    #else
-      ""
-    #endif
-  }()
-
-  private static let replHelp = """
-    /agent                 Select or edit this chat's agent; /help agent lists commands
-    /agents                Manage agent definitions and running agents; /help agents lists commands
-    /attach [MODE] PATH    Attach a document/source file; HTML asks for source, markdown, or copy
-    /attach clear          Drop the attachments queued for the next message
-    /baseurl URL           Change the current provider endpoint
-    /btw PROMPT            Ask in a fresh context without changing this chat
-    /cd PATH               Change the current working directory
-    /chat                  List, switch, archive, rename, or edit this project's chats
-    /clear                 Clear conversation history
-    /continue              Resume a stopped or interrupted task, including queued messages
-    /copy [N] [PATH]       Copy the last reply, or N messages, to the clipboard or a file
-    /cwd                   Print the current working directory
-    /edit TARGET           Edit a prompt, agent, config, MCP list, or message in $EDITOR
-    /edit input            Write the next message in $EDITOR instead of at the prompt
-    /exit                  Exit the REPL
-    /export FORMAT [PATH]  Save a portable archive, or this chat as markdown, html, json, debug, epub, or docx
-    /help [COMMAND]        Show commands or help for one command
-    /image MODE PATH       Attach at tiny/small/medium/big/full size, or OCR to Markdown
-    /import PATH           Merge a PocketMai/pmai archive into settings, skills, and chats
-    /mcp                   Manage MCP servers; /help mcp lists commands
-    /memory                Show, edit, learn, or scope this project's durable memory
-    /model NAME            Select a model
-    /models [PROVIDER]     List models from the current or named provider
-    /nothink               Disable reasoning where the model supports it
-    /plugins               List statically and dynamically loaded plugins
-    /project               Show, list, rename, or tint the project (the start directory)
-    /prompt                Manage named system prompts; /help prompt lists commands
-    /prompts               List every prompt and skill; $NAME [TEXT] sends one (/help prompt)
-    /provider ID           Select a provider
-    /providers             List registered providers
-    /queue                 List, push, pop, or drop messages waiting for an agent
-    /reply [WIDTH]         Answer the last reply in $EDITOR with it quoted above (/help reply)
-    /set [SETTING VALUE]   Show or change settings; /help set lists them
-    /skills                List, enable, disable, or send skills (/help skills)
-    /stats                 Combined ranking, tokens/s, time in use, and efficiency per provider:model, as bars
-    /stop                  Interrupt the current turn and keep its queue; /continue resumes it
-    /todo                  Show, add to, tick off, or edit this project's todo list
-    /tools                 List logical tool groups for the current agent
-    /version               Print the pmai version
-    \(visualHelp)
-    Input: Shift+Enter adds a line (Alt+Enter or Ctrl+J where the terminal sends Enter for it)
-           A paste keeps its lines Â· Enter sends the whole text
-           <<WORD starts a multiline message ending at WORD alone
-           $NAME [TEXT] sends a prompt or skill by name; /prompts lists them
-           !COMMAND runs a line in the system shell (interactive programs work)
-           Up/Down or Ctrl+P/N move between lines, then history Â· Ctrl+R reverse search
-           Ctrl+A/E or Home/End beginning/end of the line
-           Ctrl+B/F move left/right like the arrow keys
-           Ctrl+W delete word Â· Ctrl+C or /stop interrupt the run Â· Ctrl+Z suspend
-           The prompt stays open while a turn runs: a message typed then is queued and
-           joins the conversation at the next model turn. @PID TEXT reaches one agent.
-           Commands run right away too; a setting changed then reaches the next turn.
-           Child agents print in blocks prefixed agent#PID; /set ui.subagents picks how much.
-    """
-
-  private static let effortHelp = """
-    Reasoning effort:
-      /set effort                Show the current agent's reasoning effort and guidance
-      /set effort LEVEL          Set it: off, minimal, low, medium, high, xhigh, or max. The provider gets the
-                                 field its API takes (reasoning_effort, think, enable_thinking,
-                                 thinkingâ€¦) and the system prompt says how much care to take
-      /set effort LEVEL TEXT     The level plus TEXT, added to the system prompt as guidance
-      /set effort auto           Back to the provider's default, with no guidance
-      /set effort off            Disable thinking where supported (also /nothink)
-
-    Examples:
-      /set effort high
-      /set effort max Check every edge case and verify the result before answering
-      /set effort low Keep answers to one paragraph
-    """
-
-  private static let setHelp = """
-    Settings commands:
-      /set                         List current settings and their values
-      /set effort [LEVEL] [TEXT]   Show or set reasoning effort and optional guidance
-      /set yolo BOOL               Permit all tool calls without asking (on/off); kept for later runs
-      /set tool.                   List the tool calling settings
-      /set tool.calling MODE       Use automatic/native tools, or text/XML/JSON emulation
-      /set tool.proxy BOOL         Show models only the shared list-tools and call-tool pair (on/off)
-      /set delegation MODE         off: runs every tool itself; subagent: may also hand work to a child
-      /set limits.                 List the tool, turn, and subagent limits
-      /set limits.maxToolCalls N   Tool calls allowed per run
-      /set limits.maxModelTurns N  Model turns allowed per run
-      /set limits.maxSubagents N   Child agents allowed at once (0 disables delegation)
-      /set limits.maxSubagentDepth N  Maximum depth of the agent tree
-      /set limits.maxTotalTokens <off|N|Nk>  Tokens a run may spend before it pauses
-      /set limits.maxSeconds <off|N|Nm|Nh>   Wall-clock time a run may take before it pauses
-      /set retry.attempts N        Times a failed model call is repeated (default 2)
-      /set retry.delay SECONDS     Wait before each retry (default 5)
-      /set ctx.compact <off|N|Nk>  Summarize older exchanges once the chat holds ~N tokens
-      /set ctx.strategy <cache|size>  Keep prompt-cache history intact, or compact old file reads
-      /set ui.                     List terminal UI settings
-      /set ui.title TEXT           Set the prompt label and terminal/tab title (`none` clears it)
-      /set ui.editor COMMAND       Editor /edit opens (`none` falls back to $EDITOR, $VISUAL, vim)
-      /set ui.bgline COLOR         Set the input-line background
-      /set ui.fgcolor COLOR        Set the input foreground
-      /set ui.bgcolor COLOR        Set the input background
-      /set ui.fgprompt COLOR       Set the prompt foreground
-      /set ui.bgprompt COLOR       Set the prompt background
-      /set ui.fgtoolresult COLOR   Set successful tool-result output color
-      /set ui.bold BOOL            Render input in bold (on/off)
-      /set ui.markdown BOOL        Render replies as styled markdown (on/off)
-      /set ui.toolResultLines <all|N>  Show all or the first N result lines (0 hides them)
-      /set ui.thinking MODE        Thinking display: status, line, three, or full
-      /set ui.subagents LEVEL      What child agents print: all, tools, stats, or none
-      /set use.agentsmd BOOL       Put the working tree's AGENTS.md files â€” this directory up to
-                                   the repository root â€” into every run's system prompt (on/off)
-      /set use.plan BOOL           Ask an agent that can start children to open a request of
-                                   several steps with a numbered plan before delegating (on/off)
-
-    YOLO, agent, and UI settings are persisted in the active configuration; the -y
-    flag turns YOLO on for one run only. COLOR accepts a named ANSI color, rgb:RGB,
-    or none.
-    """
-
-  private static let chatHelp = """
-    Persistent chat management commands:
-      /chat list [active|archived|all]  List chats by day, newest first; archived last
-      /chat new [TITLE]             Start a fresh chat using the current agent
-      /chat new --agent ID [TITLE]  Start a fresh chat using a configured agent
-      /chat use INDEX|ID|TITLE      Switch to a chat by list index, ID prefix, or title
-      /chat next|previous           Cycle through chats
-      /chat info [INDEX|ID|TITLE]   Show a chat's agent, session, size, and timestamps
-      /chat session [new]           Show the session id providers see, or start a fresh one
-      /chat rename TITLE            Rename the active chat
-      /chat archive [INDEX|ID|TITLE]  Archive a chat; archiving the active one starts fresh
-      /chat unarchive INDEX|ID|TITLE  Return an archived chat to the active list
-      /chat close confirm           Permanently close the active chat
-      /chat messages                Display a compact indexed message list
-      /chat log           Display the full structured conversation
-      /chat edit INDEX TEXT  Replace a message's text; preserve attachments
-      /chat remove INDEX  Remove a message
-      /chat undo [INDEX]  Remove the last conversation message or selected message
-      /chat trim INDEX    Keep through the selected message; remove newer messages
-      /chat compact [FOCUS]  Summarize the chat, prioritizing what FOCUS says to preserve
-      /chat clear         Clear the conversation and restore configured instructions
-
-    Message indexes are 1-based. Negative indexes count back from the end;
-    -1 selects the last message, -2 the second-to-last, and so on.
-    Removing a tool call or result also removes its linked tool transaction.
-    pmai opens a fresh chat on every launch and names it after the first
-    message; chats that never received a message are never written. Start
-    Start with -l to list saved chats, then -r INDEX|ID|TITLE to reopen one;
-    -r without a selector reopens the most recently updated chat. Chats
-    belong to the project rooted at the start directory; /project shows it.
-    A chat is saved with the agents its runs started and their transcripts:
-    reopening it lists them under /agents tree, /agents log PID reads one,
-    /chat info counts them, and /agents clear drops them from the chat.
-    """
-
-  private static let projectHelp = """
-    Project commands (a project is the directory pmai was started in):
-      /project [info]          Show the project's name, tint, directory, and chat counts
-      /project list            List every project pmai has been started in, recent first
-      /project name NAME       Rename the project; the directory name is the default
-      /project tint COLOR      Color the prompt: a preset such as mint, or #RRGGBB; none clears it
-      /project forget INDEX|PATH|NAME  Drop another project from the list; its files stay
-
-    Chats live in .pmai/chats inside the project directory; the list of
-    projects lives in ~/.pmai/projects.json (or under $PMAI_HOME). /cd changes
-    where tools run, not which project the chats belong to.
-    """
-
-  private static let mcpCommandHelp = """
-    MCP commands:
-      /mcp list
-      /mcp enable ID
-      /mcp disable ID
-      /mcp add COMMAND [ARG ...]
-      /mcp add [--name ID] [--env KEY=VALUE] [--cwd PATH] [--timeout SECONDS]
-               [--prefix PREFIX] [--approval MODE] -- COMMAND [ARG ...]
-
-    MODE is automatic, confirm, or dangerous. Quotes and backslash escapes are
-    supported. Without --name, the command's basename becomes the server name.
-    The server is connected immediately, saved in the normal mcpServers
-    configuration, and all of its tools are enabled for every agent.
-
-    Examples:
-      /mcp add r2mcp
-      /mcp add --name weather -- npx -y weather-mcp
-    """
-
-  private static let editHelp = """
-    /edit prompt [NAME]      Edit the prompt called NAME, system or user (current agent's when omitted)
-    /edit system [NAME]      Edit/create a named system prompt (current when omitted)
-    /edit user NAME          Edit/create a user prompt; a builtin's name starts from its text
-    /edit NAME               Edit an existing system or user prompt
-    /edit agent [ID]         Edit a saved agent as JSON (current when omitted)
-    /edit provider [ID]      Edit a configured provider as JSON (current when omitted)
-    /edit compact            Edit the global chat-compaction prompt template
-    /edit memory             Edit this project's durable memory notes
-    /edit memory-prompt      Edit the template /memory learn uses
-    /edit delegation         Edit the brief template child agents receive
-    /edit worker             Edit the instructions of the derived worker agent
-    /edit config             Edit the active configuration file
-    /edit mcps               Edit the configured MCP server list as JSON
-    /edit N|MESSAGE_ID       Edit conversation message N or its full message ID
-    /edit input              Write the next message in the editor and send it
-
-    The compact and memory templates must contain {{transcript}}; {{focus}} and
-    {{memory}} are optional. The delegation template must contain {{task}};
-    {{context}}, {{output}}, {{agent}}, and {{cwd}} are optional.
-    Clearing it restores the built-in default. Uses /set ui.editor when it is
-    set, then $EDITOR, then $VISUAL, then vim. Agent limits and tool-calling
-    strategy apply immediately, and an edited provider is rebuilt in place;
-    other provider, plugin, tool, and MCP changes made through /edit config
-    require a restart.
-
-    A provider's "headers" is an object of names to values or an array of
-    "Name: value" strings, sent with every request. A value may contain
-    {{session}}, which becomes the session id of the chat a request belongs
-    to (/chat session shows it; OpenCode Zen needs it in x-opencode-session).
-    """
-
-  private static let memoryHelp = """
-    Durable notes about you, kept per project in .pmai/memory.md and added to
-    the system prompt of this chat â€” never of the subagents it starts.
-
-      /memory                    Show the notes and how they are configured
-      /memory edit               Edit them in $EDITOR (same as /edit memory)
-      /memory learn [FOCUS]      Fold this chat into the notes, keeping what is known
-      /memory learn --all [FOCUS]  Fold every chat in this project into them
-      /memory add TEXT           Append one note
-      /memory set TEXT           Replace every note
-      /memory clear              Forget everything
-      /memory reload             Re-read the file after editing it elsewhere
-      /memory on|off             Whether the notes reach the model
-      /memory scope MODE         Chats the chats_* tools may read
-
-    MODE is none, project, or all; all crosses working directories. The tools
-    are chats_list, chats_search, chats_read, and chats_read_document; enable
-    them for an agent with /tools enable chats. Edit the learning prompt with
-    /edit memory-prompt.
-    """
-
-  private static let todoHelp = """
-    The project's todo list, kept in .pmai/todo.md as a Markdown task list the
-    agent plans with and ticks off through the todo_list, todo_add, and
-    todo_done tools. It survives across chats, and editing the file by hand
-    is fine: every command and tool call reads it afresh.
-
-      /todo                      Show the list, numbered
-      /todo add TEXT             Append one pending item
-      /todo done NUMBER|TEXT     Mark an item done by number or title fragment
-      /todo remove NUMBER|TEXT   Drop an item by number or title fragment
-      /todo sweep                Remove every completed item
-      /todo edit                 Edit the list in $EDITOR
-      /todo clear                Remove every item
-      /todo path                 Print where the file lives
-
-    Enable the tools for an agent with /tools enable todo.
-    """
-
-  private static let skillsHelp = """
-    Skills are folders holding a SKILL.md whose front matter gives a name and
-    a description and whose body is the instructions to follow: the layout
-    other coding agents use, so their skills work here unchanged. pmai reads
-    the project's .pmai/skills and ~/.pmai/skills (or $PMAI_HOME/skills); a
-    project skill shadows a home one of the same name. Each skill is also a
-    skills_NAME tool the model may call to get the instructions, once it is
-    enabled for the agent.
-
-      /skills                    List skills; * marks the ones the agent may call
-      /skills show NAME          Print a skill's file, tool state, and instructions
-      /skills enable NAME|all    Offer a skill (or every skill) to the current agent
-      /skills disable NAME|all   Stop offering it; /skills prompt still works
-      /skills prompt NAME [TEXT] Send the instructions, then TEXT, as your next message
-      /skills path               Print the directories scanned
-      /skills reload             Rescan the directories (every /skills command does)
-
-    /tools enable skills is the same as /skills enable all and also picks up
-    skills added later. A skill whose front matter says
-    disable-model-invocation: true is never a tool. Where the body says
-    $ARGUMENTS the TEXT goes there; otherwise it follows the instructions.
-    """
-
-  private static let promptHelp = """
-    Prompts. A system prompt is an agent's instructions: every agent takes
-    them from one prompt in the catalog (prompts.system in the configuration),
-    referenced by name in its systemPrompt field; several agents may share
-    one, and editing the prompt updates all of them. A user prompt is a
-    message sent by name (prompts.user), and MaiCore ships builtin ones â€”
-    goal, newapp, tldr, followup â€” that a user prompt of the same name
-    replaces. Skills (/skills) are sent by name the same way, whether or not
-    the agent may call them as tools.
-
-      /prompts                   List every prompt and skill by kind
-      $NAME [TEXT]               Send prompt or skill NAME with TEXT after it: TEXT goes
-                                 where $ARGUMENTS stands, or after the text. For a
-                                 system prompt, switch this agent to it, then send TEXT.
-                                 /prompts NAME [TEXT] is the long form.
-      /prompts show NAME         Print what NAME is or sends
-      /prompts add NAME TEXT     Create a user prompt from one line (set replaces it)
-      /prompts edit NAME         Edit or create a user prompt in $EDITOR (/edit user NAME too)
-      /prompts rm NAME           Drop a user prompt (a builtin it replaced shows again)
-
-      /prompt                    Show the current agent's system prompt
-      /prompt show NAME          Print one system prompt
-      /prompt add NAME TEXT      Create a system prompt from one line (set replaces it)
-      /prompt edit [NAME]        Edit or create one in $EDITOR (current when omitted; /edit system NAME too)
-      /prompt rm NAME            Drop an unused system prompt
-      /prompt use NAME           Point the current agent at a system prompt (/prompt NAME too)
-      /agent prompt ID NAME      Point another saved agent at a system prompt
-      /edit prompt NAME          Edit NAME, whichever kind of prompt it is
-
-    Register an agent around a prompt in two lines:
-      /prompt add reviewer You review diffs and list only real defects.
-      /agent add reviewer - files,run reviewer
-
-    Keep a message you send often as a user prompt:
-      /prompts add commit Write a commit message for the staged changes: $ARGUMENTS
-      $commit one line, imperative mood
-
-    The other templates â€” compact, delegation, worker, memory â€” are edited
-    with /edit compact, /edit delegation, /edit worker, and /edit memory-prompt.
-    """
-
-  private static let agentsHelp = """
-    Agent commands. A definition is a saved setup â€” provider, model, system
-    prompt, tools, and limits â€” that you switch between; a process is one run
-    started from a definition, addressed by its pid.
-
-      /agents                    List definitions, then the running process tree
-      /agents list               Definitions only
-      /agents tree               The running process tree only
-      /agents clear              Forget finished processes, and drop the ones saved with this chat
-      /agents use ID             Switch this chat to a definition
-      /agents show [ID]          Show one definition in full
-      /agents describe ID TEXT   Set the one-line purpose a model reads to pick it
-      /agents enable|disable ID  Park a definition without deleting it
-      /agents acp [list]         List external ACP agents and what is installed
-      /agents acp add NAME [CMD ARG ...]  Register an ACP agent as a usable agent
-
-    Saving and changing definitions, one line each (/agent and /agents both work):
-
-      /agent add NAME MODEL GROUPS PROMPT [PROVIDER [BASE_URL]]
-                                 GROUPS is a,b,c (see /tools) or -; PROMPT names a system
-                                 prompt (see /prompts); PROVIDER defaults to this chat's, and
-                                 with BASE_URL registers a new OpenAI-compatible endpoint
-      /agent tools ID GROUPS     Replace its tool groups (a,b,c), adjust them (+a,-b), or clear (-)
-      /agent model ID MODEL      Change its model (- for the provider default)
-      /agent prompt ID PROMPT    Point it at another named system prompt
-      /agent provider ID PROVIDER  Move it to a configured provider
-      /agent remove ID           Drop it; subagent lists and the default agent are updated
-      /edit agent [ID]           Edit a definition as JSON in $EDITOR (current when omitted)
-
-    A definition's tools are its own, whatever its depth in the tree: give a
-    subagent its groups the same way. Named prompts are managed with /prompt.
-      /agents log PID            Print a running, finished, or saved agent's own transcript
-      /agents stop PID           Pause an agent and everything it started at their next step
-      /agents continue PID       Let a paused agent go on; queued messages reach it then
-      /agents kill PID [REASON]  End an agent and everything it started
-      /agents focus PID|main     Send what you type to one running agent, or back to the chat
-
-    While agents run, what you type is queued for them and read at their next
-    model turn: /queue lists it, @PID TEXT addresses one agent once. Their
-    output prints in blocks prefixed agent#PID; /set ui.subagents picks how much.
-
-    An agent always has the tools its definition allows, at any depth of the
-    tree. /set delegation subagent also lets it hand bulky work to a child with
-    the same tools, so only the answer lands here. /set limits.maxSubagents and
-    /set limits.maxSubagentDepth bound the tree.
-    """
-
-  private static let toolHelp = """
-    Tool group commands:
-      /tools list                    List logical tool groups
-      /tools show GROUP              What the group is for, each tool with its parameters, and its settings
-      /tools enable|disable GROUP    Change the current agent's allowed groups
-      /tools set GROUP OPTION VALUE  Configure a tool group and reload its tools
-      /tools unset GROUP OPTION      Restore an option's default
-
-    Examples:
-      /tools enable github
-      /tools set mastodon mastodonInstance mastodon.social
-      /tools set mastodon mastodonAPIKeyEnvironment MASTODON_API_KEY
-      /tools set mastodon mastodonWriteEnabled on
-    """
-
-  private static func printUsage() {
-    print(
-      """
-      pmai â€” the Pocket Mai command-line agent
-
-      Usage:
-        pmai [options] [message]
-
-      Options:
-        --acp               serve pmai as an ACP agent on stdio (for IDEs)
-        --agent ID          select a configured agent
-        --api-key KEY       prefer an environment variable or config reference
-        --base-url URL      ad-hoc OpenAI-compatible endpoint
-        --config PATH       load plugins, providers, tools, MCPs, agents, and approvals
-        -h, --help          show this help
-        --history PATH      persist editable input history (or PMAI_HISTORY)
-        --home DIR          keep the project index and shared state in DIR (or PMAI_HOME)
-        --image PATH        attach an image (repeatable)
-        -l, --list          list saved chats in this project and exit
-        --markdown          render replies as markdown even when piped
-        --max-subagents N   children an agent may run at once (default 5)
-        --max-tool-calls N  tool calls allowed per agent run (default 100)
-        --max-turns N       model turns allowed per agent run (default 50)
-        --mcp               serve pmai as an MCP server on stdio (one prompt tool)
-        --model NAME        override the selected model
-        --no-markdown       print replies verbatim
-        --no-stream         disable response streaming
-        --plugin PATH       load a native .dylib plugin (repeatable)
-        --print-config      print a complete example configuration
-        --projects          list every project pmai has been started in, then exit
-        --provider ID       override the selected provider
-        -r, --resume [CHAT] reopen CHAT (list index, ID, or title), or the latest chat,
-                            with the agents its runs started
-        --state DIR         keep this project's chats in DIR, not ./.pmai/chats (or PMAI_STATE)
-        --stdin             attach standard input as a text file (git diff | pmai --stdin "review it")
-        --system TEXT       override agent instructions
-        -v, --version       print the pmai version
-        -y, --yolo          permit all tool calls without prompting for this run
-                            (/set yolo on saves the choice for every run)
-
-      Config discovery:
-        --config, PMAI_CONFIG, ./pmai.json, ~/.config/pmai/config.json
-
-      Ad-hoc provider (overrides the selected agent's):
-        PMAI_PROVIDER, PMAI_MODEL, PMAI_BASE_URL, and PMAI_API_KEY, or
-        PMAI_API_KEY_FILE naming a file that holds the key, so the secret
-        never sits in the environment
-
-      Persistent REPL state:
-        Chats belong to the project rooted at the current directory and are
-        kept one file per chat in ./.pmai/chats; ~/.pmai/projects.json lists
-        every project and ~/.pmai/history.json holds the input history.
-
-      Without a config file, the offline hello and OpenAI-compatible providers
-      are registered as before.
-      """)
-  }
-}
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×~ùÛ´èµ©hºÚn¶X§zÍZ[\Ü›Ý[™][Û‚š[\ÜXZPPÔš[\ÜXZPÛÜ™Bš[\ÜXZQØÝ[Y[Âš[\ÜXZSPÔš[\ÜXZSX\šÙÝÛ‚š[\ÜXZSÜ[RBš[\ÜXZTYÚ[’ÜÝš[\ÜXZTÝ[™\™ÛÛÂš[\ÜXZUš\Ú[Û“ÐÔ‚‚ˆÚYˆPRWÒT×Õ’TÕPSˆ[\ÜXZUš\ÝX[ˆÙ[™Y‚‚ˆÚYˆØ[’[\Ü
+[™›ÚY
+Bˆ[\Ü[™›ÚYˆÙ[ÙZYˆØ[’[\Ü
+]\Û
+Bˆ[\Ü]\ÛˆÙ[ÙZYˆØ[’[\Ü
+ÛX˜ÊBˆ[\ÜÛX˜ÂˆÙ[ÙZYˆØ[’[\Ü
+\Ú[ŠBˆ[\Ü\Ú[‚ˆÙ[™Y‚‚ÜÚ[Ù[—Û˜[YJœÞ\Ý[HŠBœš]˜]H[˜ÈÜÚ^Þ\Ý[JÈÛÛ[X[™ˆ[œØY™TÚ[\ÐÚ\ŠHOˆÒ[‚‹ËËÈÝÚY\ØÛÝ™\œÈ\™Ýˆœ›ÛHH[š]X[›ØÙ\ÜÈÝXÚÈÛˆSˆ\™Ù]ËˆB‹ËËÈ^HÝÜ™HZ[Ùˆ\›]^™\Ù\™\È\™Ý–ÌK[œÙ\ÈH^XÝ]X›H]‹ËËÈ\™Ý–ÌWK[™Ý\È[™›ÚY	ÜÈ[šÙ\‹ˆš[ÛšXÈÚÚ\ÈH™\Ù\™Y\™Ý–ÌB‹ËËÈ™Y›Ü™HØ[[™ÈÈXZ[‹]ÝÚYÝ[š[™È]ÛˆH[š]X[ÝXÚË‚œš]˜]H[˜È]›Ü›PÛÛ[X[™[™P\™Ý[Y[Ê[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×JHOˆÔÝš[™×HÂˆ˜\ˆ\™Ý[Y[ÈHÛÛ[X[™[™K˜\™Ý[Y[ÂˆÚYˆØ[’[\Ü
+[™›ÚY
+BˆÝX\™\™Ý[Y[Ë˜ÛÝ[Hˆ[ÙHÈ™]\›ˆ\™Ý[Y[ÈB‚ˆYˆ[š\›Û›Y[È•T“UVÑVP××Ô“Ð×ÔÑS—ÑVH—HOHš[Âˆ\™Ý[Y[Ëœ™[[Ý™Qš\œÝ
+
+BˆH[ÙHÂˆËÈ[ÛÈÝ\Ü[›ÚÚ[™ÈH[™›ÚY[šÙ\ˆ^XÚ]KÝ]ÚYHBˆËÈ\›]^Y^XÈÜ˜\\‹‚ˆ]š\œÝHT“
+š[UT“Ú]]ˆ\™Ý[Y[ÖÌJK›\Ý]ÛÛ\Û™[ˆYˆš\œÝOH›[šÙ\ˆˆš\œÝOH›[šÙ\ˆÂˆ\™Ý[Y[Ëœ™[[Ý™Qš\œÝ
+
+BˆBˆBˆÙ[™Y‚ˆ™]\›ˆ\™Ý[Y[ÂŸB‚œš]˜]HÝXÝÓSÜ[ÛœÈÂˆ˜\ˆÛÛ™šYÔ]ˆÝš[™ÏÂˆËËÈ›ÛÝÛ[™ÈH›Ú™XÝ[™^[™Ú\™YÝ]NÈš[›ÛÝÜÈPRWÒÓQHÜˆ‹ËœXZK‚ˆ˜\ˆÛYT]ˆÝš[™ÏÂˆËËÈ\™XÝÜžHÛ[™È\È›Ú™XÝ	ÜÈÚ]š[\ÎÈš[\Ù\ÈœXZKØÚ]È[ˆH›Ú™XÝ‚ˆ˜\ˆÝ]T]ˆÝš[™ÏÂˆ˜\ˆ\ÝÜžT]ˆÝš[™ÏÂˆ˜\ˆYÙ[Ý™\œšYNˆÝš[™ÏÂˆ˜\ˆ›ÝšY\“Ý™\œšYNˆ›ÝšY\’QÂˆ˜\ˆ[Ù[Ý™\œšYNˆÝš[™ÏÂˆ˜\ˆ˜\ÙUT“Ý™\œšYNˆT“Âˆ˜\ˆ\RÙ^SÝ™\œšYNˆÝš[™ÏÂˆ˜\ˆÞ\Ý[SÝ™\œšYNˆÝš[™ÏÂˆ˜\ˆX^ÛÛØ[Îˆ[Âˆ˜\ˆX^[Ù[\›œÎˆ[Âˆ˜\ˆX^ÝX˜YÙ[Îˆ[Âˆ˜\ˆÝ™X[HHYBˆËËÈ\›Z][ÛÛØ[ÈÚ]Ý]›Û\[™È›Üˆ\È›ØÙ\ÜË‚ˆ˜\ˆ[ÛÈH˜[ÙBˆËËÈ™[Ü[ˆH[ÜÝ™XÙ[H\]YÚ][œÝXYÙˆÝ\[™ÈHœ™\ÚÛ™K‚ˆ˜\ˆ™\Ý[YHH˜[ÙBˆËËÈHÚ]\Ý[™^URQ™Yš^Üˆ]HÈ™[Ü[‹‚ˆ˜\ˆ™\Ý[YTÙ[XÝÜŽˆÝš[™ÏÂˆËËÈ™[™\ˆ™\Y\È\ÈX\šÙÝÛŽÈš[›ÛÝÜÈHÛÛ™šYÝ\˜][Ûˆ[™HK‚ˆ˜\ˆX\šÙÝÛŽˆ›ÛÛÂˆ˜\ˆ[XYÙT]ÎˆÔÝš[™×HH×BˆËËÈ]XÚÚ]\œš]™\ÈÛˆÝ[™\™[œ]\ÈH^š[K›ÜˆÛ™K[[™\œÂˆËËÈÝXÚ\ÈÚ]Y™ˆXZHK\Ý[ˆœ™]šY]È\È˜‚ˆ˜\ˆ™XYÝ[ˆH˜[ÙBˆ˜\ˆYÚ[”]ÎˆÔÝš[™×HH×Bˆ˜\ˆ[š]X[›Û\ˆÝš[™ÏÂˆ˜\ˆš[ÛÛ™šYÈH˜[ÙBˆËËÈ\Ý]™\žHÛ›ÝÛˆ›Ú™XÝ[™^]‚ˆ˜\ˆ\Ý›Ú™XÝÈH˜[ÙBˆËËÈ\Ý\È›Ú™XÝ	ÜÈØ]™YÚ]È[™^]‚ˆ˜\ˆ\ÝÚ]ÈH˜[ÙBˆËËÈÙ\™HÛ™H›ÝØÛÛÛˆÝ[È[œÝXYÙˆH‘T‚ˆ˜\ˆÙ\™NˆÙ\™S[ÙOÂ‚ˆ[š]
+\™Ý[Y[ÎˆÔÝš[™×K[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×JH›ÝÜÈÂˆÛÛ™šYÔ]H[š\›Û›Y[È”PRWÐÓÓ‘’QÈ—BˆÝ]T]H[š\›Û›Y[È”PRWÔÕUH—Bˆ\ÝÜžT]H[š\›Û›Y[È”PRWÒTÕÔ–H—Bˆ˜\ˆÜÚ][Û˜[ˆÔÝš[™×HH×Bˆ˜\ˆ[™^HˆÚ[H[™^\™Ý[Y[Ë˜ÛÝ[Âˆ]\™Ý[Y[H\™Ý[Y[ÖÚ[™^BˆÝÚ]Ú\™Ý[Y[ÂˆØ\ÙH‹KXÛÛ™šYÈŽ‚ˆÛÛ™šYÔ]HžHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆØ\ÙH‹K\Ý]HŽ‚ˆÝ]T]HžHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆØ\ÙH‹KZ\ÝÜžHŽ‚ˆ\ÝÜžT]HžHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆØ\ÙH‹KZÛYHŽ‚ˆÛYT]HžHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆØ\ÙH‹K\›Ú™XÝÈŽ‚ˆ\Ý›Ú™XÝÈHYBˆØ\ÙH‹[‹‹K[\ÝŽ‚ˆ\ÝÚ]ÈHYBˆØ\ÙH‹KXYÙ[Ž‚ˆYÙ[Ý™\œšYHHžHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆØ\ÙH‹K\›ÝšY\ˆŽ‚ˆ›ÝšY\“Ý™\œšYHH›ÝšY\’Q
+žHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+JBˆØ\ÙH‹K[[Ù[Ž‚ˆ[Ù[Ý™\œšYHHžHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆØ\ÙH‹KX˜\ÙK]\›Ž‚ˆ]˜[YHHžHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆÝX\™]\›HT“
+Ýš[™Îˆ˜[YJH[ÙHÈ›ÝÈÓQ\œ›Ü‹š[˜[YT“
+˜[YJHBˆ˜\ÙUT“Ý™\œšYHH\›ˆØ\ÙH‹KX\KZÙ^HŽ‚ˆ\RÙ^SÝ™\œšYHHžHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆØ\ÙH‹K\Þ\Ý[HŽ‚ˆÞ\Ý[SÝ™\œšYHHžHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆØ\ÙH‹K[X^]ÛÛXØ[ÈŽ‚ˆX^ÛÛØ[ÈHžHÙ[‹˜ÛÝ[
+Y\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆØ\ÙH‹K[X^]\›œÈ‹‹K[X^[[Ù[]\›œÈŽ‚ˆX^[Ù[\›œÈHžHÙ[‹˜ÛÝ[
+Y\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆØ\ÙH‹K[X^\ÝX˜YÙ[ÈŽ‚ˆX^ÝX˜YÙ[ÈHžHÙ[‹˜ÛÝ[
+Y\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆØ\ÙH‹KZ[XYÙHŽ‚ˆ[XYÙT]Ë˜\[™
+žHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+JBˆØ\ÙH‹K\Ý[ˆŽ‚ˆ™XYÝ[ˆHYBˆØ\ÙH‹K\YÚ[ˆŽ‚ˆYÚ[”]Ë˜\[™
+žHÙ[‹˜[YJY\Žˆ\™Ý[Y[[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+JBˆØ\ÙH‹K[›Ë\Ý™X[HŽ‚ˆÝ™X[HH˜[ÙBˆØ\ÙH‹^H‹‹K^[ÛÈŽ‚ˆ[ÛÈHYBˆØ\ÙH‹\ˆ‹‹K\™\Ý[YH‹‹KXÛÛ[YHŽ‚ˆ™\Ý[YHHYBˆYˆ[™^
+ÈH\™Ý[Y[Ë˜ÛÝ[X\™Ý[Y[ÖÚ[™^
+ÈWKš\Ô™Yš^
+‹HŠHÂˆ[™^
+ÏHBˆ™\Ý[YTÙ[XÝÜˆH\™Ý[Y[ÖÚ[™^BˆBˆØ\ÙH‹K[X\šÙÝÛˆŽ‚ˆX\šÙÝÛˆHYBˆØ\ÙH‹K[›Ë[X\šÙÝÛˆŽ‚ˆX\šÙÝÛˆH˜[ÙBˆØ\ÙH‹K\š[XÛÛ™šYÈŽ‚ˆš[ÛÛ™šYÈHYBˆØ\ÙH‹KXXÜŽ‚ˆÙ\™HH˜XÜˆØ\ÙH‹K[XÜŽ‚ˆÙ\™HH›XÜˆY˜][‚ˆÝX\™X\™Ý[Y[š\Ô™Yš^
+‹HŠH[ÙHÈ›ÝÈÓQ\œ›Ü‹[šÛ›ÝÛ“Ü[ÛŠ\™Ý[Y[
+HBˆÜÚ][Û˜[˜\[™
+\™Ý[Y[
+BˆBˆ[™^
+ÏHBˆBˆYˆ\ÜÚ][Û˜[š\Ñ[\HÈ[š]X[›Û\HÜÚ][Û˜[š›Ú[™Y
+Ù\\˜]ÜŽˆˆŠHBˆYˆ™XYÝ[‹Ù\™HOHš[È›ÝÈÓQ\œ›Ü‹œÝ[”Ù\™\Ô›ÝØÛÛBˆB‚ˆš]˜]HÝ]XÈ[˜È˜[YJˆY\ˆÜ[ÛŽˆÝš[™Ëˆ[ˆ\™Ý[Y[ÎˆÔÝš[™×Kˆ[™^ˆ[›Ý][ˆ
+H›ÝÜÈOˆÝš[™ÈÂˆ[™^
+ÏHBˆÝX\™[™^\™Ý[Y[Ë˜ÛÝ[[ÙHÈ›ÝÈÓQ\œ›Ü‹›Z\ÜÚ[™Õ˜[YJÜ[ÛŠHBˆ™]\›ˆ\™Ý[Y[ÖÚ[™^BˆB‚ˆš]˜]HÝ]XÈ[˜ÈÛÝ[
+ˆY\ˆÜ[ÛŽˆÝš[™Ëˆ[ˆ\™Ý[Y[ÎˆÔÝš[™×Kˆ[™^ˆ[›Ý][ˆ
+H›ÝÜÈOˆ[Âˆ]˜]ÈHžH˜[YJY\ŽˆÜ[Û‹[Žˆ\™Ý[Y[Ë[™^ˆ	š[™^
+BˆÝX\™]ÛÝ[H[
+˜]ÊKÛÝ[H[ÙHÈ›ÝÈÓQ\œ›Ü‹š[˜[YÛÝ[
+Ü[Û‹˜]ÊHBˆ™]\›ˆÛÝ[ˆB‚ˆËËÈ\Y\ÈÛÛ[X[™[[™H[ˆ[Z]ÈÛˆÜÙˆHÛÛ™šYÝ\™YYÙ[‚ˆ[˜È\S[Z]Ý™\œšY\ÊÈ[Z]Îˆ[›Ý]YÙ[[“[Z]ÊHÂˆYˆ]X^ÛÛØ[ÈÈ[Z]Ë›X^ÛÛØ[ÈHX^
+X^ÛÛØ[ÊHBˆYˆ]X^[Ù[\›œÈÈ[Z]Ë›X^[Ù[\›œÈHX^
+KX^[Ù[\›œÊHBˆYˆ]X^ÝX˜YÙ[ÈÈ[Z]Ë›X^ÝX˜YÙ[ÈHX^
+X^ÝX˜YÙ[ÊHBˆBŸB‚‹ËËÈH›ÝØÛÛXZHÜXZÜÈÝ™\ˆÝ[È[œÝXYÙˆ[›š[™È]È‘T‚™[[HÙ\™S[ÙNˆÝš[™ËÙ[™X›HÂˆØ\ÙHXÜˆØ\ÙHXÜŸB‚œš]˜]H[[HÓQ\œ›ÜŽˆØØ[^™Y\œ›ÜˆÂˆØ\ÙH[˜[YT“
+Ýš[™ÊBˆØ\ÙHZ\ÜÚ[™Õ˜[YJÝš[™ÊBˆØ\ÙH[šÛ›ÝÛ“Ü[ÛŠÝš[™ÊBˆØ\ÙH[šÛ›ÝÛÚ]
+Ýš[™ÊBˆØ\ÙH[˜[YÛÝ[
+Ýš[™ËÝš[™ÊBˆØ\ÙHÛÛ™šYÓ›Ý›Ý[™
+Ýš[™ÊBˆØ\ÙH›Ô›ÝšY\‚ˆØ\ÙH›Ô›Ú™XÝˆØ\ÙH[˜[Y[XYÙJÝš[™ÊBˆØ\ÙH\Ñ\™XÝÜžJÝš[™ÊBˆØ\ÙHZ\ÜÚ[™Ñ›Û\ŠÝš[™ÊBˆØ\ÙHÝ[”Ù\™\Ô›ÝØÛÛˆØ\ÙHÝ[•Ú]Ý]\›Z[˜[ˆØ\ÙH\RÙ^TÛÝ\˜Ù\ÐÛÛ™›XÝ‚ˆ˜\ˆ\œ›Ü‘\ØÜš\[ÛŽˆÝš[™ÏÈÂˆÝÚ]ÚÙ[ˆÂˆØ\ÙH››Ô›Ú™XÝˆ“›È›Ú™XÝ\ÈÜ[‹ˆ‚ˆØ\ÙHœÝ[”Ù\™\Ô›ÝØÛÛ‚ˆ‹K\Ý[ˆØ[››Ý™HÛÛXš[™YÚ]KXXÜÜˆK[XÜˆ^HÝÛˆÝ[™\™[œ]ˆ‚ˆØ\ÙH˜\RÙ^TÛÝ\˜Ù\ÐÛÛ™›XÝˆ”Ù]PRWÐTWÒÑVHÜˆPRWÐTWÒÑVWÑ’SK›Ý›Ýˆ‚ˆØ\ÙHœÝ[•Ú]Ý]\›Z[˜[‚ˆ‹K\Ý[ˆØ\È™XY]\™H\È›È\›Z[˜[›ÜˆH‘TÈÚ]™HHY\ÜØYÙHÛˆHÛÛ[X[™[™Kˆ‚ˆØ\ÙHš[˜[YT“
+]˜[YJNˆ’[˜[YT“ˆ
+˜[YJH‚ˆØ\ÙH›Z\ÜÚ[™Õ˜[YJ]Ü[ÛŠNˆ“Z\ÜÚ[™È˜[YHY\ˆ
+Ü[ÛŠKˆ‚ˆØ\ÙH[šÛ›ÝÛ“Ü[ÛŠ]Ü[ÛŠNˆ•[šÛ›ÝÛˆÜ[ÛŽˆ
+Ü[ÛŠH‚ˆØ\ÙH[šÛ›ÝÛÚ]
+]Ù[XÝÜŠNˆ“›ÈÚ]X]Ú\È	×
+Ù[XÝÜŠIËˆ[ˆXZH[È\ÝÚ]Ëˆ‚ˆØ\ÙHš[˜[YÛÝ[
+]Ü[Û‹]˜[YJN‚ˆ—
+Ü[ÛŠH^XÝÈH›Û‹[™YØ]]™H[YÙ\‹ÛÝ	×
+˜[YJIËˆ‚ˆØ\ÙH˜ÛÛ™šYÓ›Ý›Ý[™
+]]
+NˆÛÛ™šYÝ\˜][Ûˆš[H›Ý›Ý[™ˆ
+]
+H‚ˆØ\ÙH››Ô›ÝšY\Žˆ“›È›ÝšY\ˆ\ÈÛÛ™šYÝ\™Yˆ‚ˆØ\ÙHš[˜[Y[XYÙJ]]
+Nˆ•[˜X›HÈØY[XYÙNˆ
+]
+H‚ˆØ\ÙHš\Ñ\™XÝÜžJ]]
+Nˆ—
+]
+H\ÈH›Û\ŽÈÚ]™HHš[H˜[YKˆ‚ˆØ\ÙH›Z\ÜÚ[™Ñ›Û\Š]]
+Nˆ•H›Û\ˆ
+]
+HÙ\È›Ý^\ÝÈÜ™X]H]š\œÝˆ‚ˆBˆBŸB‚œš]˜]H[[HPÔÛÛ[X[™\œ›ÜŽˆØØ[^™Y\œ›ÜˆÂˆØ\ÙHZ\ÜÚ[™ÒQˆØ\ÙH[˜[YQ
+Ýš[™ÊBˆØ\ÙH\XØ]RQ
+Ýš[™ÊBˆØ\ÙHZ\ÜÚ[™ÐÛÛ[X[™ˆØ\ÙHZ\ÜÚ[™ÓÜ[Û•˜[YJÝš[™ÊBˆØ\ÙH[˜[YÜ[ÛŠÝš[™ÊBˆØ\ÙH[˜[Y[š\›Û›Y[ˆØ\ÙH[˜[Y[Y[Ý]ˆØ\ÙH[˜[Y\›Ý˜[ˆØ\ÙH[\›Z[˜]Y][ÝBˆØ\ÙH[™Û[™Ñ\ØØ\B‚ˆ˜\ˆ\œ›Ü‘\ØÜš\[ÛŽˆÝš[™ÏÈÂˆÝÚ]ÚÙ[ˆÂˆØ\ÙH›Z\ÜÚ[™ÒQˆÛÝ[›Ý[™™\ˆ[ˆPÔ˜[YHœ›ÛHHÛÛ[X[™ˆ\ÙHK[˜[YHQˆ‚ˆØ\ÙHš[˜[YQ
+]Y
+N‚ˆ’[˜[YPÔ˜[YH	×
+Y
+IËˆÝ\Ú]H]\ˆÜˆ[X™\ŽÈ‚ˆ
+È[ˆ\ÙH]\œË[X™\œË	Ë‰Ë	×ÉËÜˆ	ËIËˆ‚ˆØ\ÙH™\XØ]RQ
+]Y
+Nˆ[ˆPÔÙ\™\ˆ˜[YY	×
+Y
+IÈ\È[™XYHÛÛ™šYÝ\™Yˆ‚ˆØ\ÙH›Z\ÜÚ[™ÐÛÛ[X[™ˆ•HÝ[ÈPÔÛÛ[X[™\ÈZ\ÜÚ[™Ëˆ‚ˆØ\ÙH›Z\ÜÚ[™ÓÜ[Û•˜[YJ]Ü[ÛŠNˆ“Z\ÜÚ[™È˜[YHY\ˆ
+Ü[ÛŠKˆ‚ˆØ\ÙHš[˜[YÜ[ÛŠ]Ü[ÛŠNˆ•[šÛ›ÝÛˆPÔÜ[Ûˆ	×
+Ü[ÛŠIËˆ‚ˆØ\ÙHš[˜[Y[š\›Û›Y[ˆ‹KY[ˆ^XÝÈÑVOUSQKˆ‚ˆØ\ÙHš[˜[Y[Y[Ý]ˆ‹K][Y[Ý]^XÝÈHÜÚ]]™H[X™\ˆÙˆÙXÛÛ™Ëˆ‚ˆØ\ÙHš[˜[Y\›Ý˜[ˆ‹KX\›Ý˜[^XÝÈ]]ÛX]XËÛÛ™š\›KÜˆ[™Ù\›Ý\Ëˆ‚ˆØ\ÙH[\›Z[˜]Y][ÝNˆ•HÛÛ[X[™ÛÛZ[œÈ[ˆ[\›Z[˜]Y][ÝKˆ‚ˆØ\ÙH™[™Û[™Ñ\ØØ\Nˆ•HÛÛ[X[™[™ÈÚ][ˆ[˜ÛÛ\]H\ØØ\Kˆ‚ˆBˆBŸB‚œš]˜]HÝXÝ[[YTÙ]\Âˆ˜\ˆØ][ÙÜÎˆÓPÔÙ\™\Ø][Ù×Bˆ˜\ˆ[\XÚ]›ÝšY\œÎˆÐÛÛ™šYÝ\™Y›ÝšY\—HH×Bˆ˜\ˆ›ÝšY\˜\ÙUT“ÎˆÔÝš[™ÎˆT“HHÎ—BŸB‚œš]˜]H[˜È[š\›Û›Y[˜[YJˆÈ˜[Y\ÎˆÔÝš[™×Kˆ[ˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×BŠHOˆÝš[™ÏÈÂˆ˜[Y\Ë›^žK˜ÛÛ\XÝX\È[š\›Û›Y[ÉHK™š\œÝÈIš\Ñ[\HBŸB‚‹ËËÈ[›ZÙHHÝ\ˆYZØÈÙ][™ÜË[ˆ^XÚ]H^ÜY[\HTHÙ^H\Â‹ËËÈYX[š[™Ù[ˆ]Ý\™\ÜÙ\ÈÝÙ\‹\š[Üš]H[X\Ù\È[™ÛÛ™šYÝ\™YÙXÜ™]Ë‚‹ËËÈPRWÐTWÒÑVWÑ’SX˜[Y\ÈHš[HÛ[™ÈHÙ^H[œÝXYÛÈHÙXÜ™]‹ËËÈ]Ù[ˆ™]™\ˆÚ]È[ˆH[š\›Û›Y[È]^ÛY\ÈPRWÐTWÒÑVX‚œš]˜]H[˜È[š\›Û›Y[TRÙ^J[ˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×JH›ÝÜÈOˆÝš[™ÏÈÂˆ]Ù^Qš[HBˆ[š\›Û›Y[È”PRWÐTWÒÑVWÑ’SH—OËš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHÏÈˆ‚ˆYˆZÙ^Qš[Kš\Ñ[\HÂˆÝX\™[š\›Û›Y[È”PRWÐTWÒÑVH—HOHš[[ÙHÈ›ÝÈÓQ\œ›Ü‹˜\RÙ^TÛÝ\˜Ù\ÐÛÛ™›XÝBˆ™]\›ˆžHÛÛ™šYÝ\™Y›ÝšY\‹˜\RÙ^Jœ›ÛQš[NˆÙ^Qš[JBˆBˆ›Üˆ˜[YH[ˆÈ”PRWÐTWÒÑVH‹“PRWÐTWÒÑVH‹“ÔSRWÐTWÒÑVH—HÂˆYˆ]˜[YHH[š\›Û›Y[Û˜[YWHÈ™]\›ˆ˜[YHBˆBˆ™]\›ˆš[ŸB‚œš]˜]H[˜È[š\›Û›Y[˜[YJˆÈ˜[Y\ÎˆÔÝš[™×Kˆ[ˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×BŠHOˆÝš[™ÏÈÂˆ˜[Y\Ë™š\œÝÈ[š\›Û›Y[ÉK›X\ÈIš\Ñ[\HHÏÈ˜[ÙHBŸB‚‹ËËÈÚ]Ýš\ÝX[™YYÈ™^[Û™H‘TÙ\ÜÚ[Ûˆ]Ù[‹‚œš]˜]Hš[˜[Û\ÜÈ›ÝšY\˜\ÙUT“ÝÜ™Nˆ[˜ÚXÚÙYÙ[™X›HÂˆš]˜]H]ØÚÈH”ÓØÚÊ
+Bˆš]˜]H˜\ˆ\›ÎˆÔÝš[™ÎˆT“B‚ˆ[š]
+È\›ÎˆÔÝš[™ÎˆT“JHÂˆÙ[‹\›ÈH\›ÂˆB‚ˆ[˜È\›
+›Üˆ›ÝšY\’QˆÝš[™ÊHOˆT“ÈÂˆØÚËÚ]ØÚÈÈ\›ÖÜ›ÝšY\’QHBˆB‚ˆ[˜ÈÙ]
+È\›ˆT“›Üˆ›ÝšY\’QˆÝš[™ÊHÂˆØÚËÚ]ØÚÈÈ\›ÖÜ›ÝšY\’QHH\›BˆB‚ˆ[˜ÈÛ˜\ÚÝ
+
+HOˆÔÝš[™ÎˆT“HÂˆØÚËÚ]ØÚÈÈ\›ÈBˆBŸB‚œš]˜]HÝXÝš\ÝX[œšYÙHÂˆ˜\ˆ\›Ý˜[[™\Žˆ\›Z[˜[\›Ý˜[[™\‚ˆ˜\ˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏÂˆ˜\ˆ[\XÚ]›ÝšY\œÎˆÐÛÛ™šYÝ\™Y›ÝšY\—Bˆ˜\ˆ›ÝšY\˜\ÙUT“Îˆ›ÝšY\˜\ÙUT“ÝÜ™Bˆ˜\ˆY[[ÜžNˆY[[ÜžTÝ]Bˆ˜\ˆÙÎˆÙÔÝ]Bˆ˜\ˆÚÚ[ÎˆÚÚ[Ý]BˆËËÈÚÙ[œËÜÈ[™[YH[ˆ\ÙH\ˆ›ÝšY\Ž›[Ù[Ú\™YÚ]H[[YK‚ˆ˜\ˆ\ØYÙTÝ]Îˆ[Ù[\ØYÙTÝÜ™BŸB‚‹ËËÈÚ\™HHÝ\œ™[›Ú™XÝ	ÜÈÙÈ\Ý]™\ËˆHÙ×Ê˜ÛÛÈ\™B‹ËËÈ™YÚ\Ý\™Y™Y›Ü™HH›Ú™XÝ\ÈÜ[™YÛÈ^H™\ÛÛ™HHš[H›ÝYÚ‹ËËÈ\È›ÞÛˆ]™\žHØ[ÈHš[H]Ù[ˆ\ÈHÛ›HÛÜK™XYœ™\ÚXXÚ‹ËËÈ[YHÛÈY]ÈXYH[ˆ[ˆY]Üˆ\™HÙY[ˆ]Û˜ÙK‚œš]˜]Hš[˜[Û\ÜÈÙÔÝ]Nˆ[˜ÚXÚÙYÙ[™X›HÂˆš]˜]H]ØÚÈH”ÓØÚÊ
+Bˆš]˜]H]ÛYNˆYÙ[ÛYBˆš]˜]H˜\ˆ›Ú™XÝˆYÙ[›Ú™XÝÂ‚ˆ[š]
+ÛYNˆYÙ[ÛYJHÂˆÙ[‹šÛYHHÛYBˆB‚ˆ[˜È›ØÝ\Ê›Ú™XÝˆYÙ[›Ú™XÝ
+HÂˆØÚËÚ]ØÚÈÈÙ[‹œ›Ú™XÝH›Ú™XÝBˆB‚ˆ˜\ˆ\›ˆT“ÈÂˆØÚËÚ]ØÚÈÈ›Ú™XÝ›X\ÈÛYKÙÕT“
+›ÜŽˆ	
+HHBˆB‚ˆ˜\ˆÝ\œ™[ˆYÙ[ÙÓ\ÝÂˆ\›™›]X\ÈžOÈYÙ[ÙÓ\Ý›ØY
+œ›ÛNˆ	
+HHÏÈYÙ[ÙÓ\Ý
+
+BˆB‚ˆ[˜ÈØ]™JÈ\ÝˆYÙ[ÙÓ\Ý
+H›ÝÜÈÂˆÝX\™]\›[ÙHÈ›ÝÈÓQ\œ›Ü‹››Ô›Ú™XÝBˆžH\ÝœØ]™JÎˆ\›
+BˆBŸB‚‹ËËÈÚ\™HÚÚ[È\™H™XYœ›ÛNˆH›Ú™XÝ	ÜÈœXZKÜÚÚ[Ø[ˆB‹ËËÈÚÚ[Ø›Û\ˆ[™\ˆHÛYKˆHÚÚ[×Ê˜ÛÛÈ\™H™YÚ\Ý\™Y™Y›Ü™B‹ËËÈH›Ú™XÝ\ÈÜ[™YÛÈ[[[ˆHÝ\\™XÝÜžHÝ[™È[ˆ›Ü‚‹ËËÈ]È]™\žH\Ý[™È[™Ø[™XYÈHÒÒS›Yš[\ÈYœ™\Ú‚œš]˜]Hš[˜[Û\ÜÈÚÚ[Ý]Nˆ[˜ÚXÚÙYÙ[™X›HÂˆš]˜]H]ØÚÈH”ÓØÚÊ
+Bˆš]˜]H]ÛYNˆYÙ[ÛYBˆš]˜]H˜\ˆ›Ú™XÝˆYÙ[›Ú™XÝÂ‚ˆ[š]
+ÛYNˆYÙ[ÛYJHÂˆÙ[‹šÛYHHÛYBˆB‚ˆ[˜È›ØÝ\Ê›Ú™XÝˆYÙ[›Ú™XÝ
+HÂˆØÚËÚ]ØÚÈÈÙ[‹œ›Ú™XÝH›Ú™XÝBˆB‚ˆËËÈH›Ú™XÝ	ÜÈ\™XÝÜžHš\œÝÛÈ]ÈÚÚ[ÈÚYÝÈHÛYIÜË‚ˆ˜\ˆ\™XÝÜšY\ÎˆÕT“HÂˆ]ØØ[BˆØÚËÚ]ØÚÈÈ›Ú™XÝ›X\ÈÛYKœÚÚ[ÕT“
+›ÜŽˆ	
+HHBˆÏÈT“
+š[UT“Ú]]ˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]\Ñ\™XÝÜžNˆYJBˆ˜\[™[™Ô]ÛÛ\Û™[
+YÙ[ÛYK™\™XÝÜžS˜[YK\Ñ\™XÝÜžNˆYJBˆ˜\[™[™Ô]ÛÛ\Û™[
+YÙ[ÛYKœÚÚ[Ñ\™XÝÜžS˜[YK\Ñ\™XÝÜžNˆYJBˆ™]\›ˆÛØØ[\Ù\‘\™XÝÜžWBˆB‚ˆ˜\ˆ\Ù\‘\™XÝÜžNˆT“ÈÛYKœÚÚ[Ñ\™XÝÜžUT“B‚ˆ˜\ˆØ][ÙÎˆYÙ[ÚÚ[Ø][ÙÈÈYÙ[ÚÚ[Ø][ÙË›ØY
+\™XÝÜšY\Îˆ\™XÝÜšY\ÊHBŸB‚‹ËËÈ]™\ž][™ÈHY[[ÜžH™X]\™H™YYÈ]Ý]]™\ÈÛ™HÛÛ[X[™ˆÚ\™HB‹ËËÈ›Ý\È\™HÝÜ™YÚXÚÚ]ÈHÚ]×Ê˜ÛÛÈX^H™XXÚ[™ÝÈ˜\‹‚‹ËËÈH‘TÙY\È]Ý\œ™[ÈÛÛ[X[™È[™ÛÛÈ™XY]‚‹ËËÂ‹ËËÈH›Ú™XÝ\œš]™\ÈY\ˆH[[YH\ÈZ[ÛÈHÛÛÈ\™H™YÚ\Ý\™Y‹ËËÈYØZ[œÝ\È›Þ˜]\ˆ[ˆYØZ[œÝH›Ú™XÝ^HØ[››ÝÙYHY]‚œš]˜]Hš[˜[Û\ÜÈY[[ÜžTÝ]Nˆ[˜ÚXÚÙYÙ[™X›HÂˆš]˜]H]ØÚÈH”ÓØÚÊ
+Bˆš]˜]H]ÛYNˆYÙ[ÛYBˆš]˜]H˜\ˆ›Ú™XÝˆYÙ[›Ú™XÝÂˆš]˜]H˜\ˆÝ\œ™[Ú]QˆURQÂˆš]˜]H˜\ˆY[[ÜžHHYÙ[Y[[ÜžJ
+Bˆš]˜]H˜\ˆÙ][™ÜÈHÛÛ™šYÝ\™YY[[ÜžJ
+B‚ˆ[š]
+ÛYNˆYÙ[ÛYJHÂˆÙ[‹šÛYHHÛYBˆB‚ˆËËÈYÜÈH›Ú™XÝÚÜÙHY[[ÜžH\È\ËØY[™È]È›Ý\Èœ›ÛH\ÚË‚ˆ[˜ÈYÜ
+›Ú™XÝˆYÙ[›Ú™XÝÙ][™ÜÎˆÛÛ™šYÝ\™YY[[ÜžJHÂˆØÚËÚ]ØÚÈÂˆÙ[‹œ›Ú™XÝH›Ú™XÝˆÙ[‹œÙ][™ÜÈHÙ][™ÜÂˆY[[ÜžHH
+žOÈYÙ[Y[[ÜžK›ØY
+œ›ÛNˆÛYK›Y[[ÜžUT“
+›ÜŽˆ›Ú™XÝ
+JJHÏÈYÙ[Y[[ÜžJ
+BˆBˆB‚ˆ[˜È›ØÝ\Ê›Ú™XÝˆYÙ[›Ú™XÝÚ]QˆURQÊHÂˆØÚËÚ]ØÚÈÂˆÙ[‹œ›Ú™XÝH›Ú™XÝˆÝ\œ™[Ú]QHÚ]QˆBˆB‚ˆ[˜È\JÈÙ][™ÜÎˆÛÛ™šYÝ\™YY[[ÜžJHÂˆØÚËÚ]ØÚÈÈÙ[‹œÙ][™ÜÈHÙ][™ÜÈBˆB‚ˆ˜\ˆÝ\œ™[ˆYÙ[Y[[ÜžHÈØÚËÚ]ØÚÈÈY[[ÜžHHBˆ˜\ˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\™YY[[ÜžHÈØÚËÚ]ØÚÈÈÙ][™ÜÈHBˆ˜\ˆ™XYÓÝ\Ú]Îˆ›ÛÛÈØÚËÚ]ØÚÈÈÙ][™ÜËœØÛÜHOH››Û™HHB‚ˆ˜\ˆ\›ˆT“ÈÂˆØÚËÚ]ØÚÈÈ›Ú™XÝ›X\ÈÛYK›Y[[ÜžUT“
+›ÜŽˆ	
+HHBˆB‚ˆËËÈÚ]H[[YHÚÝ[[š™XÝÜˆš[Ú[ˆY[[ÜžH\ÈÙ™ˆÜˆ[\K‚ˆ˜\ˆ›Û\ÙXÝ[ÛŽˆÝš[™ÏÈÂˆØÚËÚ]ØÚÈÈÙ][™ÜË™[˜X›YÈY[[ÜžKœ›Û\ÙXÝ[Ûˆˆš[BˆB‚ˆ[˜ÈØ]™JÈ\]YˆYÙ[Y[[ÜžJH›ÝÜÈÂˆ]\›HØÚËÚ]ØÚÈÈ
+
+HOˆT“È[‚ˆY[[ÜžHH\]Yˆ™]\›ˆ›Ú™XÝ›X\ÈÛYK›Y[[ÜžUT“
+›ÜŽˆ	
+HBˆBˆÝX\™]\›[ÙHÈ›ÝÈÓQ\œ›Ü‹››Ô›ÝšY\ˆBˆžH\]YœØ]™JÎˆ\›
+BˆB‚ˆ[˜È™[ØY
+
+HÂˆØÚËÚ]ØÚÈÂˆÝX\™]›Ú™XÝ[ÙHÈ™]\›ˆBˆY[[ÜžHH
+žOÈYÙ[Y[[ÜžK›ØY
+œ›ÛNˆÛYK›Y[[ÜžUT“
+›ÜŽˆ›Ú™XÝ
+JJHÏÈYÙ[Y[[ÜžJ
+BˆBˆB‚ˆËËÈ]™\žHÚ][ˆHÝ\œ™[›Ú™XÝ™]Ù\Ýš\œÝ›ÜˆÛY[[ÜžHX\›ˆKX[‚ˆ[˜È›Ú™XÝÚ]Ê
+HOˆÓY[[ÜžPÚ]HÂˆÝX\™]›Ú™XÝHØÚËÚ]ØÚÊÈ›Ú™XÝJH[ÙHÈ™]\›ˆ×HBˆ™]\›ˆÚ]ÊÙŽˆ›Ú™XÝ
+BˆB‚ˆËËÈHÚ]ÈHÛÛÈX^H™XYˆ™]™\ˆHÛ™H\ÚÚ[™Ë[™Û›H\ÂˆËËÈ›Ú™XÝ[›\ÜÈHØÛÜHÜ[œÈ]™\žHÛÜšÚ[™È\™XÝÜžK‚ˆ[˜È™XXÚX›PÚ]Ê
+HOˆÓY[[ÜžPÚ]HÂˆ]
+›Ú™XÝÝ\œ™[Ú]QØÛÜJHHØÚËÚ]ØÚÈÂˆ
+Ù[‹œ›Ú™XÝÙ[‹˜Ý\œ™[Ú]QÙ][™ÜËœØÛÜJBˆBˆÝX\™ØÛÜHOH››Û™K]›Ú™XÝ[ÙHÈ™]\›ˆ×HBˆ˜\ˆ™XXÚX›HHÚ]ÊÙŽˆ›Ú™XÝ
+BˆYˆØÛÜHOH˜[][™^HžOÈÛYK›ØY›Ú™XÝ[™^
+
+HÂˆ›ÜˆÝ\ˆ[ˆ[™^›Ü™\™Y›Ú™XÝÈÚ\™HÝ\‹šYOH›Ú™XÝšYÂˆ™XXÚX›H
+ÏHÚ]ÊÙŽˆÝ\ŠBˆBˆBˆ™]\›ˆ™XXÚX›K™š[\ˆÈ	šYOHÝ\œ™[Ú]QBˆœÛÜYÈ	\]Y]ˆ	K\]Y]BˆB‚ˆš]˜]H[˜ÈÚ]ÊÙˆ›Ú™XÝˆYÙ[›Ú™XÝ
+HOˆÓY[[ÜžPÚ]HÂˆ]Ú]ÈH
+žOÈÛYK˜Ú]ÝÜ™J›ÜŽˆ›Ú™XÝ
+K›ØYÚ]Ê
+JHÏÈ×Bˆ™]\›ˆÚ]Ë™š[\Šš\ÐÛÛ™\œØ][ÛŠBˆ›X\ÈY[[ÜžPÚ]
+	ØÛÜNˆ›Ú™XÝ™\Ü^S˜[YJHBˆœÛÜYÈ	\]Y]ˆ	K\]Y]BˆBŸB‚œÝXÝÙ\ÜÚ[Û”›Ùš[HÂˆ˜\ˆYÙ[QˆÝš[™Âˆ˜\ˆ\Ü^S˜[YNˆÝš[™ÂˆËËÈØ\œšYY›ÝYÚÛÈÜš][™ÈHÚ]	ÜÈYÙ[˜XÚÈÈHÛÛ™šYÝ\˜][Û‚ˆËËÈ™]™\ˆ\˜\Ù\ÈHÙ]\	ÜÈ\œÜÙHÜˆ]È[˜X›YÝ]K‚ˆ˜\ˆ\ØÜš\[ÛŽˆÝš[™Âˆ˜\ˆ\Ñ[˜X›Yˆ›ÛÛˆ˜\ˆ›ÝšY\Žˆ›ÝšY\’Qˆ˜\ˆ[Ù[ˆÝš[™Âˆ˜\ˆ[œÝXÝ[ÛœÎˆÝš[™Âˆ˜\ˆÞ\Ý[T›Û\ˆÝš[™ÏÂˆ˜\ˆÛÛ˜[Y\ÎˆÙ]Ýš[™Ï‚ˆ˜\ˆÛÛÜ›Ý\˜[Y\ÎˆÙ]Ýš[™Ï‚ˆ˜\ˆÝX˜YÙ[˜[Y\ÎˆÙ]Ýš[™Ï‚ˆ˜\ˆÝ™X[Nˆ›ÛÛˆ˜\ˆ[Z]ÎˆYÙ[[“[Z]Âˆ˜\ˆÛÛÚÚXÙNˆÛÛÚÚXÙBˆ˜\ˆ™\ÜÛœÙQ›Ü›X]ˆ™\ÜÛœÙQ›Ü›X]ˆ˜\ˆÜ[ÛœÎˆÙ[™\˜][Û“Ü[ÛœÂˆ˜\ˆÛÛØ[[™ÔÝ˜]YÞNˆÛÛØ[[™ÔÝ˜]YÞBˆ˜\ˆ\ÙUÛÛ›ÞNˆ›ÛÛˆ˜\ˆ›ÞQ^ÜÙYÛÛÎˆÙ]Ýš[™ÏÂˆ˜\ˆÛÛ[YØ][ÛŽˆYÙ[ÛÛ[YØ][Û‚ˆ˜\ˆ™]žNˆYÙ[™]žTÛXÞBˆ˜\ˆ]]ØÛÛ\XÝˆYÙ[]]ØÛÛ\XÝˆ˜\ˆÛÛ^ˆYÙ[ÛÛ^[ÙB‚ˆ[š]
+Yš[š][ÛŽˆYÙ[Yš[š][ÛŠHÂˆYÙ[QHYš[š][Û‹šYˆ\Ü^S˜[YHHYš[š][Û‹™\Ü^S˜[YBˆ\ØÜš\[ÛˆHYš[š][Û‹™\ØÜš\[Û‚ˆ\Ñ[˜X›YHYš[š][Û‹š\Ñ[˜X›Yˆ›ÝšY\ˆHYš[š][Û‹œ›ÝšY\‚ˆ[Ù[HYš[š][Û‹›[Ù[ˆ[œÝXÝ[ÛœÈHYš[š][Û‹š[œÝXÝ[ÛœÂˆÞ\Ý[T›Û\HYš[š][Û‹œÞ\Ý[T›Û\ˆÛÛ˜[Y\ÈHYš[š][Û‹ÛÛ˜[Y\ÂˆÛÛÜ›Ý\˜[Y\ÈHYš[š][Û‹ÛÛÜ›Ý\˜[Y\ÂˆÝX˜YÙ[˜[Y\ÈHYš[š][Û‹œÝX˜YÙ[˜[Y\ÂˆÝ™X[HHYš[š][Û‹œÝ™X[Bˆ[Z]ÈHYš[š][Û‹›[Z]ÂˆÛÛÚÚXÙHHYš[š][Û‹ÛÛÚÚXÙBˆ™\ÜÛœÙQ›Ü›X]HYš[š][Û‹œ™\ÜÛœÙQ›Ü›X]ˆÜ[ÛœÈHYš[š][Û‹›Ü[ÛœÂˆÛÛØ[[™ÔÝ˜]YÞHHYš[š][Û‹ÛÛØ[[™ÔÝ˜]YÞBˆ\ÙUÛÛ›ÞHHYš[š][Û‹\ÙUÛÛ›ÞBˆ›ÞQ^ÜÙYÛÛÈHYš[š][Û‹œ›ÞQ^ÜÙYÛÛÂˆÛÛ[YØ][ÛˆHYš[š][Û‹ÛÛ[YØ][Û‚ˆ™]žHHYš[š][Û‹œ™]žBˆ]]ØÛÛ\XÝHYš[š][Û‹˜]]ØÛÛ\XÝˆÛÛ^HYš[š][Û‹˜ÛÛ^ˆB‚ˆ[š]
+›ÝšY\Žˆ›ÝšY\’Q[Ù[ˆÝš[™Ë[œÝXÝ[ÛœÎˆÝš[™ËÝ™X[Nˆ›ÛÛ
+HÂˆYÙ[QH›XZ[ˆ‚ˆ\Ü^S˜[YHH›XZ[ˆ‚ˆ\ØÜš\[ÛˆHˆ‚ˆ\Ñ[˜X›YHYBˆÙ[‹œ›ÝšY\ˆH›ÝšY\‚ˆÙ[‹›[Ù[H[Ù[ˆÙ[‹š[œÝXÝ[ÛœÈH[œÝXÝ[ÛœÂˆÞ\Ý[T›Û\Hš[ˆÛÛ˜[Y\ÈHÙ]
+ˆÂˆXZQXÚÕÛÛ›˜[YKˆXZPÝ\œ™[[YUÛÛ›˜[YKˆXZPØ[Ý[]Ü•ÛÛ›˜[YKˆXZUÙX]\•ÛÛ›˜[YKˆXZUÙX”ÙX\˜ÚÛÛ›˜[YKˆXZUÙX‘™]ÚÛÛ›˜[YKˆXZSX\ÝÙÛ•ÛÛ›˜[YKˆH
+ÈXZQš[UÛÜšÜÜXÙUÛÛÛÛ˜[Y\È
+ÈXZT[•ÛÛÛÛ˜[Y\È
+ÈXZQÚ]X•ÛÛÛÛ˜[Y\Âˆ
+ÈXZUÙÕÛÛËÛÛ˜[Y\È
+ÈXZPÛÛ^ÛÛËÛÛ˜[Y\ÊBˆÛÛÜ›Ý\˜[Y\ÈHÂˆ™XÚÈ‹™]][YH‹˜Ø[È‹™š[\È‹œ[ˆ‹ÙX]\ˆ‹ÙXˆ‹›X\ÝÙÛˆ‹™Ú]Xˆ‹ÙÈ‹ˆ˜ÛÛ^‹XZTÚÚ[ÛÛË™Ü›Ý\QˆBˆÝX˜YÙ[˜[Y\ÈH×BˆÙ[‹œÝ™X[HHÝ™X[Bˆ[Z]ÈHš[š]
+
+BˆÛÛÚÚXÙHH˜]]ÛX]XÂˆ™\ÜÛœÙQ›Ü›X]H^ˆÜ[ÛœÈHš[š]
+
+BˆÛÛØ[[™ÔÝ˜]YÞHH˜]]ÛX]XÂˆ\ÙUÛÛ›ÞHH˜[ÙBˆ›ÞQ^ÜÙYÛÛÈHš[ˆÛÛ[YØ][ÛˆHš[›[™Bˆ™]žHHš[š]
+
+Bˆ]]ØÛÛ\XÝHš[š]
+
+BˆÛÛ^H˜ØXÚBˆB‚ˆ˜\ˆYÙ[Yš[š][ÛŽˆYÙ[Yš[š][ÛˆÂˆYÙ[Yš[š][ÛŠˆYˆYÙ[Qˆ\Ü^S˜[YNˆ\Ü^S˜[YKˆ\ØÜš\[ÛŽˆ\ØÜš\[Û‹ˆ\Ñ[˜X›Yˆ\Ñ[˜X›Yˆ[œÝXÝ[ÛœÎˆ[œÝXÝ[ÛœËˆÞ\Ý[T›Û\ˆÞ\Ý[T›Û\ˆ›ÝšY\Žˆ›ÝšY\‹ˆ[Ù[ˆ[Ù[ˆÛÛ˜[Y\ÎˆÛÛ˜[Y\ËˆÛÛÜ›Ý\˜[Y\ÎˆÛÛÜ›Ý\˜[Y\ËˆÝX˜YÙ[˜[Y\ÎˆÝX˜YÙ[˜[Y\ËˆÝ™X[NˆÝ™X[Kˆ[Z]Îˆ[Z]ËˆÛÛÚÚXÙNˆÛÛÚÚXÙKˆ™\ÜÛœÙQ›Ü›X]ˆ™\ÜÛœÙQ›Ü›X]ˆÜ[ÛœÎˆÜ[ÛœËˆÛÛØ[[™ÔÝ˜]YÞNˆÛÛØ[[™ÔÝ˜]YÞKˆ\ÙUÛÛ›ÞNˆ\ÙUÛÛ›ÞKˆ›ÞQ^ÜÙYÛÛÎˆ›ÞQ^ÜÙYÛÛËˆÛÛ[YØ][ÛŽˆÛÛ[YØ][Û‹ˆ™]žNˆ™]žKˆ]]ØÛÛ\XÝˆ]]ØÛÛ\XÝˆÛÛ^ˆÛÛ^
+BˆBŸB‚œÝXÝ‘TÙ\ÜÚ[ÛˆÂˆ˜\ˆYˆURQˆËËÈHÙ\ÜÚ[ÛˆHÚ]™\Ù[ÈÈ›ÝšY\œÎÈÙYHÚ]Ù\ÜÚ[Û˜‚ˆ˜\ˆÙ\ÜÚ[Û’QˆÝš[™Âˆ˜\ˆ]NˆÝš[™Âˆ˜\ˆ›Ùš[NˆÙ\ÜÚ[Û”›Ùš[Bˆ˜\ˆ\ÝÜžNˆYÙ[˜[œØÜš\ˆ˜\ˆ[™[™ÐÛÛ[ˆÐÛÛ[\Bˆ˜\ˆÜ™X]Y]ˆ]Bˆ˜\ˆ\]Y]ˆ]Bˆ˜\ˆ\Ð\˜Ú]™Yˆ›ÛÛˆËËÈHYÙ[È\ÈÚ]	ÜÈ[œÈÝ\YÚ]Z\ˆ˜[œØÜš\Ë\ÈØ]™YˆËËÈÚ]HÚ]ˆH‘Tœš[™ÜÈ[H\È]Hœ›ÛHHÝ\\š\ÛÜˆ\ÂˆËËÈ[œÈ[™[™]È[H˜XÚÈ[ˆH›ØÙ\ÜÈX›HÚ[ˆHÚ]\ÂˆËËÈ™[Ü[™YÛÈØYÙ[È™YX[™ØYÙ[ÈÙØÝ]]™HHÙ\ÜÚ[Û‹‚ˆ˜\ˆÝX˜YÙ[ÎˆÐYÙ[›ØÙ\ÜÔ™XÛÜ™BˆÚYˆPRWÒT×Õ’TÕPSˆËËÈÛÛ™\œØ][ÛœÈ[™[™\ÈY™Z[™žHH\ÝÝš\ÝX[Ù\ÜÚ[Û‹‚ˆ˜\ˆš\ÝX[Û˜\ÚÝˆš\ÝX[ÛÜšÜÜXÙTÛ˜\ÚÝÂˆÙ[™Y‚‚ˆ[š]
+ˆYˆURQHURQ
+
+Kˆ]NˆÝš[™ÏÈHš[ˆ›Ùš[NˆÙ\ÜÚ[Û”›Ùš[Kˆ[™[™ÐÛÛ[ˆÐÛÛ[\HH×KˆÜ™X]Y]ˆ]HH]J
+Kˆ\]Y]ˆ]HH]J
+KˆÙ\ÜÚ[Û’QˆÝš[™ÏÈHš[ˆ
+HÂˆÙ[‹šYHYˆÙ[‹œÙ\ÜÚ[Û’QHÙ\ÜÚ[Û’QÏÈÚ]Ù\ÜÚ[Û‹›™]ÒQ
+
+BˆÙ[‹]HH]HÏÈ›Ùš[K˜YÙ[QˆÙ[‹œ›Ùš[HH›Ùš[Bˆ\ÝÜžHHYÙ[˜[œØÜš\
+Y\ÜØYÙ\ÎˆÙ[‹š[š]X[\ÝÜžJ›ÜŽˆ›Ùš[JJBˆÙ[‹œ[™[™ÐÛÛ[H[™[™ÐÛÛ[ˆÙ[‹˜Ü™X]Y]HÜ™X]Y]ˆÙ[‹\]Y]H\]Y]ˆ\Ð\˜Ú]™YH˜[ÙBˆÝX˜YÙ[ÈH×BˆB‚ˆ[š]
+Ú]ˆYÙ[Ú]
+HÂˆYHÚ]šYˆÙ\ÜÚ[Û’QHÚ]œÙ\ÜÚ[Û’Qˆ]HHÚ]]Bˆ›Ùš[HHÙ\ÜÚ[Û”›Ùš[JYš[š][ÛŽˆÚ]œš[X\žPYÙ[
+Bˆ\ÝÜžHHYÙ[˜[œØÜš\
+Y\ÜØYÙ\ÎˆÚ]›Y\ÜØYÙ\ÊBˆ[™[™ÐÛÛ[HÚ]œ[™[™ÐÛÛ[ˆÜ™X]Y]HÚ]˜Ü™X]Y]ˆ\]Y]HÚ]\]Y]ˆ\Ð\˜Ú]™YHÚ]š\Ð\˜Ú]™YˆÝX˜YÙ[ÈHÚ]œÝX˜YÙ[ÂˆB‚ˆ˜\ˆÚ]ˆYÙ[Ú]ÂˆYÙ[Ú]
+ˆYˆYˆ]Nˆ]Kˆš[X\žPYÙ[ˆ›Ùš[K˜YÙ[Yš[š][Û‹ˆY\ÜØYÙ\Îˆ\ÝÜžK›Y\ÜØYÙ\Ëˆ[™[™ÐÛÛ[ˆ[™[™ÐÛÛ[ˆÜ™X]Y]ˆÜ™X]Y]ˆ\]Y]ˆ\]Y]ˆ\Ð\˜Ú]™Yˆ\Ð\˜Ú]™YˆÙ\ÜÚ[Û’QˆÙ\ÜÚ[Û’QˆÝX˜YÙ[ÎˆÝX˜YÙ[ÊBˆB‚ˆËËÈ˜[Y\ÈHXÙZÛ\ˆÚ]Y\ˆ]Èš\œÝY\ÜØYÙNÈÚÜÙ[ˆ]\ÈÝ^K‚ˆ]]][™È[˜È™Yœ™\Ú]Jœ›ÛH^ˆÝš[™ÊHÂˆ]š[[YYH]Kš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™š[[YYš\Ñ[\Hš[[YYOHYÙ[Ú]œXÙZÛ\•]Kˆ]\š]™YHYÙ[Ú]™\š]™Y]Jœ›ÛNˆ^
+Bˆ[ÙHÈ™]\›ˆBˆ]HH\š]™YˆB‚ˆËËÈHÛX\™YÛÛ™\œØ][ÛˆÙY\È›Ý[™ÈÙˆ]È[œÎˆHYÙ[È^BˆËËÈÝ\YÛÈÚ]HY\ÜØYÙ\Ë‚ˆ]]][™È[˜È™\Ù]
+›Ùš[NˆÙ\ÜÚ[Û”›Ùš[OÈHš[
+HÂˆYˆ]›Ùš[HÈÙ[‹œ›Ùš[HH›Ùš[HBˆ\ÝÜžKœ™\XÙP[
+Ú]ˆÙ[‹š[š]X[\ÝÜžJ›ÜŽˆÙ[‹œ›Ùš[JJBˆ[™[™ÐÛÛ[œ™[[Ý™P[
+
+BˆÝX˜YÙ[Ëœ™[[Ý™P[
+
+BˆÝXÚ
+
+BˆB‚ˆ]]][™È[˜ÈÝXÚ
+
+HÂˆ\]Y]H]J
+BˆB‚ˆÚYˆPRWÒT×Õ’TÕPSˆ[˜Èš\ÝX[ÙYY
+
+HOˆš\ÝX[ÛÛ™\œØ][Û”ÙYYÂˆš\ÝX[ÛÛ™\œØ][Û”ÙYY
+ˆYˆYˆ]Nˆ]Kˆ›Ùš[Nˆ›Ùš[K˜YÙ[Yš[š][Û‹ˆY\ÜØYÙ\Îˆ\ÝÜžK›Y\ÜØYÙ\Ëˆ[™[™ÐÛÛ[ˆ[™[™ÐÛÛ[ˆÙ\ÜÚ[Û’QˆÙ\ÜÚ[Û’Q
+BˆB‚ˆ]]][™È[˜ÈYÜ
+ÈÛÛ™\œØ][ÛŽˆš\ÝX[ÛÛ™\œØ][Û”ÙYY
+HÂˆYHÛÛ™\œØ][Û‹šYˆÙ\ÜÚ[Û’QHÛÛ™\œØ][Û‹œÙ\ÜÚ[Û’Qˆ]HHÛÛ™\œØ][Û‹]Bˆ›Ùš[HHÙ\ÜÚ[Û”›Ùš[JYš[š][ÛŽˆÛÛ™\œØ][Û‹œ›Ùš[JBˆ\ÝÜžKœ™\XÙP[
+Ú]ˆÛÛ™\œØ][Û‹›Y\ÜØYÙ\ÊBˆ[™[™ÐÛÛ[HÛÛ™\œØ][Û‹œ[™[™ÐÛÛ[ˆÝXÚ
+
+BˆBˆÙ[™Y‚‚ˆš]˜]HÝ]XÈ[˜È[š]X[\ÝÜžJ›Üˆ›Ùš[NˆÙ\ÜÚ[Û”›Ùš[JHOˆÐYÙ[Y\ÜØYÙWHÂˆ][œÝXÝ[ÛœÈH›Ùš[Kš[œÝXÝ[ÛœËš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆ™]\›ˆ[œÝXÝ[ÛœËš\Ñ[\HÈ×HˆËœÞ\Ý[J[œÝXÝ[ÛœÊWBˆBŸB‚œš]˜]Hš[˜[Û\ÜÈ\›Z[˜[[\œ\[™\Žˆ[˜ÚXÚÙYÙ[™X›HÂˆÚYˆ[ÜÊÚ[™ÝÜÊBˆš]˜]H]ÛÝ\˜ÙNˆ\Ü]ÚÛÝ\˜ÙTÚYÛ˜[ˆÙ[™Y‚ˆš]˜]H]ØÚÈH”ÓØÚÊ
+Bˆš]˜]H˜\ˆØ[˜Ù[][ÛŽˆ
+Ù[™X›H
+
+HOˆ›ÚY
+OÂˆš]˜]H˜\ˆ[\œ\YH˜[ÙB‚ˆ[š]
+
+HÂˆÚYˆÜÊÚ[™ÝÜÊBˆÚ[™ÝÜÐÛÛœÛÛKØ]Ú[\œ\ÈÈÝÙXZÈÙ[—H[ˆÙ[Ëš[\œ\
+
+HBˆÙ[ÙBˆÚYÛ˜[
+ÒQÒS•ÒQ×ÒQÓŠBˆÛÝ\˜ÙHH\Ü]ÚÛÝ\˜ÙK›XZÙTÚYÛ˜[ÛÝ\˜ÙJÚYÛ˜[ˆÒQÒS•]Y]YNˆ™ÛØ˜[
+
+JBˆÛÝ\˜ÙKœÙ]]™[[™\ˆÈÝÙXZÈÙ[—H[ˆÙ[Ëš[\œ\
+
+HBˆÛÝ\˜ÙKœ™\Ý[YJ
+BˆÙ[™Y‚ˆB‚ˆZ[š]ÂˆÚYˆÜÊÚ[™ÝÜÊBˆÚ[™ÝÜÐÛÛœÛÛKØ]Ú[\œ\Êš[
+BˆÙ[ÙBˆÛÝ\˜ÙK˜Ø[˜Ù[
+
+BˆÚYÛ˜[
+ÒQÒS•ÒQ×Ñ“
+BˆÙ[™Y‚ˆB‚ˆ[˜ÈXÝ]˜]JØ[˜Ù[][ÛŽˆ\ØØ\[™ÈÙ[™X›H
+
+HOˆ›ÚY
+HÂˆØÚËÚ]ØÚÈÂˆ[\œ\YH˜[ÙBˆÙ[‹˜Ø[˜Ù[][ÛˆHØ[˜Ù[][Û‚ˆBˆB‚ˆ[˜ÈXXÝ]˜]J
+HÂˆØÚËÚ]ØÚÈÈØ[˜Ù[][ÛˆHš[BˆB‚ˆ[˜È[\œ\YXÝ]™SÜ\˜][ÛŠ
+HOˆ›ÛÛÂˆØÚËÚ]ØÚÈÈ[\œ\YBˆB‚ˆš]˜]H[˜È[\œ\
+
+HÂˆ]XÝ[ÛˆHØÚËÚ]ØÚÈÈ
+
+HOˆ
+Ù[™X›H
+
+HOˆ›ÚY
+OÈ[‚ˆÝX\™]Ø[˜Ù[][Ûˆ[ÙHÈ™]\›ˆš[Bˆ[\œ\YHYBˆ™]\›ˆØ[˜Ù[][Û‚ˆBˆXÝ[ÛÊ
+BˆBŸB‚œš]˜]HXÝÜˆ\›Z[˜[\›Ý˜[[™\Žˆ\›Ý˜[[™\ˆÂˆ\X[X\È›Û\\ˆHÙ[™X›H
+\›Ý˜[™\]Y\Ý
+H\Þ[˜È›ÝÜÈOˆ\›Ý˜[XÚ\Ú[Û‚‚ˆš]˜]H]ÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\™Y\›Ý˜[Âˆš]˜]H˜\ˆ[YØ]Nˆ
+[žH\›Ý˜[[™\ŠOÂˆš]˜]H˜\ˆ[ÛÑ[˜X›Yˆ›ÛÛˆËËÈ\ÚÜÈ›ÝYÚH‘T	ÜÈÝÛˆ›Û\Ú[HH\œÚ\Ý[ØÜ™Y[ˆÝÛœÈBˆËËÈ\›Z[˜[ÛÈH]Y\Ý[Ûˆœ›ÛHHÚ[YÙ[™]™\ˆšYÚÈH[™HY]Ü‚ˆËËÈ›ÜˆÝ[‹‚ˆš]˜]H˜\ˆ›Û\\Žˆ›Û\\Â‚ˆ[š]
+ÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\™Y\›Ý˜[Ë[ÛÑ[˜X›Yˆ›ÛÛH˜[ÙJHÂˆÙ[‹˜ÛÛ™šYÝ\˜][ÛˆHÛÛ™šYÝ\˜][Û‚ˆÙ[‹ž[ÛÑ[˜X›YH[ÛÑ[˜X›YˆB‚ˆËËÈ›Ý]\È\ÚØXÚ\Ú[ÛœÈ[Ù]Ú\™HÚ[H[›Ý\ˆÝ\™˜XÙHÝÛœÈH\›Z[˜[‚ˆ[˜ÈÙ][YØ]JÈ[™\Žˆ
+[žH\›Ý˜[[™\ŠOÊHÂˆ[YØ]HH[™\‚ˆB‚ˆ[˜ÈÙ]SÓÑ[˜X›Y
+È[˜X›Yˆ›ÛÛ
+HÂˆ[ÛÑ[˜X›YH[˜X›YˆB‚ˆ[˜È\ÖSÓÑ[˜X›Y
+
+HOˆ›ÛÛÂˆ[ÛÑ[˜X›YˆB‚ˆ[˜ÈÙ]›Û\\ŠÈ›Û\\Žˆ›Û\\ÊHÂˆÙ[‹œ›Û\\ˆH›Û\\‚ˆB‚ˆ[˜ÈXÚYJÈ™\]Y\Ýˆ\›Ý˜[™\]Y\Ý
+H\Þ[˜È›ÝÜÈOˆ\›Ý˜[XÚ\Ú[ÛˆÂˆYˆ[ÛÑ[˜X›YÂˆ™]\›ˆ˜\›Ý™J\™Ý[Y[Îˆ™\]Y\Ý˜Ø[˜\™Ý[Y[ÊBˆBˆ][ÙHBˆ™\]Y\ÝÛÛ˜[››Ý][ÛœË˜\›Ý˜[OH™[™Ù\›Ý\ÂˆÈÛÛ™šYÝ\˜][Û‹™[™Ù\›Ý\ÈˆÛÛ™šYÝ\˜][Û‹˜ÛÛ™š\›BˆÝÚ]Ú[ÙHÂˆØ\ÙH˜[ÝÎ‚ˆ™]\›ˆ˜\›Ý™J\™Ý[Y[Îˆ™\]Y\Ý˜Ø[˜\™Ý[Y[ÊBˆØ\ÙH™[žN‚ˆ™]\›ˆ™[žJ™X\ÛÛŽˆ‘[šYYžHÛÛ™šYÝ\˜][Û‹ˆŠBˆØ\ÙH˜\ÚÎ‚ˆYˆ][YØ]HÈ™]\›ˆžH]ØZ][YØ]K™XÚYJ™\]Y\Ý
+HBˆYˆ]›Û\\ˆÈ™]\›ˆžH]ØZ]›Û\\Š™\]Y\Ý
+HBˆÝX\™\Ø]JÕS—Ñ’SS“ÊHOH[ÙHÂˆ™]\›ˆ™[žJ™X\ÛÛŽˆ’[\˜XÝ]™H\›Ý˜[™\]Z\™\ÈH\›Z[˜[ˆŠBˆBˆš[R[™KœÝ[™\™\œ›Ü‹Üš]Jˆ]Jˆ\›Ý™H
+™\]Y\ÝÛÛ˜[››Ý][ÛœË˜\›Ý˜[œ˜]Õ˜[YJHÛÛ	×
+™\]Y\ÝÛÛ›˜[YJIÏ×\™Ý[Y[Îˆ
+™\]Y\Ý˜Ø[˜\™Ý[Y[Ë˜ÛÛ\XÝ”ÓÓ”Ýš[™ÊWˆ‚ˆ]Ž
+JBˆ]Y]ÜˆH\›Z[˜[[™QY]ÜŠ
+BˆY]Ü‹˜ÛÛ™šYÝ\™JˆZNˆÛÛ™šYÝ\™Y\›Z[˜[RJ˜XÚÙÜ›Ý[™[™Nˆˆ‹›Û\›Ü™YÜ›Ý[™ˆžY[ÝÈŠJBˆÝX\™ˆ][œÝÙ\ˆHY]Ü‹œ™XY[™Jˆ›Û\ˆ–ÞWY\ËÖØW[Ø^\ËÖÛ—[ËÖÙWY]ÖØ×X[˜Ù[[Žˆ‹ÛÛ\][ÛœÎˆ×JOÂˆš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊK›ÝÙ\˜Ø\ÙY
+
+Bˆ[ÙHÈ™]\›ˆ™[žJ™X\ÛÛŽˆ“›È\›Ý˜[™\ÜÛœÙKˆŠHBˆYˆY]Ü‹Ø\Ò[\œ\YÈ›ÝÈØ[˜Ù[][Û‘\œ›ÜŠ
+HBˆÝÚ]Ú[œÝÙ\ˆÂˆØ\ÙHžH‹žY\ÈŽ‚ˆ™]\›ˆ˜\›Ý™J\™Ý[Y[Îˆ™\]Y\Ý˜Ø[˜\™Ý[Y[ÊBˆØ\ÙH˜H‹˜[Ø^\ÈŽ‚ˆ[ÛÑ[˜X›YHYBˆ™]\›ˆ˜\›Ý™J\™Ý[Y[Îˆ™\]Y\Ý˜Ø[˜\™Ý[Y[ÊBˆØ\ÙH™H‹™Y]Ž‚ˆš[R[™KœÝ[™\™\œ›Ü‹Üš]J]J”™\XÙ[Y[”ÓÓˆ\™Ý[Y[Îˆ‹]Ž
+JBˆÝX\™]˜]ÈH™XY[™J
+K]]HH˜]Ë™]J\Ú[™Îˆ]Ž
+Kˆ]˜[YHHžOÈ”ÓÓ‘XÛÙ\Š
+K™XÛÙJ”ÓÓ•˜[YKœÙ[‹œ›ÛNˆ]JKˆ˜[YK›Øš™XÝ˜[YHOHš[ˆ[ÙHÈ™]\›ˆ™[žJ™X\ÛÛŽˆ‘Y]Y\™Ý[Y[ÈÙ\™H›ÝH”ÓÓˆØš™XÝˆŠHBˆ™]\›ˆ˜\›Ý™J\™Ý[Y[Îˆ˜[YJBˆØ\ÙH˜È‹˜Ø[˜Ù[Ž‚ˆ™]\›ˆ˜Ø[˜Ù[[‚ˆY˜][‚ˆ™]\›ˆ™[žJ™X\ÛÛŽˆ‘[šYYžH\Ù\‹ˆŠBˆBˆBˆBŸB‚XZ[‚œÝXÝXZPÓHÂˆš]˜]HÝ]XÈ]™\œÚ[ÛˆHŒKËH‚‚ˆÝ]XÈ[˜ÈXZ[Š
+H\Þ[˜ÈÂˆ][š\›Û›Y[H›ØÙ\ÜÒ[™›Ëœ›ØÙ\ÜÒ[™›Ë™[š\›Û›Y[ˆ]ÛÛ[X[™[™P\™Ý[Y[ÈH]›Ü›PÛÛ[X[™[™P\™Ý[Y[Ê[š\›Û›Y[ˆ[š\›Û›Y[
+BˆYˆÛÛ[X[™[™P\™Ý[Y[Ë™›Üš\œÝ
+
+K˜ÛÛZ[œÊÚ\™NˆÈ	OH‹KZ[ˆ	OH‹ZˆJHÂˆš[\ØYÙJ
+Bˆ™]\›‚ˆBˆYˆÛÛ[X[™[™P\™Ý[Y[Ë™›Üš\œÝ
+
+K˜ÛÛZ[œÊÚ\™NˆÈ	OH‹K]™\œÚ[Ûˆˆ	OH‹]ˆˆJHÂˆš[
+™\œÚ[ÛŠBˆ™]\›‚ˆB‚ˆÈÂˆ]Ü[ÛœÈHžHÓSÜ[ÛœÊˆ\™Ý[Y[Îˆ\œ˜^JÛÛ[X[™[™P\™Ý[Y[Ë™›Üš\œÝ
+
+JKˆ[š\›Û›Y[ˆ[š\›Û›Y[
+BˆYˆÜ[ÛœËœš[ÛÛ™šYÈÂˆš[R[™KœÝ[™\™Ý]]Üš]JžHØ[\PÛÛ™šYÝ\˜][ÛŠ
+K™[˜ÛÙY
+
+JBˆš[R[™KœÝ[™\™Ý]]Üš]J]J—ˆ‹]Ž
+JBˆ™]\›‚ˆBˆYˆÜ[ÛœË›\Ý›Ú™XÝÈÂˆ]ÛYHH™\ÛÛ™YÛYJÜ[ÛœÎˆÜ[ÛœË[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆš[
+›Ú™XÝ\Ý[™ÊžHÛYK›ØY›Ú™XÝ[™^
+
+KÝ\œ™[Qˆš[›ÝÎˆ]J
+JJBˆ™]\›‚ˆBˆYˆÜ[ÛœË›\ÝÚ]ÈÂˆ]ÛYHH™\ÛÛ™YÛYJÜ[ÛœÎˆÜ[ÛœË[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ]›Ú™XÝHžHÛYK›Ü[”›Ú™XÝ
+ˆ]ÛÜšÚ[™Ñ\™XÝÜžNˆT“
+ˆš[UT“Ú]]ˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]\Ñ\™XÝÜžNˆYJJBˆ]ÝÜ™HH™\ÛÛ™YÚ]ÝÜ™JˆÜ[ÛœÎˆÜ[ÛœËÛYNˆÛYK›Ú™XÝˆ›Ú™XÝ[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ]ÛÜšÜÜXÙHHžHÝÜ™K›ØYÛÜšÜÜXÙHÈ\œ›Üˆ[‚ˆš[R[™KœÝ[™\™\œ›Ü‹Üš]Jˆ]JØ\›š[™ÎˆÚÚ\YHÚ]š[Kˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠWˆ‹]Ž
+JBˆBˆš[
+Ú]\Ý[™ÊÛÜšÜÜXÙKØÛÜNˆ˜[Ù[XÝYQˆš[
+JBˆ™]\›‚ˆB‚ˆ]ØYYHžHØYÛÛ™šYÝ\˜][ÛŠÜ[ÛœÎˆÜ[ÛœË[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ]ÛÛ™šYÝ\˜][Û”]HØYYËœ]ÏÈY˜][ÛÛ™šYÝ\˜][Û”]
+[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ˜\ˆÛÛ™šYÝ\˜][ÛˆHØYYË˜ÛÛ™šYÝ\˜][Û‚ˆYˆ˜\ˆ^\Ý[™ÈHÛÛ™šYÝ\˜][ÛˆÂˆ˜\ˆÚ[™ÙYH^\Ý[™Ë˜\ÜÛØÚX]TÞ\Ý[T›Û\Ê
+BˆYˆY^\Ý[™ËÛÛÛÝ\˜Ù\Ë˜ÛÛZ[œÊÚ\™NˆÂˆ	šÚ[™OHXZTÝ[™\™ÛÛÔYÚ[‹™˜XÝÜžRÚ[™ˆJHÂˆ^\Ý[™ËÛÛÛÝ\˜Ù\Ë˜\[™
+ˆÛÛ™šYÝ\™YÛÛÛÝ\˜ÙJˆYˆœÝ[™\™]ÛÛÈ‹ˆÚ[™ˆXZTÝ[™\™ÛÛÔYÚ[‹™˜XÝÜžRÚ[™
+JBˆÚ[™ÙYHYBˆBˆYˆÚ[™ÙYÈžH^\Ý[™ËœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JHBˆÛÛ™šYÝ\˜][ÛˆH^\Ý[™ÂˆBˆ]\›Ý˜[[™\ˆH\›Z[˜[\›Ý˜[[™\ŠˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛË˜\›Ý˜[ÈÏÈš[š]
+
+Kˆ[ÛÑ[˜X›YˆÜ[ÛœËž[ÛÈ
+ÛÛ™šYÝ\˜][ÛË˜\›Ý˜[Ëž[ÛÈÏÈ˜[ÙJJBˆ][[YHHYÙ[[[YJ\›Ý˜[[™\Žˆ\›Ý˜[[™\ŠBˆ]YÚ[œÈHYÚ[”™YÚ\ÝžJ
+BˆžH]ØZ]YÚ[œËš[œÝ[
+XZPÛÜ™PZ[[œÔYÚ[Š
+KÜšYÚ[Žˆ˜Z[Z[ˆŠBˆžH]ØZ]YÚ[œËš[œÝ[
+XZSPÔYÚ[Š
+KÜšYÚ[Žˆ˜Z[Z[ˆŠBˆžH]ØZ]YÚ[œËš[œÝ[
+XZSÜ[RTYÚ[Š
+KÜšYÚ[Žˆ˜Z[Z[ˆŠBˆžH]ØZ]YÚ[œËš[œÝ[
+XZPPÔYÚ[Š
+KÜšYÚ[Žˆ˜Z[Z[ˆŠBˆÈÂˆžH]ØZ]YÚ[œËš[œÝ[
+XZUš\Ú[Û“ÐÔ”YÚ[Š
+KÜšYÚ[Žˆ˜Z[Z[ˆŠBˆHØ]ÚÂˆËÈÐÔˆ\ÈÜ[Û˜[ˆH]›Ü›HÚ]Ý]H\ØX›H˜XÚÙ[™]\Ý›ÝÝÜˆËÈHÓHœ›ÛHÝ\[™Ë‚ˆš[R[™KœÝ[™\™\œ›Ü‹Üš]Jˆ]JØ\›š[™ÎˆÐÔˆYÚ[ˆ[˜]˜Z[X›Nˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠWˆ‹]Ž
+JBˆBˆžH]ØZ]YÚ[œËš[œÝ[
+XZTÝ[™\™ÛÛÔYÚ[Š
+KÜšYÚ[Žˆ˜Z[Z[ˆŠBˆ]˜]]™TYÚ[’ÜÝH˜]]™TYÚ[’ÜÝ
+
+BˆžH]ØZ]ØY˜]]™TYÚ[œÊˆÜ[ÛœÎˆÜ[ÛœËˆØYYÛÛ™šYÝ\˜][Û”]ˆØYYËœ]ˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ˆ[š\›Û›Y[ˆ[š\›Û›Y[ˆÜÝˆ˜]]™TYÚ[’ÜÝˆ™YÚ\ÝžNˆYÚ[œÊBˆ]Y[[ÜžTÝ]HHY[[ÜžTÝ]JˆÛYNˆ™\ÛÛ™YÛYJÜ[ÛœÎˆÜ[ÛœË[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆ]ÙÔÝ]HHÙÔÝ]JˆÛYNˆ™\ÛÛ™YÛYJÜ[ÛœÎˆÜ[ÛœË[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆ]ÚÚ[Ý]HHÚÚ[Ý]JˆÛYNˆ™\ÛÛ™YÛYJÜ[ÛœÎˆÜ[ÛœË[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆžH]ØZ]™YÚ\Ý\•ÛÛÊˆ[Žˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ˆ[š\›Û›Y[ˆ[š\›Û›Y[
+BˆžH]ØZ]™YÚ\Ý\“Y[[ÜžUÛÛÊ[Žˆ[[YKÝ]NˆY[[ÜžTÝ]JBˆžH]ØZ]™YÚ\Ý\•ÙÕÛÛÊ[Žˆ[[YKÝ]NˆÙÔÝ]JBˆ›ÜˆÛÛ[ˆXZPÛÛ^ÛÛË›XZÙUÛÛÊÝ\\š\ÛÜŽˆ[[YKœÝ\\š\ÛÜŠHÂˆžH]ØZ][[YKœ™YÚ\Ý\ŠÛÛˆÛÛ
+BˆBˆžH]ØZ]™YÚ\Ý\”ÚÚ[ÛÛÊ[Žˆ[[YKÝ]NˆÚÚ[Ý]JBˆžH]ØZ]Þ[˜Ú›Ûš^™UÛÛÜ›Ý\Ù[XÝ[ÛœÊˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆYÚ[œÎˆYÚ[œËˆ[[YNˆ[[YKˆ[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ]ØÜ”›ÝšY\ˆH]ØZ]ÛÛ™šYÝ\™YÐÔ”›ÝšY\ŠˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ˆ[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ]Ù]\HžH]ØZ]ÛÛ™šYÝ\™T[[YJˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ˆÜ[ÛœÎˆÜ[ÛœËˆ[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ˜\ˆ›Ùš[HHžHÙ[XÝY›Ùš[JˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ˆÜ[ÛœÎˆÜ[ÛœËˆ[š\›Û›Y[ˆ[š\›Û›Y[
+BˆYˆÛÛ™šYÝ\˜][ÛˆOHš[Âˆ˜\ˆÜ™X]YHXZPÛÛ™šYÝ\˜][ÛŠˆY˜][YÙ[ˆ›Ùš[K˜YÙ[Qˆ›ÝšY\œÎˆÙ]\š[\XÚ]›ÝšY\œËˆÛÛÛÝ\˜Ù\ÎˆÂˆÛÛ™šYÝ\™YÛÛÛÝ\˜ÙJˆYˆœÝ[™\™]ÛÛÈ‹ˆÚ[™ˆXZTÝ[™\™ÛÛÔYÚ[‹™˜XÝÜžRÚ[™
+BˆKˆYÙ[ÎˆÜ›Ùš[K˜YÙ[Yš[š][Û—JBˆÜ™X]Y˜\ÜÛØÚX]TÞ\Ý[T›Û\Ê
+BˆžHÜ™X]YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆHÜ™X]Yˆ›Ùš[HHžHÙ[XÝY›Ùš[JˆÛÛ™šYÝ\˜][ÛŽˆÜ™X]YˆÜ[ÛœÎˆÜ[ÛœËˆ[š\›Û›Y[ˆ[š\›Û›Y[
+BˆBˆ]ÛYHH™\ÛÛ™YÛYJÜ[ÛœÎˆÜ[ÛœË[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ]\ØYÙTÝ]ÈH[Ù[\ØYÙTÝÜ™J\›ˆÛYK\ØYÙTÝ]ÕT“
+Bˆ]ØZ][[YK˜ÛÛ™šYÝ\™U\ØYÙTÝ]Ê\ØYÙTÝ]ÊBˆ]›Ú™XÝHžHÛYK›Ü[”›Ú™XÝ
+ˆ]ÛÜšÚ[™Ñ\™XÝÜžNˆT“
+ˆš[UT“Ú]]ˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]\Ñ\™XÝÜžNˆYJJBˆY[[ÜžTÝ]K˜YÜ
+›Ú™XÝˆ›Ú™XÝÙ][™ÜÎˆÛÛ™šYÝ\˜][ÛË›Y[[ÜžHÏÈš[š]
+
+JBˆÙÔÝ]K™›ØÝ\Ê›Ú™XÝˆ›Ú™XÝ
+BˆÚÚ[Ý]K™›ØÝ\Ê›Ú™XÝˆ›Ú™XÝ
+Bˆ]ØZ][[YK˜ÛÛ™šYÝ\™SY[[ÜžJY[[ÜžTÝ]Kœ›Û\ÙXÝ[ÛŠBˆ]ØZ][[YK˜ÛÛ™šYÝ\™T›Ú™XÝ[œÝXÝ[ÛœÊ›Ú™XÝ[œÝXÝ[ÛœÔÙXÝ[ÛŠÛÛ™šYÝ\˜][ÛŠJBˆ]ØZ][[YK˜ÛÛ™šYÝ\™T[›š[™ÊÛÛ™šYÝ\˜][ÛË\ÙKœ[ˆÏÈYJBˆ]ÝÜ™HH™\ÛÛ™YÚ]ÝÜ™JˆÜ[ÛœÎˆÜ[ÛœËÛYNˆÛYK›Ú™XÝˆ›Ú™XÝ[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ[\ÜYØXÞPÚ]Ê[ÎˆÝÜ™K›Ú™XÝˆ›Ú™XÝÜ[ÛœÎˆÜ[ÛœË[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ]›ÝšY\“Ý™\œšYHBˆÜ[ÛœËœ›ÝšY\“Ý™\œšYBˆÏÈ[š\›Û›Y[˜[YJÈ”PRWÔ“Õ’QTˆ‹“PRWÔ“Õ’QTˆ—K[Žˆ[š\›Û›Y[
+K›X\Âˆ›ÝšY\’Q
+	
+BˆBˆ][Ù[Ý™\œšYHBˆÜ[ÛœË›[Ù[Ý™\œšYBˆÏÈ[š\›Û›Y[˜[YJÈ”PRWÓSÑS‹“PRWÓSÑS‹“ÔSRWÓSÑS—K[Žˆ[š\›Û›Y[
+Bˆ˜\ˆÛÜšÜÜXÙHHžHØYÚ]ÛÜšÜÜXÙJˆœ›ÛNˆÝÜ™Kˆ[š]X[›Ùš[Nˆ›Ùš[KˆÛÛ™šYÝ\™YYÙ[ÎˆÛÛ™šYÝ\˜][ÛË˜YÙ[ÈÏÈ×Kˆ›ÝšY\“Ý™\œšYNˆ›ÝšY\“Ý™\œšYKˆ[Ù[Ý™\œšYNˆ[Ù[Ý™\œšYKˆÜ[ÛœÎˆÜ[ÛœÊBˆ˜\ˆÙ\ÜÚ[ÛˆH‘TÙ\ÜÚ[ÛŠÚ]ˆÛÜšÜÜXÙKœÙ[XÝYÚ]JBˆÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[˜\[™
+ÛÛ[ÓÙŽˆžHÜ[ÛœËš[XYÙT]Ë›X\
+[XYÙPÛÛ[
+JBˆYˆÜ[ÛœËœ™XYÝ[ˆÂˆÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[˜\[™
+ˆžHÝ[]XÚY[
+™[Ü[š[™Õ\›Z[˜[ˆÜ[ÛœËš[š]X[›Û\OHš[
+JBˆBˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆ]\›Z[˜[H\›Z[˜[Üš]\Š
+Bˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™SX\šÙÝÛŠˆX\šÙÝÛ”™[™\™\Šˆ[˜X›YˆÜ[ÛœË›X\šÙÝÛˆÏÈÛÛ™šYÝ\˜][ÛËZK›X\šÙÝÛˆÏÈYKˆ›Ü˜ÙYˆÜ[ÛœË›X\šÙÝÛˆOHYKˆ[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™U[šÚ[™ÊÛÛ™šYÝ\˜][ÛËZK[šÚ[™ÈÏÈœÝ]\ÊBˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™UÛÛ™\Ý[[™\ÊˆÛÛ™šYÝ\˜][ÛËZKÛÛ™\Ý[[™\ÈÏÈÛÛ™šYÝ\™Y\›Z[˜[RJ
+KÛÛ™\Ý[[™\ÊBˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™UÛÛ™\Ý[ÛÛÜŠˆÛÛ™šYÝ\˜][ÛËZKÛÛ™\Ý[›Ü™YÜ›Ý[™ÏÈÛÛ™šYÝ\™Y\›Z[˜[RJ
+KÛÛ™\Ý[›Ü™YÜ›Ý[™
+Bˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™TÝX˜YÙ[Ý]]
+ˆÛÛ™šYÝ\˜][ÛËZKœÝX˜YÙ[Ý]]ÏÈÛÛ™šYÝ\™Y\›Z[˜[RJ
+KœÝX˜YÙ[Ý]]
+Bˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™T›Û\ÛÛÜŠˆÛÛ™šYÝ\˜][ÛËZKœ›Û\›Ü™YÜ›Ý[™ÏÈÛÛ™šYÝ\™Y\›Z[˜[RJ
+Kœ›Û\›Ü™YÜ›Ý[™
+BˆÛÛ™šYÝ\™QY]ÜŠÛÛ™šYÝ\˜][ÛËZK™Y]ÜˆÏÈˆŠB‚ˆYˆ][ÙHHÜ[ÛœËœÙ\™HÂˆ]ØZ][”Ù\™\Šˆ[ÙKˆ[[YNˆ[[YKˆ\›Ý˜[[™\Žˆ\›Ý˜[[™\‹ˆYÙ[ˆ›Ùš[K˜YÙ[Yš[š][ÛŠBˆ™]\›‚ˆBˆYˆØYYOHš[Âˆ]ØZ]\›Z[˜[›[™JÜ™X]Y
+ÛÛ™šYÝ\˜][Û”]
+H‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆYˆ]›Û\HÜ[ÛœËš[š]X[›Û\Âˆ˜\ˆÛ™TÚÝ›ØÙ\ÜÎˆYÙ[QÂˆ]ÝXØÙYYYH]ØZ]ÝX›Z]
+ˆ›Û\ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆ›ØÙ\ÜÎˆ	›Û™TÚÝ›ØÙ\ÜËˆ\›Z[˜[ˆ\›Z[˜[
+BˆYˆ]›ØÙ\ÜÈHÛ™TÚÝ›ØÙ\ÜÈÂˆÙ\ÜÚ[Û‹œÝX˜YÙ[ÈHYÙ[›ØÙ\ÜÔ™XÛÜ™›Y\™Ú[™ÊˆØ]™YˆÙ\ÜÚ[Û‹œÝX˜YÙ[ËˆÝ\œ™[ˆ]ØZ][[YKœÝ\\š\ÛÜ‹œ™XÛÜ™Ê[™\Žˆ›ØÙ\ÜÊJBˆBˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆžHÝÜ™K˜ÛÛ[Z]
+	ÛÜšÜÜXÙJBˆYˆ\ÝXØÙYYYÈ^]
+JHBˆ™]\›‚ˆBˆ]ØZ][”‘T
+ˆÛÜšÜÜXÙNˆ	ÛÜšÜÜXÙKˆÝÜ™NˆÝÜ™KˆÛYNˆÛYKˆ›Ú™XÝˆ›Ú™XÝˆ\ÝÜžUT“ˆ™\ÛÛ™Y\ÝÜžUT“
+Ü[ÛœÎˆÜ[ÛœËÛYNˆÛYK[š\›Û›Y[ˆ[š\›Û›Y[
+Kˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆØÜ”›ÝšY\ŽˆØÜ”›ÝšY\‹ˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ˆØ][ÙÜÎˆÙ]\˜Ø][ÙÜËˆš\ÝX[ˆš\ÝX[œšYÙJˆ\›Ý˜[[™\Žˆ\›Ý˜[[™\‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ[\XÚ]›ÝšY\œÎˆÙ]\š[\XÚ]›ÝšY\œËˆ›ÝšY\˜\ÙUT“Îˆ›ÝšY\˜\ÙUT“ÝÜ™JÙ]\œ›ÝšY\˜\ÙUT“ÊKˆY[[ÜžNˆY[[ÜžTÝ]KˆÙÎˆÙÔÝ]KˆÚÚ[ÎˆÚÚ[Ý]Kˆ\ØYÙTÝ]Îˆ\ØYÙTÝ]ÊKˆ\›Z[˜[ˆ\›Z[˜[
+BˆHØ]ÚÂˆš[R[™KœÝ[™\™\œ›Ü‹Üš]J]J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠWˆ‹]Ž
+JBˆ^]
+ŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈØY˜]]™TYÚ[œÊˆÜ[ÛœÎˆÓSÜ[ÛœËˆØYYÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛËˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×KˆÜÝˆ˜]]™TYÚ[’ÜÝˆ™YÚ\ÝžNˆYÚ[”™YÚ\ÝžBˆ
+H\Þ[˜È›ÝÜÈÂˆ]Ý\œ™[\™XÝÜžHHT“
+ˆš[UT“Ú]]ˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]ˆ\Ñ\™XÝÜžNˆYJBˆ]ÛÛ™šYÑ\™XÝÜžHBˆØYYÛÛ™šYÝ\˜][Û”]›X\ÂˆT“
+š[UT“Ú]]ˆ	
+K™[][™Ó\Ý]ÛÛ\Û™[
+
+BˆHÏÈÝ\œ™[\™XÝÜžBˆ]ÛÛ™šYÝ\™YBˆÛÛ™šYÝ\˜][ÛËœYÚ[œË™š[\Š™[˜X›Y
+K›X\Âˆ
+[žNˆ	˜\ÙUT“ˆÛÛ™šYÑ\™XÝÜžJBˆHÏÈ×Bˆ]ÛÛ[X[™[™HHÜ[ÛœËœYÚ[”]Ë›X\Âˆ
+[žNˆÛÛ™šYÝ\™YYÚ[Š]ˆ	
+K˜\ÙUT“ˆÝ\œ™[\™XÝÜžJBˆB‚ˆ›Üˆ][H[ˆÛÛ™šYÝ\™Y
+ÈÛÛ[X[™[™HÂˆ]^[™YHYÙ[ÛYK™^[™\Ù\”]
+][K™[žKœ][š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ]\›HT“
+š[UT“Ú]]ˆ^[™Y™[]]™UÎˆ][K˜˜\ÙUT“
+KœÝ[™\™^™Yš[UT“ˆÈÂˆÈHžH]ØZ]ÜÝ›ØYYÚ[Š]ˆ\›[Îˆ™YÚ\ÝžJBˆHØ]ÚÂˆYˆ][K™[žKœ™\]Z\™YÈ›ÝÈ\œ›ÜˆBˆš[R[™KœÝ[™\™\œ›Ü‹Üš]Jˆ]JˆØ\›š[™ÎˆÜ[Û˜[YÚ[ˆ	×
+\›œ]
+IÈØ\È›ÝØYYˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠWˆ‚ˆ]Ž
+JBˆBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È™YÚ\Ý\•ÛÛÊˆ[ˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛËˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×Bˆ
+H\Þ[˜È›ÝÜÈÂˆ]ÛÝ\˜Ù\ÈHÛÛ™šYÝ\˜][ÛËÛÛÛÝ\˜Ù\ÈÏÈ×Bˆ]ÛÛ™šYÝ\™YÝ[™\™ÛÛÈHÛÝ\˜Ù\Ë™š[\ˆÂˆ	šÚ[™OHXZTÝ[™\™ÛÛÔYÚ[‹™˜XÝÜžRÚ[™ˆBˆYˆÛÛ™šYÝ\™YÝ[™\™ÛÛËš\Ñ[\HÂˆ]ÛÛÈHžH]ØZ]YÚ[œË›XZÙUÛÛÊˆÚ[™ˆXZTÝ[™\™ÛÛÔYÚ[‹™˜XÝÜžRÚ[™ˆÛÛ^ˆYÚ[‘˜XÝÜžPÛÛ^
+YˆœÝ[™\™]ÛÛÈ‹[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆ›ÜˆÛÛ[ˆÛÛÈÈžH]ØZ][[YKœ™YÚ\Ý\ŠÛÛˆÛÛ
+HBˆH[ÙHÂˆ›ÜˆÛÝ\˜ÙH[ˆÛÛ™šYÝ\™YÝ[™\™ÛÛÈÚ\™HÛÝ\˜ÙK™[˜X›YÂˆ]ÛÛÈHžH]ØZ]YÚ[œË›XZÙUÛÛÊˆÚ[™ˆÛÝ\˜ÙKšÚ[™ˆÛÛ^ˆÛÝ\˜ÙK˜ÛÛ^
+[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆ›ÜˆÛÛ[ˆÛÛÈÈžH]ØZ][[YKœ™YÚ\Ý\ŠÛÛˆÛÛ
+HBˆBˆB‚ˆ›ÜˆÛÝ\˜ÙH[ˆÛÝ\˜Ù\ÂˆÚ\™HÛÝ\˜ÙK™[˜X›Y	‰ˆÛÝ\˜ÙKšÚ[™OHXZTÝ[™\™ÛÛÔYÚ[‹™˜XÝÜžRÚ[™Âˆ]ÛÛÈHžH]ØZ]YÚ[œË›XZÙUÛÛÊˆÚ[™ˆÛÝ\˜ÙKšÚ[™ˆÛÛ^ˆÛÝ\˜ÙK˜ÛÛ^
+[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆ›ÜˆÛÛ[ˆÛÛÈÈžH]ØZ][[YKœ™YÚ\Ý\ŠÛÛˆÛÛ
+HBˆBˆB‚ˆËËÈÛÛ[™Ü›Ý\˜[Y\È]Ú[™ÙYÈYÙ[™XÛÜ™ÈØ]™Y[™\ˆHÛˆËËÈ˜[YH\™H[Ý™YÈH™]ÈÛ™HH™^[YHHÛÛ™šYÝ\˜][Ûˆ\È™XY‚ˆš]˜]HÝ]XÈ]™[˜[YYÛÛ˜[Y\ÈHÈ˜Ø[Ý[]ÜˆŽˆXZPØ[Ý[]Ü•ÛÛ›˜[YWB‚ˆËËÈÛÛ˜[Y\È™[XZ[ˆ[ˆHYÙ[™XÛÜ™›Üˆ›ÝšY\‹Ü[[YHÜXš[]NÂˆËËÈÜ›Ý\˜[Y\È]HÜÝ^[™™]ÛHYYYÚ[ˆÛÛÈÚ]Ý]™\]Z\š[™ÂˆËËÈ\Ù\œÈÈÙÙÛH[ˆ[™XYH[˜X›YÜ›Ý\Ù™ˆ[™ÛˆYØZ[‹‚ˆš]˜]HÝ]XÈ[˜ÈÞ[˜Ú›Ûš^™UÛÛÜ›Ý\Ù[XÝ[ÛœÊˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ËˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆ[[YNˆYÙ[[[YKˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×Bˆ
+H\Þ[˜È›ÝÜÈÂˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Ûˆ[ÙHÈ™]\›ˆBˆ˜\ˆÛÛÐžQÜ›Ý\ˆÔÝš[™ÎˆÙ]Ýš[™Ï—HHÂˆYÙ[[[YK˜YÙ[ÛÛÜ›Ý\šYˆYÙ[[[YK˜YÙ[ÛÛÜ›Ý\ÛÛ˜[Y\ÂˆBˆ›ÜˆÛÝ\˜ÙH[ˆ˜YÛÛÛÝ\˜Ù\ÈÚ\™HÛÝ\˜ÙK™[˜X›YÂˆ›ÜˆÜ›Ý\[ˆžH]ØZ]YÚ[œËÛÛÜ›Ý\ÊˆÚ[™ˆÛÝ\˜ÙKšÚ[™ˆÛÛ^ˆÛÝ\˜ÙK˜ÛÛ^
+[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆÂˆÛÛÐžQÜ›Ý\ÙÜ›Ý\šYY˜][ˆ×WK™›Ü›U[š[ÛŠÜ›Ý\ÛÛ˜[Y\ÊBˆBˆBˆËÈÛÛÈXZH™YÚ\Ý\œÈ]Ù[ˆ8 %ÙËÚ]È8 %™[Û™ÈÈ›ÈYÚ[‹ÛÂˆËÈZ\ˆÜ›Ý\È\™H[™™\œ™YHØ^HÝÛÛÈ\ÝÈ[NÈÝ\Ú\ÙHHÜ›Ý\ˆËÈ˜[YY[ˆHÛÛ™šYÝ\˜][ÛˆÛÝ[ÚÝÈ\È[˜X›YY]Ù™™\ˆ›Ý[™Ë‚ˆ]Ü›Ý\YHÙ]
+ÛÛÐžQÜ›Ý\˜[Y\Ë™›]X\È	JBˆ]ÜÝÛÛÈH]ØZ][[YK˜]˜Z[X›UÛÛÊ
+K™š[\ˆÈYÜ›Ý\Y˜ÛÛZ[œÊ	›˜[YJHBˆ›ÜˆÜ›Ý\[ˆÛÛÜ›Ý\Yš[š][Û‹š[™™\œ™Y
+œ›ÛNˆÜÝÛÛÊHÂˆÛÛÐžQÜ›Ý\ÙÜ›Ý\šYY˜][ˆ×WK™›Ü›U[š[ÛŠÜ›Ý\ÛÛ˜[Y\ÊBˆBˆ˜\ˆÚ[™ÙYH˜[ÙBˆ›Üˆ[™^[ˆ˜Y˜YÙ[Ëš[™XÙ\ÈÂˆ]™]š[Ý\ÈH˜Y˜YÙ[ÖÚ[™^KÛÛ˜[Y\Âˆ]™]š[Ý\ÑÜ›Ý\ÈH˜Y˜YÙ[ÖÚ[™^KÛÛÜ›Ý\˜[Y\Âˆ›Üˆ
+Û™]ÊH[ˆ™[˜[YYÛÛ˜[Y\ÈÂˆYˆ˜Y˜YÙ[ÖÚ[™^KÛÛ˜[Y\Ëœ™[[Ý™JÛ
+HOHš[Âˆ˜Y˜YÙ[ÖÚ[™^KÛÛ˜[Y\Ëš[œÙ\
+™]ÊBˆBˆYˆ˜Y˜YÙ[ÖÚ[™^KÛÛÜ›Ý\˜[Y\Ëœ™[[Ý™JÛ
+HOHš[Âˆ˜Y˜YÙ[ÖÚ[™^KÛÛÜ›Ý\˜[Y\Ëš[œÙ\
+™]ÊBˆBˆBˆ›ÜˆÜ›Ý\˜[YH[ˆ˜Y˜YÙ[ÖÚ[™^KÛÛÜ›Ý\˜[Y\ÈÂˆ˜Y˜YÙ[ÖÚ[™^KÛÛ˜[Y\Ë™›Ü›U[š[ÛŠÛÛÐžQÜ›Ý\ÙÜ›Ý\˜[YWHÏÈ×JBˆBˆÚ[™ÙYBˆÚ[™ÙY™]š[Ý\ÈOH˜Y˜YÙ[ÖÚ[™^KÛÛ˜[Y\Âˆ™]š[Ý\ÑÜ›Ý\ÈOH˜Y˜YÙ[ÖÚ[™^KÛÛÜ›Ý\˜[Y\ÂˆBˆÝX\™Ú[™ÙY[ÙHÈ™]\›ˆBˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜YˆB‚ˆËËÈXÚÜÈHÛÛ™šYÝ\™YÐÔˆ˜XÚÙ[™˜[[™È˜XÚÈÈÚ]]™\ˆ\È]›Ü›BˆËËÈØ[ˆÙ™™\ˆ
+\Hš\Ú[Û‹[ˆHØØ[\ÜÙ\˜XÝš[˜\žJKˆÐÔˆ™]™\ˆ›ØÚÜÂˆËËÈÝ\\ˆÚ[ˆ›Ý[™È\È\ØX›HH™]\›™Y›ÝšY\ˆ^Z[œÈÚHBˆËËÈš\œÝ[YHÐÔˆ\È™\]Y\ÝY‚ˆš]˜]HÝ]XÈ[˜ÈÛÛ™šYÝ\™YÐÔ”›ÝšY\ŠˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛËˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×Bˆ
+H\Þ[˜ÈOˆ[žHÐÔ”›ÝšY\ˆÂˆ˜\ˆ˜Z[\™\ÎˆÔÝš[™×HH×BˆYˆ]ÛÛ™šYÝ\™YHÛÛ™šYÝ\˜][ÛË›ØÜ”›ÝšY\œË™š\œÝ
+Ú\™Nˆ™[˜X›Y
+HÂˆÈÂˆ™]\›ˆžH]ØZ]YÚ[œË›XZÙSÐÔ”›ÝšY\ŠˆÚ[™ˆÛÛ™šYÝ\™YšÚ[™ˆÛÛ^ˆÛÛ™šYÝ\™Y˜ÛÛ^
+[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆHØ]ÚÂˆ˜Z[\™\Ë˜\[™
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠBˆBˆBˆ˜\ˆ˜[˜XÚÒÚ[™ÈHÓXZUš\Ú[Û“ÐÔ”YÚ[‹œ™Y™\œ™Y˜XÝÜžRÚ[™Bˆ›ÜˆÚ[™[ˆÈš\Ú[Ûˆ‹\ÜÙ\˜XÝÐÔ”›ÝšY\‹™˜XÝÜžRÚ[™HÚ\™HY˜[˜XÚÒÚ[™Ë˜ÛÛZ[œÊÚ[™
+HÂˆ˜[˜XÚÒÚ[™Ë˜\[™
+Ú[™
+BˆBˆ›ÜˆÚ[™[ˆ˜[˜XÚÒÚ[™ÈÂˆÈÂˆ™]\›ˆžH]ØZ]YÚ[œË›XZÙSÐÔ”›ÝšY\ŠˆÚ[™ˆÚ[™ˆÛÛ^ˆYÚ[‘˜XÝÜžPÛÛ^
+YˆÚ[™[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆHØ]ÚÂˆ˜Z[\™\Ë˜\[™
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠBˆBˆBˆ™]\›ˆ[˜]˜Z[X›SÐÔ”›ÝšY\Šˆ™X\ÛÛŽˆ˜Z[\™\Ëš\Ñ[\BˆÈ››ÈÐÔˆ›ÝšY\ˆ\È™YÚ\Ý\™YÛˆ\È]›Ü›Kˆ‚ˆˆ˜Z[\™\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆˆŠJBˆB‚ˆËËÈ^ÜÙ\ÈHÚ\™YÚ]×Ê˜ÛÛÈÝ™\ˆ\ÈÙ\ÜÚ[Û‰ÜÈ™XXÚX›HÚ]Ë‚ˆËËÈ^H\™H™YÚ\Ý\™Y™Y›Ü™HÛÛ™šYÝ\™YYÙ[È\™Hš[\™YYØZ[œÝBˆËËÈÛ›ÝÛˆÛÛ˜[Y\ËÛÈ[ˆYÙ[X^H\Ý[HZÙH[žHÝ\ˆÛÛ‚ˆš]˜]HÝ]XÈ[˜È™YÚ\Ý\“Y[[ÜžUÛÛÊˆ[ˆ[[YNˆYÙ[[[YKˆÝ]NˆY[[ÜžTÝ]Bˆ
+H\Þ[˜È›ÝÜÈÂˆ›ÜˆYš[š][Ûˆ[ˆXZSY[[ÜžUÛÛË™Yš[š][ÛœÈÂˆ]˜[YHHYš[š][Û‹›˜[YBˆžH]ØZ][[YKœ™YÚ\Ý\ŠˆÛÛˆÛÜÝ\™UÛÛ
+Yš[š][ÛŽˆYš[š][ÛŠHÈ\™Ý[Y[ËÈ[‚ˆÝX\™Ý]Kœ™XYÓÝ\Ú]È[ÙHÂˆ™]\›ˆÛÛÝ]]
+ˆ^‚ˆ‘\œ›ÜŽˆ™XY[™ÈÝ\ˆÚ]È\È\ØX›Yˆ[˜X›H]Ú]ÛY[[ÜžHØÛÜH›Ú™XÝÜˆÛY[[ÜžHØÛÜH[ˆ‹ˆ\Ñ\œ›ÜŽˆYJBˆBˆ™]\›ˆÛÛÝ]]
+ˆ^ˆXZSY[[ÜžUÛÛË™^XÝ]Jˆ˜[YNˆ˜[YKˆ\™Ý[Y[Îˆ\™Ý[Y[Ë›Øš™XÝ˜[YHÏÈÎ—KˆÚ]ÎˆÝ]Kœ™XXÚX›PÚ]Ê
+JJBˆJBˆBˆB‚ˆËËÈ^ÜÙ\ÈHÚ\™YÙ×Ê˜ÛÛÈÝ™\ˆHÝ\œ™[›Ú™XÝ	ÜÈ\Ýš[K‚ˆËËÈZÙHHY[[ÜžHÛÛÈ^H\™H™YÚ\Ý\™Y™Y›Ü™HYÙ[È\™Hš[\™YˆËËÈYØZ[œÝHÛ›ÝÛˆÛÛ˜[Y\ËÛÈ[ˆYÙ[X^H\Ý[HZÙH[žHÝ\‹‚ˆš]˜]HÝ]XÈ[˜È™YÚ\Ý\•ÙÕÛÛÊˆ[ˆ[[YNˆYÙ[[[YKˆÝ]NˆÙÔÝ]Bˆ
+H\Þ[˜È›ÝÜÈÂˆ›ÜˆÛÛ[ˆXZUÙÕÛÛË›XZÙUÛÛÊ\›ˆÈÝ]K\›JHÂˆžH]ØZ][[YKœ™YÚ\Ý\ŠÛÛˆÛÛ
+BˆBˆB‚ˆËËÈ[œÈXZH\ÈHÝ[ÈÙ\™\ˆ[œÝXYÙˆH‘TˆPÔ›ÜˆY]ÜœËPÔ›Ü‚ˆËËÈÛÛØ[\œËˆ›ÝÜXZÈ”ÓÓ‹T”ÈÝ™\ˆÝ[‹ÜÝÝ]ÛÈ›ÈÝ]]X^HÛÂˆËËÈ\™H]H›ÝØÛÛ]Ù[ŽÈXYÛ›ÜÝXÜÈÛÈÈÝ\œ‹‚ˆš]˜]HÝ]XÈ[˜È[”Ù\™\ŠˆÈ[ÙNˆÙ\™S[ÙKˆ[[YNˆYÙ[[[YKˆ\›Ý˜[[™\Žˆ\›Z[˜[\›Ý˜[[™\‹ˆYÙ[ˆYÙ[Yš[š][Û‚ˆ
+H\Þ[˜ÈÂˆ]˜[œÜÜHÝ[Ò”ÓÓ””Õ˜[œÜÜœÝ[™\™SÊ
+BˆÝÚ]Ú[ÙHÂˆØ\ÙH˜XÜ‚ˆËÈÛÛ\›Ý˜[È™[Û™ÈÈHY]Ü‹›ÝÈH\›Z[˜[›Ø›ÙH\È]‚ˆ]œšYÙHHPÔ\›Z\ÜÚ[ÛœšYÙJ
+Bˆ]ØZ]\›Ý˜[[™\‹œÙ][YØ]JœšYÙK˜\›Ý˜[[™\ŠBˆ]Ù\™\ˆHPÔÙ\™\Š[[YNˆ[[YKYÙ[ˆYÙ[œšYÙNˆœšYÙJBˆš[R[™KœÝ[™\™\œ›Ü‹Üš]Jˆ]JœXZHPÔYÙ[™XYH
+
+YÙ[šY
+JNÈØZ][™È›ÜˆHÛY[ÛˆÝ[Ë—ˆ‹]Ž
+JBˆ]ØZ]Ù\™\‹œÙ\™JÛŽˆ˜[œÜÜ
+BˆØ\ÙH›XÜ‚ˆ]Ù\™\ˆHPÔYÙ[Ù\™\Š[[YNˆ[[YKYÙ[ˆYÙ[
+Bˆš[R[™KœÝ[™\™\œ›Ü‹Üš]Jˆ]JœXZHPÔÙ\™\ˆ™XYH
+
+YÙ[šY
+JNÈØZ][™È›ÜˆHÛY[ÛˆÝ[Ë—ˆ‹]Ž
+JBˆ]ØZ]Ù\™\‹œÙ\™JÛŽˆ˜[œÜÜ
+BˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÛÛ™šYÝ\™T[[YJˆÈ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛËˆÜ[ÛœÎˆÓSÜ[ÛœËˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×Bˆ
+H\Þ[˜È›ÝÜÈOˆ[[YTÙ]\Âˆ]›ÝšY\“Ý™\œšYHBˆÜ[ÛœËœ›ÝšY\“Ý™\œšYBˆÏÈ[š\›Û›Y[˜[YJÈ”PRWÔ“Õ’QTˆ‹“PRWÔ“Õ’QTˆ—K[Žˆ[š\›Û›Y[
+K›X\Âˆ›ÝšY\’Q
+	
+BˆBˆ]˜]Ð˜\ÙUT“BˆÜ[ÛœË˜˜\ÙUT“Ý™\œšYOË˜XœÛÛ]TÝš[™ÂˆÏÈ[š\›Û›Y[˜[YJˆÈ”PRWÐTÑWÕT“‹“PRWÐTÑWÕT“‹“ÔSRWÐTÑWÕT“—K[Žˆ[š\›Û›Y[
+Bˆ]˜\ÙUT“Ý™\œšYNˆT“ÂˆYˆ]˜]Ð˜\ÙUT“ÂˆÝX\™]\›HT“
+Ýš[™Îˆ˜]Ð˜\ÙUT“
+H[ÙHÈ›ÝÈÓQ\œ›Ü‹š[˜[YT“
+˜]Ð˜\ÙUT“
+HBˆ˜\ÙUT“Ý™\œšYHH\›ˆH[ÙHÂˆ˜\ÙUT“Ý™\œšYHHš[ˆBˆ]\RÙ^SÝ™\œšYHBˆžHÜ[ÛœË˜\RÙ^SÝ™\œšYHÏÈ[š\›Û›Y[TRÙ^J[Žˆ[š\›Û›Y[
+B‚ˆYˆ]ÛÛ™šYÝ\˜][ÛˆÂˆ]Ù[XÝYYÙ[QBˆÜ[ÛœË˜YÙ[Ý™\œšYHÏÈÛÛ™šYÝ\˜][Û‹™Y˜][YÙ[ˆÏÈÛÛ™šYÝ\˜][Û‹˜YÙ[Ë™š\œÝËšYˆ]Ù[XÝY›ÝšY\’QHÙ[XÝYYÙ[Q™›]X\ÈÙ[XÝYYÙ[Q[‚ˆÛÛ™šYÝ\˜][Û‹˜YÙ[Ë™š\œÝÈ	šYOHÙ[XÝYYÙ[QOËœ›ÝšY\‹œ˜]Õ˜[YBˆBˆ]\™Ù]›ÝšY\’QBˆ›ÝšY\“Ý™\œšYOËœ˜]Õ˜[YHÏÈÙ[XÝY›ÝšY\’QˆÏÈ›ÝšY\’Q›Ü[RKœ˜]Õ˜[YBˆ˜\ˆ›ÝšY\˜\ÙUT“ÎˆÔÝš[™ÎˆT“HHÎ—Bˆ›ÜˆÛÛ™šYÝ\™Y›ÝšY\ˆ[ˆÛÛ™šYÝ\˜][Û‹œ›ÝšY\œÈÂˆ˜\ˆ›ÝšY\ˆHÛÛ™šYÝ\™Y›ÝšY\‚ˆYˆ›ÝšY\‹šYOH\™Ù]›ÝšY\’QÂˆYˆ]˜\ÙUT“Ý™\œšYHÈ›ÝšY\‹˜˜\ÙUT“H˜\ÙUT“Ý™\œšYHBˆYˆ]\RÙ^SÝ™\œšYHÂˆ›ÝšY\‹˜\RÙ^HH\RÙ^SÝ™\œšYBˆ›ÝšY\‹˜\RÙ^Q[š\›Û›Y[Hš[ˆ›ÝšY\‹˜\RÙ^Qš[HHš[ˆBˆBˆ›ÝšY\˜\ÙUT“ÖÜ›ÝšY\‹šYHH›ÝšY\‹˜˜\ÙUT“ˆžH]ØZ][[YKœ™YÚ\Ý\ŠˆYÚ[œË›XZÙT›ÝšY\Šœ›ÛNˆ›ÝšY\‹[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆBˆ˜\ˆØ][ÙÜÎˆÓPÔÙ\™\Ø][Ù×HH×Bˆ›ÜˆÙ\™\ˆ[ˆÛÛ™šYÝ\˜][Û‹›XÜÙ\™\œÈÚ\™HÙ\™\‹™[˜X›YÂˆ]ÛÝ\˜ÙHHžH]ØZ]YÚ[œË›XZÙSPÔÛÛÛÝ\˜ÙJˆÚ[™ˆÙ\™\‹šÚ[™ˆÛÛ™šYÝ\˜][ÛŽˆÙ\™\‹ˆ[š\›Û›Y[ˆ[š\›Û›Y[
+BˆØ][ÙÜË˜\[™
+žH]ØZ][[YKœ™YÚ\Ý\ŠXÜˆÛÝ\˜ÙJJBˆBˆ]ØZ][[YK˜ÛÛ™šYÝ\™Q[YØ][ÛŠˆ›Û\ˆÛÛ™šYÝ\˜][Û‹œ›Û\ÏË™[YØ][Û‹ˆÛÜšÙ\’[œÝXÝ[ÛœÎˆÛÛ™šYÝ\˜][Û‹œ›Û\ÏËÛÜšÙ\ŠBˆ]ØZ][[YK˜ÛÛ™šYÝ\™PÛÛ\XÝ[ÛŠ›Û\ˆÛÛ™šYÝ\˜][Û‹œ›Û\ÏË˜ÛÛ\XÝ
+Bˆ]Û›ÝÛ•ÛÛÈHÙ]
+]ØZ][[YK˜]˜Z[X›UÛÛÊ
+K›X\
+›˜[YJJBˆ›Üˆ˜\ˆYÙ[[ˆÛÛ™šYÝ\˜][Û‹˜YÙ[ÈÂˆYÙ[ÛÛ˜[Y\Ë™›Ü›R[\œÙXÝ[ÛŠÛ›ÝÛ•ÛÛÊBˆžH]ØZ][[YKœ™YÚ\Ý\ŠYÙ[ˆYÙ[
+BˆBˆ™]\›ˆ[[YTÙ]\
+Ø][ÙÜÎˆØ][ÙÜË›ÝšY\˜\ÙUT“Îˆ›ÝšY\˜\ÙUT“ÊBˆB‚ˆ][ÈHÛÛ™šYÝ\™Y›ÝšY\ŠYˆš[È‹Ú[™ˆš[ÊBˆžH]ØZ][[YKœ™YÚ\Ý\ŠYÚ[œË›XZÙT›ÝšY\Šœ›ÛNˆ[Ë[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆ]˜\ÙUT“H˜\ÙUT“Ý™\œšYHÏÈT“
+Ýš[™Îˆš‹ËÌLËŒŒŒNŒLMÍÝŒHŠHBˆ]Ü[RHHÛÛ™šYÝ\™Y›ÝšY\ŠˆYˆ›ÝšY\’Q›Ü[RKœ˜]Õ˜[YKˆÚ[™ˆ›Ü[RPÛÛ\]X›Kˆ˜\ÙUT“ˆ˜\ÙUT“ˆ\RÙ^Nˆ\RÙ^SÝ™\œšYJBˆžH]ØZ][[YKœ™YÚ\Ý\ŠYÚ[œË›XZÙT›ÝšY\Šœ›ÛNˆÜ[RK[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆËÈHš\ÝX[ÛÜšÜÜXÙH˜YÈHÛÛ™šYÝ\˜][Ûˆœ›ÛH\ÙH[\XÚ]›ÝšY\œË‚ˆËÈ]™Y™\™[˜Ù\ÈHTHÙ^H›ÝYÚ]È[š\›Û›Y[˜\šXX›H[œÝXYÙ‚ˆËÈÛÜZ[™ÈHÙXÜ™][ÈHš[K‚ˆ˜\ˆ˜YHÜ[RBˆ˜Y˜\RÙ^HHš[ˆ˜Y˜\RÙ^Q[š\›Û›Y[H[š\›Û›Y[˜[YJˆÈ”PRWÐTWÒÑVH‹“PRWÐTWÒÑVH‹“ÔSRWÐTWÒÑVH—K[Žˆ[š\›Û›Y[
+Bˆ˜Y˜\RÙ^Qš[HH[š\›Û›Y[È”PRWÐTWÒÑVWÑ’SH—K™›]X\Âˆ	š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKš\Ñ[\HÈš[ˆ	ˆBˆ™]\›ˆ[[YTÙ]\
+ˆØ][ÙÜÎˆ×Kˆ[\XÚ]›ÝšY\œÎˆÚ[Ë˜YKˆ›ÝšY\˜\ÙUT“ÎˆÛÜ[RKšYˆ˜\ÙUT“JBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÙ[XÝY›Ùš[JˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛËˆÜ[ÛœÎˆÓSÜ[ÛœËˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×Bˆ
+H›ÝÜÈOˆÙ\ÜÚ[Û”›Ùš[HÂˆ]›ÝšY\“Ý™\œšYHBˆÜ[ÛœËœ›ÝšY\“Ý™\œšYBˆÏÈ[š\›Û›Y[˜[YJÈ”PRWÔ“Õ’QTˆ‹“PRWÔ“Õ’QTˆ—K[Žˆ[š\›Û›Y[
+K›X\Âˆ›ÝšY\’Q
+	
+BˆBˆ][Ù[Ý™\œšYHBˆÜ[ÛœË›[Ù[Ý™\œšYBˆÏÈ[š\›Û›Y[˜[YJÈ”PRWÓSÑS‹“PRWÓSÑS‹“ÔSRWÓSÑS—K[Žˆ[š\›Û›Y[
+BˆYˆ]ÛÛ™šYÝ\˜][Û‹XÛÛ™šYÝ\˜][Û‹˜YÙ[Ëš\Ñ[\HÂˆ]Ù[XÝYQBˆÜ[ÛœË˜YÙ[Ý™\œšYHÏÈÛÛ™šYÝ\˜][Û‹™Y˜][YÙ[ˆÏÈÛÛ™šYÝ\˜][Û‹˜YÙ[Ë™š\œÝËšYˆÝX\™]Yš[š][ÛˆHÛÛ™šYÝ\˜][Û‹˜YÙ[Ë™š\œÝ
+Ú\™NˆÈ	šYOHÙ[XÝYQJH[ÙHÂˆ›ÝÈXZPÛÛ™šYÝ\˜][Û‘\œ›Ü‹[šÛ›ÝÛYÙ[
+Ù[XÝYQÏÈˆŠBˆBˆ˜\ˆ›Ùš[HHÙ\ÜÚ[Û”›Ùš[JYš[š][ÛŽˆYš[š][ÛŠBˆYˆ]›ÝšY\“Ý™\œšYHÈ›Ùš[Kœ›ÝšY\ˆH›ÝšY\“Ý™\œšYHBˆYˆ][Ù[Ý™\œšYHÈ›Ùš[K›[Ù[H[Ù[Ý™\œšYHBˆYˆ]Þ\Ý[HHÜ[ÛœËœÞ\Ý[SÝ™\œšYHÂˆ›Ùš[Kš[œÝXÝ[ÛœÈHÞ\Ý[Bˆ›Ùš[KœÞ\Ý[T›Û\Hš[ˆBˆ›Ùš[KœÝ™X[HHÜ[ÛœËœÝ™X[H	‰ˆ›Ùš[KœÝ™X[BˆÜ[ÛœË˜\S[Z]Ý™\œšY\ÊÎˆ	œ›Ùš[K›[Z]ÊBˆ™]\›ˆ›Ùš[BˆBˆ˜\ˆ›Ùš[HHÙ\ÜÚ[Û”›Ùš[Jˆ›ÝšY\Žˆ›ÝšY\“Ý™\œšYHÏÈ›Ü[RKˆ[Ù[ˆ[Ù[Ý™\œšYHÏÈ™Ü[ÜÜÎŒŒˆ‹ˆ[œÝXÝ[ÛœÎˆÜ[ÛœËœÞ\Ý[SÝ™\œšYHÏÈ–[ÝH\™HH[[ÛÛ˜Ú\ÙH\ÜÚ\Ý[ˆ‹ˆÝ™X[NˆÜ[ÛœËœÝ™X[JBˆÜ[ÛœË˜\S[Z]Ý™\œšY\ÊÎˆ	œ›Ùš[K›[Z]ÊBˆ™]\›ˆ›Ùš[BˆB‚ˆËËÈH™[™\™\ˆ›Üˆ™\Y\ÈÛˆ\È\›Z[˜[Üˆš[Èš[[H™\˜˜][K‚ˆËËÈÝ]]]\È›ÝH\›Z[˜[Ý^\È™\˜˜][H[›\ÜÈ™[™\š[™È\È›Ü˜ÙY‚ˆš]˜]HÝ]XÈ[˜ÈX\šÙÝÛ”™[™\™\Šˆ[˜X›Yˆ›ÛÛˆ›Ü˜ÙYˆ›ÛÛˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×Bˆ
+HOˆX\šÙÝÛ•\›Z[˜[™[™\™\ÈÂˆÝX\™[˜X›Y›Ü˜ÙY\Ø]JÕÕUÑ’SS“ÊHOH[ÙHÈ™]\›ˆš[Bˆ]]XÝYHX\šÙÝÛ•\›Z[˜[[š\›Û›Y[™]XÝ
+[š\›Û›Y[
+Bˆ™]\›ˆX\šÙÝÛ•\›Z[˜[™[™\™\Šˆ[YNˆ]XÝY[YKˆÜ[ÛœÎˆX\šÙÝÛ“^[Ý]Ü[ÛœÊˆÚYˆ\›Z[˜[[™QY]Ü‹\›Z[˜[ÛÛ[[œÊ
+K[šXÛÙNˆ]XÝY[šXÛÙJKˆÚY›ÝšY\ŽˆÈ\›Z[˜[[™QY]Ü‹\›Z[˜[ÛÛ[[œÊ
+HJBˆB‚ˆËËÈÚ]Ý]]™\ÈÛ™H]™[ÙˆHÛÜˆH\›ˆ[ˆ›YÚÚÈ\Y^ˆËËÈÛÙ\ÈË[™HÛÛØ[ÈØZ][™È›Üˆ[ˆ[œÝÙ\‹‚ˆš]˜]H[[H‘T\›’Ú[™ÂˆØ\ÙHÚ]ˆØ\ÙHÂˆB‚ˆËËÈÛ™H[ˆ[ˆ›YÚˆHÚ]\›ˆ[ÛÈ™[Y[X™\œÈÚXÚÚ]]™[Û™ÜÈÂˆËËÈ[™Ú]]Ú][Ú[ˆ]Ø\ÈÙ[ÛÈ]È™\Hš[™È]ÈØ^BˆËËÈ˜XÚÈ]™[ˆY\ˆH\œÛÛˆY]YHÚ]Üˆ[Ý™YÈ[›Ý\ˆÛ™K‚ˆš]˜]HÝXÝ‘T\›ˆÂˆ]\ÚÎˆ\ÚÏYÙ[™\Ý[[žH\œ›Ü‚ˆ]Ý\YˆÛÛ[[Ý\ÐÛØÚË’[œÝ[ˆ]YˆYÙ[Qˆ]Ú[™ˆ‘T\›’Ú[™ˆ]Ú]QˆURQÂˆ]Ù[ˆÐYÙ[Y\ÜØYÙWBˆB‚ˆš]˜]HÝXÝ‘TÛÜÂˆ˜\ˆXÝ]™U\›Žˆ‘T\›Âˆ˜\ˆ›ØÝ\Îˆ‘TY\ÜØYÙU\™Ù]H›XZ[‚ˆ˜\ˆ\›Ý˜[ÎˆÊ™\]Y\Ýˆ\›Ý˜[™\]Y\Ý™\Nˆ‘T\›Ý˜[™\JWHH×Bˆ˜\ˆY][™Ð\›Ý˜[ˆ
+™\]Y\Ýˆ\›Ý˜[™\]Y\Ý™\Nˆ‘T\›Ý˜[™\JOÂˆ˜\ˆ[™[™Ô]Y]YSY\ÜØYÙNˆÝš[™ÏÂˆËËÈYHÚ[HH[œ]™XYØZ]È›ÜˆHÛÜ™Y›Ü™H™XY[™ÈYØZ[‹‚ˆ˜\ˆ™XY\”\šÙYHYBˆ˜\ˆ^][™ÈH˜[ÙBˆB‚ˆËËÈÚ]HÛÛ[X[™X^HÚ[™ÙH[™\ˆH[›š[™È\›‹ZÙ[ˆ™Y›Ü™H][œÂˆËËÈÛÈH\œÛÛˆØ[ˆ™HÛÝÈHÚ[™ÙH[™H[ˆYY]‚ˆš]˜]HÝXÝ‘TÛÛ[X[™Û˜\ÚÝÂˆ]Ú]QˆURQˆ]]NˆÝš[™Âˆ]Y\ÜØYÙ\ÎˆÐYÙ[Y\ÜØYÙWBˆ]YÙ[ˆYÙ[Yš[š][Û‚ˆ]ÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛÂˆ]\™XÝÜžNˆÝš[™Â‚ˆ[š]
+Ù\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[Û‹ÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛÊHÂˆÚ]QHÙ\ÜÚ[Û‹šYˆ]HHÙ\ÜÚ[Û‹]BˆY\ÜØYÙ\ÈHÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\ÂˆYÙ[HÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Yš[š][Û‚ˆÙ[‹˜ÛÛ™šYÝ\˜][ÛˆHÛÛ™šYÝ\˜][Û‚ˆ\™XÝÜžHHš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]ˆBˆB‚ˆËËÈÚ]HÚ]ÛÈÛ˜ÙHH[ˆ]Ý\Yœ›ÛHÙ[ÛÛY\È˜XÚÈÚ]ˆËËÈ™\Ý[ˆ\ÝX[H›Ý[™ÈÝXÚYHÚ]YX[Ú[H[™H[‰ÜÂˆËËÈ˜[œØÜš\\ÈHÚ]ˆÚ[ˆH\œÛÛˆY]Y]\š[™ÈH[ˆ8 %ˆËËÈÛX\™Y][™YHY\ÜØYÙKÛÛ\XÝY]8 %Z\ˆY]ÈÝ^H[™Ú]ˆËËÈH[ˆYYÛÙ\ÈY\ˆ[K‚ˆÝ]XÈ[˜ÈY\™ÙY˜[œØÜš\
+ˆÝ\œ™[ˆÐYÙ[Y\ÜØYÙWKÙ[ˆÐYÙ[Y\ÜØYÙWK™\Ý[ˆÐYÙ[Y\ÜØYÙWBˆ
+HOˆÐYÙ[Y\ÜØYÙWHÂˆÝX\™Ý\œ™[OHÙ[[ÙHÈ™]\›ˆ™\Ý[Bˆ]Ú\™YHš\
+Ù[™\Ý[
+Kœ™Yš^È	ŒOH	ŒHK˜ÛÝ[ˆ™]\›ˆÝ\œ™[
+È™\Ý[™›Üš\œÝ
+Ú\™Y
+BˆB‚ˆËËÈH‘T\ÈÛ™HÛÜÝ™\ˆÛ™HÝ™X[HÙˆ]™[Ëˆ\Y[™\È\œš]™Hœ›ÛBˆËËÈH™XYÙˆZ\ˆÝÛ‹ÛÈH›Û\Ý^\ÈÛˆØÜ™Y[ˆÚ[HH\›ˆ[œÎÂˆËËÈH\›ˆ[™[™ËHÛÛ\ÚÚ[™È›Üˆ\›Ý˜[[™HÚ[™ÙH[ˆH›ØÙ\ÜÂˆËËÈX›H\œš]™HÛˆHØ[YHÝ™X[KˆÛˆH\›Z[˜[H›Û\]™\ÈÛˆÛÂˆËËÈ™\Ù\™Y›ÝÜÈ[™\ˆHÝ]]
+\›Z[˜[ØÜ™Y[˜
+NÈ\Y[œ]ÙY\ÈBˆËËÈÛ™K[[™KX]XK][YH™Z]š[Ý\‹Ú\™HH\›ˆš[š\Ú\È™Y›Ü™HH™^[™BˆËËÈ\È™XY‚ˆš]˜]HÝ]XÈ[˜È[”‘T
+ˆÛÜšÜÜXÙNˆ[›Ý]YÙ[Ú]ÛÜšÜÜXÙKˆÝÜ™NˆYÙ[Ú]ÝÜ™KˆÛYNˆYÙ[ÛYKˆ›Ú™XÝˆYÙ[›Ú™XÝˆ\ÝÜžUT“ˆT“ˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆØÜ”›ÝšY\Žˆ[žHÐÔ”›ÝšY\‹ˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛËˆØ][ÙÜÎˆÓPÔÙ\™\Ø][Ù×Kˆš\ÝX[ˆš\ÝX[œšYÙKˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ˜\ˆÛÛ™šYÝ\˜][ÛˆHÛÛ™šYÝ\˜][Û‚ˆ˜\ˆØ][ÙÜÈHØ][ÙÜÂˆ˜\ˆ›Ú™XÝH›Ú™XÝˆ˜\ˆÙ\ÜÚ[ÛˆH‘TÙ\ÜÚ[ÛŠÚ]ˆÛÜšÜÜXÙKœÙ[XÝYÚ]JBˆ]Y]ÜˆH\›Z[˜[[™QY]ÜŠ\ÝÜžUT“ˆ\ÝÜžUT“
+Bˆ][\œ\[™\ˆH\›Z[˜[[\œ\[™\Š
+Bˆ˜\ˆ[››Ý[˜ÙY][[ÛŽˆÙ]YÙ[QˆH×BˆËÈÛ™H›ØÙ\ÜÈ\ˆÚ]›Ý\ˆ\›ŽˆH˜XÚÙÜ›Ý[™YÙ[Ý\Y™YBˆËÈ\›œÈYÛÈ\ÈÝ[HÝ\œ™[[‰ÜÈÚ[ÛÈ]Ý^\ÈÛÛXÝX›KˆËÈ[™HY\ÜØYÙH\YÚ[HH\›ˆ[œÈ\ÈHYÈØZ][‹‚ˆ˜\ˆÚ]›ØÙ\ÜÒQÎˆÕURQˆYÙ[QHHÎ—BˆËÈÚ]ÈÚÜÙHØ]™YYÙ[ÈÙ\™H]˜XÚÈ[ˆH›ØÙ\ÜÈX›H\ÂˆËÈÙ\ÜÚ[ÛŽˆÛ˜ÙH\È[›ÝYÚ[™ÛX\š[™ÈHX›H]\Ý›Ýœš[™È[BˆËÈ˜XÚË‚ˆ˜\ˆ™\ÝÜ™YÚ]QÎˆÙ]URQˆH×Bˆ]ØZ]\›Z[˜[›[™JœXZH8 %XZPÛÜ™HYÙ[‘TŠBˆ]ØZ]\›Z[˜[›[™Jˆ”›Ú™XÝˆ
+›Ú™XÝ™\Ü^S˜[YJH0­È
+X˜œ™]šX]Y]
+›Ú™XÝÛÜšÚ[™Ñ\™XÝÜžJJH0­ÈÜ›Ú™XÝÚÝÜÈ[Ü™H‚ˆ
+Bˆ]ØZ]\›Z[˜[›[™Jˆ•\HÚ[›ÜˆÛÛ[X[™Ëˆ
+›Û\Y[]JÙ\ÜÚ[ÛŠJH0­È
+Ù\ÜÚ[Û‹]JHŠBˆ]X\›Y\ˆHÛÜšÜÜXÙK˜Ú]Ë™š[\ˆÈ	šYOHÙ\ÜÚ[Û‹šY	‰ˆ	š\ÐÛÛ™\œØ][ÛˆBˆYˆYX\›Y\‹š\Ñ[\HÂˆ]ØZ]\›Z[˜[›[™Jˆ—
+X\›Y\‹˜ÛÝ[
+HX\›Y\ˆÚ]
+X\›Y\‹˜ÛÝ[OHHÈˆˆˆœÈŠH[ˆ\È›Ú™XÝˆØÚ]\ÝÚÝÜÈ[KØÚ]\ÙHˆÝÚ]Ú\Ëˆ‚ˆ
+BˆB‚ˆ]
+]™[ËÛÛ[X][ÛŠHH\Þ[˜ÔÝ™X[O‘T]™[‹›XZÙTÝ™X[J
+Bˆ]™XY\ˆH‘T[œ]™XY\ŠY]ÜŽˆY]Ü‹ÛÛ[X][ÛŽˆÛÛ[X][ÛŠBˆ]ØÜ™Y[ˆH\›Z[˜[ØÜ™Y[Š
+BˆYˆ]ØÜ™Y[ˆÂˆØÜ™Y[‹˜ÛÛ™šYÝ\™JZNˆ[YRJÛÛ™šYÝ\˜][ÛËZHÏÈš[š]
+
+K›Ú™XÝˆ›Ú™XÝ
+JBˆØÜ™Y[‹˜XÝ]˜]J
+Bˆ\›Z[˜[ØÜ™Y[‹š[œÝ[
+ØÜ™Y[ŠBˆY]Ü‹š[œÝ[
+Ý\™˜XÙNˆØÜ™Y[ŠBˆ]ØZ]\›Z[˜[˜]XÚ
+ØÜ™Y[ŽˆØÜ™Y[ŠBˆ]ØZ]š\ÝX[˜\›Ý˜[[™\‹œÙ]›Û\\ˆÈ™\]Y\Ý[‚ˆžH]ØZ]Ú]ÚXÚÙY›ÝÚ[™ÐÛÛ[X][ÛˆÈ[™[™È[‚ˆÛÛ[X][Û‹žZY[
+˜\›Ý˜[
+™\]Y\Ý‘T\›Ý˜[™\J[™[™ÊJJBˆBˆBˆBˆ]Ý\\š\ÛÜ‘™YYH\ÚÈÂˆ›Üˆ]ØZ]Ú[™ÙH[ˆ]ØZ][[YKœÝ\\š\ÛÜ‹™]™[Ê
+HÂˆÛÛ[X][Û‹žZY[
+œÝ\\š\ÛÜŠÚ[™ÙJJBˆBˆBˆËÈH[œ]™XY\ˆ[X™\˜][H›ØÚÜÈÛˆ]ÈÝÛˆ™XYX]š[™È\ÂˆËÈ]™[ÛÜœ™YHÈ[š[X]HHXÝ]š]HX\šÙ\ˆÚ[HH[ˆ\ÈXÝ]™K‚ˆ]XÝ]š]T[ÙHH\ÚÈÂˆÚ[HU\ÚËš\ÐØ[˜Ù[YÂˆžOÈ]ØZ]\ÚËœÛY\
+˜[›ÜÙXÛÛ™ÎˆŒÌÌ
+BˆÝX\™U\ÚËš\ÐØ[˜Ù[Y[ÙHÈ™]\›ˆBˆÛÛ[X][Û‹žZY[
+˜XÝ]š]T[ÙJBˆBˆBˆ˜\ˆÛÜH‘TÛÜ
+
+Bˆ˜\ˆXÝ]š]UØ\Ò[\œ\YH˜[ÙB‚ˆ[˜È™Yœ™\Ú\›Z[˜[Ù][™ÜÊ
+H\Þ[˜ÈÂˆ]ZHH[YRJÛÛ™šYÝ\˜][ÛËZHÏÈš[š]
+
+K›Ú™XÝˆ›Ú™XÝ
+BˆY]Ü‹˜ÛÛ™šYÝ\™JZNˆZJBˆØÜ™Y[Ë˜ÛÛ™šYÝ\™JZNˆZJBˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™U[šÚ[™ÊZK[šÚ[™ÊBˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™UÛÛ™\Ý[[™\ÊZKÛÛ™\Ý[[™\ÊBˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™UÛÛ™\Ý[ÛÛÜŠZKÛÛ™\Ý[›Ü™YÜ›Ý[™
+Bˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™TÝX˜YÙ[Ý]]
+ZKœÝX˜YÙ[Ý]]
+Bˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™T›Û\ÛÛÜŠZKœ›Û\›Ü™YÜ›Ý[™
+Bˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™U\›Z[˜[]JZK]JBˆÛÛ™šYÝ\™QY]ÜŠZK™Y]ÜŠBˆš\ÝX[›Y[[ÜžK™›ØÝ\Ê›Ú™XÝˆ›Ú™XÝÚ]QˆÙ\ÜÚ[Û‹šY
+Bˆš\ÝX[ÙË™›ØÝ\Ê›Ú™XÝˆ›Ú™XÝ
+Bˆ]ØZ][[YK˜ÛÛ™šYÝ\™SY[[ÜžJš\ÝX[›Y[[ÜžKœ›Û\ÙXÝ[ÛŠBˆ]ØZ][[YK˜ÛÛ™šYÝ\™T›Ú™XÝ[œÝXÝ[ÛœÊÙ[‹œ›Ú™XÝ[œÝXÝ[ÛœÔÙXÝ[ÛŠÛÛ™šYÝ\˜][ÛŠJBˆ]ØZ][[YK˜ÛÛ™šYÝ\™T[›š[™ÊÛÛ™šYÝ\˜][ÛË\ÙKœ[ˆÏÈYJBˆB‚ˆ[˜ÈÝ]\Ó[™J
+H\Þ[˜ÈOˆÝš[™ÈÂˆ˜\ˆ˜XÝÎˆÔÝš[™×HH×Bˆ]]™T›ØÙ\ÜÙ\ÈH]ØZ][[YKœÝ\\š\ÛÜ‹›]™T›ØÙ\ÜÙ\Ê
+Bˆ][›š[™ÈHXXÝ]š]UØ\Ò[\œ\Y	‰ˆ[]™T›ØÙ\ÜÙ\Ëš\Ñ[\Bˆ]XÝ]š]SX\šÙ\ˆH[›š[™ÈÈ˜[™ÛPœ˜Z[TÝš[™Ê
+Hˆ¸¥âÈ‚ˆYˆ]\›ˆHÛÜ˜XÝ]™U\›ˆÂˆ]XÝ]š]HH]ØZ][[YKœÝ\\š\ÛÜ‹š[™›Ê\›‹œY
+OË˜XÝ]š]HÏÈˆ‚ˆ]™Yš^H\›‹šÚ[™OH˜ÈÈ˜Èˆˆˆ‚ˆ˜XÝË˜\[™
+ˆ™Yš^
+È
+XÝ]š]Kš\Ñ[\HXÝ]š]HOH[šÚ[™ÈˆÈ[šÚ[™Èˆˆœ[›š[™È
+XÝ]š]JHŠBˆ
+BˆBˆ]Ú[™[ˆH]ØZ][[YKœÝ\\š\ÛÜ‹›]™T›ØÙ\ÜÙ\Ê
+K™š[\ˆÈ	™\ˆBˆYˆXÚ[™[‹š\Ñ[\HÂˆ]]\ÙYHÚ[™[‹™š[\ˆÈ	œÝ]HOHœ]\ÙYK˜ÛÝ[ˆ]]Y]YYHÚ[™[‹™š[\ˆÈ	œÝ]HOHœ]Y]YYK˜ÛÝ[ˆ˜\ˆ›Ý\ÎˆÔÝš[™×HH×BˆYˆ]\ÙYˆÈ›Ý\Ë˜\[™
+—
+]\ÙY
+H]\ÙYŠHBˆYˆ]Y]YYˆÈ›Ý\Ë˜\[™
+—
+]Y]YY
+H]Y]YYŠHBˆ˜XÝË˜\[™
+ˆ—
+Ú[™[‹˜ÛÝ[
+HYÙ[
+Ú[™[‹˜ÛÝ[OHHÈˆˆˆœÈŠH‚ˆ
+È
+›Ý\Ëš\Ñ[\HÈˆˆˆˆ
+
+›Ý\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJJHŠJBˆBˆ]]Y]YYH]ØZ][[YKœÝ\\š\ÛÜ‹œ]Y]YYY\ÜØYÙ\Ê
+K˜ÛÝ[ˆYˆ]Y]YYˆÈ˜XÝË˜\[™
+—
+]Y]YY
+H]Y]YYŠHBˆYˆØ\ÙH˜YÙ[
+]Y
+HHÛÜ™›ØÝ\ÈÈ˜XÝË˜\[™
+¸¡¤ˆYÙ[×
+Yœ˜]Õ˜[YJHŠHBˆYˆ]Y][™ÈHÛÜ™Y][™Ð\›Ý˜[Âˆ˜XÝË˜\[™
+šœÛÛˆ›Üˆ
+Y][™Ëœ™\]Y\ÝÛÛ›˜[YJOÈŠBˆH[ÙHYˆ]ØZ][™ÈHÛÜ˜\›Ý˜[Ë™š\œÝÂˆ]ÚÈHØZ][™Ëœ™\]Y\Ýœ[‹œY›X\È˜YÙ[×
+	œ˜]Õ˜[YJHˆHÏÈˆ‚ˆ˜XÝË˜\[™
+˜\›Ý™OÈ
+ÚÊW
+ØZ][™Ëœ™\]Y\ÝÛÛ›˜[YJHÞKØKÛ‹ÙKØ×HŠBˆBˆ]]Z[H˜XÝËš\Ñ[\HÈˆˆˆˆ0­Èˆ
+È˜XÝËš›Ú[™Y
+Ù\\˜]ÜŽˆˆ0­ÈŠBˆËÈHÚ]]HÛÙ\È\ÝÛÈH˜\œ›ÝÈ\›Z[˜[[˜Ø]\È]›ÝHÝ]\Ë‚ˆ™]\›‚ˆ—
+XÝ]š]SX\šÙ\ŠH
+Ý\œ™[\™XÝÜžS˜[YJ
+JH0­È
+›Ú™XÝ™\Ü^S˜[YJH
+›Û\Y[]JÙ\ÜÚ[ÛŠJW
+]Z[
+H0­È
+Ù\ÜÚ[Û‹]JH‚ˆB‚ˆ[˜È›Û\^
+
+HOˆÝš[™ÈÂˆ]›Û\ˆÝš[™ÂˆYˆÛÜœ[™[™Ô]Y]YSY\ÜØYÙHOHš[Âˆ›Û\Hœ]Y]YHÜÝX›Z]ÚYÛ›Ü™KØÛX\—Oˆ‚ˆH[ÙHYˆÛÜ™Y][™Ð\›Ý˜[OHš[Âˆ›Û\HšœÛÛˆ‚ˆH[ÙHYˆ]ØZ][™ÈHÛÜ˜\›Ý˜[Ë™š\œÝÂˆ]ÚÈHØZ][™Ëœ™\]Y\Ýœ[‹œY›X\Èˆ×
+	œ˜]Õ˜[YJHˆHÏÈˆ‚ˆ›Û\H˜\›Ý™H
+ÚÊW
+ØZ][™Ëœ™\]Y\ÝÛÛ›˜[YJOÈÞKØKÛ‹ÙKØ×H‚ˆH[ÙHYˆØ\ÙH˜YÙ[
+]Y
+HHÛÜ™›ØÝ\ÈÂˆËÈH›Û\˜[Y\ÈH›ØÙ\ÜÈH[™HÛÙ\ÈÎˆH›ØÝ\ÙYÚ[ÜˆBˆËÈÚ]	ÜÈÝÛˆÛ˜ÙH]\È[‹ÛÈ]ÈY\È][™›ÜˆØYÙ[ÈÛÛ[X[™Ë‚ˆ›Û\HœXZH×
+Yœ˜]Õ˜[YJOˆ‚ˆH[ÙHYˆ]YHÚ]›ØÙ\ÜÒQÖÜÙ\ÜÚ[Û‹šYHÂˆ›Û\HœXZH×
+Yœ˜]Õ˜[YJOˆ‚ˆH[ÙHÂˆ›Û\HœXZOˆ‚ˆBˆ]]HHš\ÚX›URU]JÛÛ™šYÝ\˜][ÛËZK]HÏÈˆŠBˆ™]\›ˆ]Kš\Ñ[\HÈ›Û\ˆ–×
+]JWH
+›Û\
+H‚ˆB‚ˆ[˜È™Yœ™\ÚÝ]\Ê
+H\Þ[˜ÈÂˆÝX\™]ØÜ™Y[ˆ[ÙHÈ™]\›ˆBˆØÜ™Y[‹œÙ]Ý]\Ê]ØZ]Ý]\Ó[™J
+JBˆB‚ˆËËÈ]ÈH[œ]™XY™XYH™^[™KˆÙ][™ÜÈ]HY]Ü‚ˆËËÈ™XYÈ\™H™Yœ™\ÚY\™KÚ[HH™XY\È\šÙY[™Ø[››Ý˜XÙK‚ˆ[˜È™[X\ÙT™XY\ŠÛÜšÜÜXÙNˆYÙ[Ú]ÛÜšÜÜXÙJH\Þ[˜ÈÂˆÝX\™ÛÜœ™XY\”\šÙY[ÛÜ™^][™È[ÙHÈ™]\›ˆBˆ]ØZ]™Yœ™\Ú\›Z[˜[Ù][™ÜÊ
+BˆYˆØÜ™Y[ˆOHš[ÂˆËÈ[››Ý[˜Ú[™ÈÚ[HHÛ\ÜÚXÈY]ÜˆÝÛœÈH›ÝÈÛÝ[ÛÜœ\]ˆËÈÛÈÛˆHZ[ˆ\›Z[˜[\È\[œÈ™]ÙY[ˆ›Û\Ë‚ˆ]ØZ][››Ý[˜ÙPYÙ[][[ÛŠˆ[[YNˆ[[YK[››Ý[˜ÙYˆ	˜[››Ý[˜ÙY][[Û‹\›Z[˜[ˆ\›Z[˜[
+BˆBˆ]Ý]\ÈH]ØZ]Ý]\Ó[™J
+BˆØÜ™Y[ËœÙ]Ý]\ÊÝ]\ÊBˆÛÜœ™XY\”\šÙYH˜[ÙBˆ™XY\‹œ™\Ý[YJˆÚ]ˆ‘T[œ]™XY\‹”›Û\
+ˆ^ˆ›Û\^
+
+KˆÛÛ\][ÛœÎˆÛÛ\][ÛØ[™Y]\ÊˆÛÜšÜÜXÙNˆÛÜšÜÜXÙKÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ˆÚÚ[Îˆš\ÝX[œÚÚ[Ë˜Ø][ÙËœÚÚ[ÊKˆÙ\\˜]ÜŽˆØÜ™Y[ˆOHš[ÈÝ]\Èˆš[
+JBˆB‚ˆËËÈÛˆHZ[ˆ\›Z[˜[H\›ˆÝÛœÈHØÜ™Y[‹ÛÈH™^[™HØZ]È›Ü‚ˆËËÈ]ÈÛˆH\œÚ\Ý[ØÜ™Y[ˆH›Û\\È[Ø^\ÈÜ[‹‚ˆ[˜È™[X\ÙRY’YJÛÜšÜÜXÙNˆYÙ[Ú]ÛÜšÜÜXÙJH\Þ[˜ÈÂˆYˆØÜ™Y[ˆOHš[ÛÜ˜XÝ]™U\›ˆOHš[Âˆ]ØZ]™[X\ÙT™XY\ŠÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆBˆB‚ˆ[˜ÈXZ[”›ØÙ\ÜÊ
+H\Þ[˜ÈOˆYÙ[QÂˆYˆ]YHÚ]›ØÙ\ÜÒQÖÜÙ\ÜÚ[Û‹šYHÈ™]\›ˆYBˆ]YH]ØZ][[YK˜[ØØ]T›ØÙ\ÜÊYÙ[QˆÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q\ÚÎˆÙ\ÜÚ[Û‹]JBˆÚ]›ØÙ\ÜÒQÖÜÙ\ÜÚ[Û‹šYHHYˆ™]\›ˆYˆB‚ˆËËÈœš[™ÜÈ]™\žHÚ]	ÜÈØ]™YYÙ[È\È]HÚ]H›ØÙ\ÜÈX›N‚ˆËËÈÚ][œÈ[™\ˆHÚ]	ÜÈ›ØÙ\ÜË]™HÜˆš[š\ÚY™\XÙ\È]ÂˆËËÈØ]™YÛÜK[™Ú]HX›H\ÈÚ[˜ÙH›Ü™ÛÝ[ˆÝ^\È\ÈØ]™Y‚ˆËËÈØ[YÚ\™]™\ˆHÛÜšÜÜXÙH\ÈX›Ý]È™HÜš][‹‚ˆ[˜È™XÛÜ™ÝX˜YÙ[Ê
+H\Þ[˜ÈÂˆ›Üˆ
+Ú]QY
+H[ˆÚ]›ØÙ\ÜÒQÈÂˆ]Ý\œ™[H]ØZ][[YKœÝ\\š\ÛÜ‹œ™XÛÜ™Ê[™\ŽˆY
+BˆYˆÚ]QOHÙ\ÜÚ[Û‹šYÂˆÙ\ÜÚ[Û‹œÝX˜YÙ[ÈHYÙ[›ØÙ\ÜÔ™XÛÜ™›Y\™Ú[™ÊˆØ]™YˆÙ\ÜÚ[Û‹œÝX˜YÙ[ËÝ\œ™[ˆÝ\œ™[
+BˆH[ÙHYˆ˜\ˆÚ]HÛÜšÜÜXÙK˜Ú]Ë™š\œÝ
+Ú\™NˆÈ	šYOHÚ]QJHÂˆÚ]œÝX˜YÙ[ÈHYÙ[›ØÙ\ÜÔ™XÛÜ™›Y\™Ú[™ÊØ]™YˆÚ]œÝX˜YÙ[ËÝ\œ™[ˆÝ\œ™[
+BˆÛÜšÜÜXÙK\Ù\
+Ú]
+BˆBˆBˆB‚ˆËËÈ]ÈHYÙ[ÈØ]™YÚ]HÚ]]H›Û\˜XÚÈ[ˆH›ØÙ\ÜÂˆËËÈX›KÛ˜ÙH\ˆÚ][™Ù\ÜÚ[Û‹ÛÈØYÙ[È™YX[™ØYÙ[ÈÙØˆËËÈÚÝÈÚ]X\›Y\ˆ[œÈÝ\Y™Y›Ü™HHÚ]	ÜÈ™^\›‹‚ˆ[˜È™\ÝÜ™TØ]™YÝX˜YÙ[Ê
+H\Þ[˜ÈÂˆÝX\™™\ÝÜ™YÚ]QËš[œÙ\
+Ù\ÜÚ[Û‹šY
+Kš[œÙ\Y\Ù\ÜÚ[Û‹œÝX˜YÙ[Ëš\Ñ[\H[ÙHÂˆ™]\›‚ˆBˆ]YH]ØZ]XZ[”›ØÙ\ÜÊ
+Bˆ]™\ÝÜ™YH]ØZ][[YKœÝ\\š\ÛÜ‹œ™\ÝÜ™JÙ\ÜÚ[Û‹œÝX˜YÙ[Ë[™\ŽˆY
+BˆËÈYH™]ÙY[ˆ\›œËZÙHHÚ]]\È[™XYH[Žˆ\ÝY\ÈÛ™KˆËÈÛX\™YÚ]H™\Ý[™™[Ü[™YžH]È™^\›‹‚ˆ]ØZ][[YKœÝ\\š\ÛÜ‹˜ÛÛ\]JY
+BˆÝX\™\™\ÝÜ™Yš\Ñ[\H[ÙHÈ™]\›ˆBˆ]ØZ]\›Z[˜[›[™Jˆ—
+™\ÝÜ™Y˜ÛÝ[
+HYÙ[
+™\ÝÜ™Y˜ÛÝ[OHHÈˆˆˆœÈŠHœ›ÛHX\›Y\ˆ[œÈÙˆ\ÈÚ]ˆØYÙ[È™YH\ÝÈ[KØYÙ[ÈÙÈQ™XYÈÛ™KØYÙ[ÈÛX\ˆ›ÜÈ[Kˆ‚ˆ
+BˆB‚ˆËËÈ›ÜÈHYÙ[ÈØ]™YÚ]HÚ]]H›Û\]H›ØÙ\ÜÂˆËËÈX›H›ÈÛ™Ù\ˆÛËY\ˆØYÙ[ÈÛX\˜ˆ[œÝÙ\œÈÝÈX[žHÙ[‚ˆ[˜È›Ü›Ü™ÛÝ[”ÝX˜YÙ[Ê
+H\Þ[˜ÈOˆ[Âˆ]Û›ÝÛˆHÙ]
+]ØZ][[YKœÝ\\š\ÛÜ‹œ›ØÙ\ÜÙ\Ê
+K›X\
+œ[’Q
+JBˆ]™Y›Ü™HHÙ\ÜÚ[Û‹œÝX˜YÙ[Ë˜ÛÝ[ˆÙ\ÜÚ[Û‹œÝX˜YÙ[Ëœ™[[Ý™P[ÈZÛ›ÝÛ‹˜ÛÛZ[œÊ	œ[’Q
+HBˆ™]\›ˆ™Y›Ü™HHÙ\ÜÚ[Û‹œÝX˜YÙ[Ë˜ÛÝ[ˆB‚ˆ[˜È™YÚ[•\›ŠÈ™\]Y\ÝˆYÙ[™\]Y\Ý›ØÙ\ÜÈYˆYÙ[QÚ[™ˆ‘T\›’Ú[™
+H\Þ[˜ÈÂˆ]ØZ]\›Z[˜[œ™\Ù]™\ÜÛœÙJ
+Bˆ]\ÚÈH\ÚÈÂˆžH]ØZ][[YKœ[Š™\]Y\Ý›ØÙ\ÜÎˆY
+HÈ]™[[‚ˆ]ØZ]\›Z[˜[˜ÛÛœÝ[YJ]™[
+BˆBˆBˆ[\œ\[™\‹˜XÝ]˜]HÈ\ÚË˜Ø[˜Ù[
+
+HBˆXÝ]š]UØ\Ò[\œ\YH˜[ÙBˆÛÜ˜XÝ]™U\›ˆH‘T\›Šˆ\ÚÎˆ\ÚËÝ\YˆÛÛ[[Ý\ÐÛØÚË››ÝËYˆYÚ[™ˆÚ[™ˆÚ]QˆÚ[™OH˜Ú]ÈÙ\ÜÚ[Û‹šYˆš[Ù[ˆ™\]Y\Ý›Y\ÜØYÙ\ÊBˆ\ÚÈÂˆ]Ý]ÛÛYNˆ™\Ý[YÙ[™\Ý[[žH\œ›Ü‚ˆÈÂˆÝ]ÛÛYHHœÝXØÙ\ÜÊžH]ØZ]\ÚË˜[YJBˆHØ]ÚÂˆÝ]ÛÛYHH™˜Z[\™J\œ›ÜŠBˆBˆÛÛ[X][Û‹žZY[
+\›‘š[š\ÚY
+Ý]ÛÛYJJBˆBˆ]ØZ]™Yœ™\ÚÝ]\Ê
+BˆB‚ˆËËÈÝ\ÈÛ™H\›ˆÚ]Ú]]™\ˆ\È]Y]YY›ÜˆHÚ]›ÛÝÙYžHBˆËËÈ^È\Ý\YˆH\›ˆ[œÈ[ˆ]ÈÝÛˆ\ÚÎÈHÛÜX\œÈX›Ý]ˆËËÈ]È[™\È[ˆ]™[‚ˆ[˜ÈÝ\\›ŠÈ^ÎˆÔÝš[™×KYÛ›Üš[™Ô]Y]YNˆ›ÛÛH˜[ÙJH\Þ[˜ÈÂˆ]YH]ØZ]XZ[”›ØÙ\ÜÊ
+Bˆ][HYÛ›Üš[™Ô]Y]YBˆÈÙ]
+]ØZ][[YKœÝ\\š\ÛÜ‹œ]Y]YYY\ÜØYÙ\Ê›ÜŽˆY
+K›X\
+šY
+JHˆ×Bˆ˜\ˆY\ÜØYÙ\ÈH]ØZ][[YKœÝ\\š\ÛÜ‹™˜Z[’[˜›Þ
+Y^ÛY[™Îˆ[
+BˆY\ÜØYÙ\Ë˜\[™
+ÛÛ[ÓÙŽˆ^Ë›X\ÈYÙ[Y\ÜØYÙK\Ù\Š	
+HJBˆÝX\™[Y\ÜØYÙ\Ëš\Ñ[\H[ÙHÈ™]\›ˆBˆYˆ\Ù\ÜÚ[Û‹œ[™[™ÐÛÛ[š\Ñ[\HÂˆY\ÜØYÙ\ÖÌK˜ÛÛ[˜\[™
+ÛÛ[ÓÙŽˆÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[
+BˆÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[œ™[[Ý™P[
+
+BˆBˆ›ÜˆY\ÜØYÙH[ˆY\ÜØYÙ\ÈÈÙ\ÜÚ[Û‹š\ÝÜžK˜\[™
+Y\ÜØYÙJHBˆÙ\ÜÚ[Û‹œ™Yœ™\Ú]Jœ›ÛNˆY\ÜØYÙ\ÖÌK^
+Bˆ˜\ˆ™\]Y\ÝHÚ]™\]Y\Ý
+
+Bˆ™\]Y\ÝšYÛ›Ü™Y]Y]YYY\ÜØYÙRQÈH[ˆ]ØZ]™YÚ[•\›Š™\]Y\Ý›ØÙ\ÜÎˆYÚ[™ˆ˜Ú]
+BˆB‚ˆËËÈHÚ]	ÜÈ™^[Žˆ]ÈÚÛH\ÝÜžH[™\ˆHÝ\œ™[›Ùš[K‚ˆ[˜ÈÚ]™\]Y\Ý
+
+HOˆYÙ[™\]Y\ÝÂˆ]›Ùš[HHÙ\ÜÚ[Û‹œ›Ùš[Bˆ™]\›ˆYÙ[™\]Y\Ý
+ˆYÙ[Qˆ›Ùš[K˜YÙ[Qˆ›ÝšY\Žˆ›Ùš[Kœ›ÝšY\‹ˆ[Ù[ˆ›Ùš[K›[Ù[ˆY\ÜØYÙ\ÎˆÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\ËˆÛÛ˜[Y\Îˆ›Ùš[KÛÛ˜[Y\ËˆÛÛÜ›Ý\˜[Y\Îˆ›Ùš[KÛÛÜ›Ý\˜[Y\ËˆÝX˜YÙ[˜[Y\Îˆ›Ùš[KœÝX˜YÙ[˜[Y\ËˆÛÛÚÚXÙNˆ›Ùš[KÛÛÚÚXÙKˆ™\ÜÛœÙQ›Ü›X]ˆ›Ùš[Kœ™\ÜÛœÙQ›Ü›X]ˆÜ[ÛœÎˆ›Ùš[K›Ü[ÛœËˆ[Z]Îˆ›Ùš[K›[Z]ËˆÝ™X[Nˆ›Ùš[KœÝ™X[KˆÛÛØ[[™ÔÝ˜]YÞNˆ›Ùš[KÛÛØ[[™ÔÝ˜]YÞKˆ\ÙUÛÛ›ÞNˆ›Ùš[K\ÙUÛÛ›ÞKˆ›ÞQ^ÜÙYÛÛÎˆ›Ùš[Kœ›ÞQ^ÜÙYÛÛËˆÛÛ[YØ][ÛŽˆ›Ùš[KÛÛ[YØ][Û‹ˆ™]žNˆ›Ùš[Kœ™]žKˆ]]ØÛÛ\XÝˆ›Ùš[K˜]]ØÛÛ\XÝˆÛÛ^ˆ›Ùš[K˜ÛÛ^ˆÙ\ÜÚ[Û’QˆÙ\ÜÚ[Û‹œÙ\ÜÚ[Û’Q
+BˆB‚ˆËËÈXÚÜÈH]\ÙYÜˆ[\œ\Y\ÚÈ\Ú\™H]ÝÜYˆH\ÝÜžH\ÂˆËËÈ[ˆYØZ[ˆÚ]Hœ™\ÚYÙ][™›Ý[™È™]ÈØZYÛÈH[Ù[ÙY\ÂˆËËÈ]È\ÝÛÛ™\Ý[È[™Ø\œšY\ÈÛ‹ˆ]Y]YYY\ÜØYÙ\ÈÛÈÚ]]BˆËËÈØ^H^HÛÝ[Ú]H\YÛ™K‚ˆ\ØØ\™X›T™\Ý[ˆ[˜ÈÛÛ[YU\›Š
+H\Þ[˜ÈOˆ›ÛÛÂˆ]YH]ØZ]XZ[”›ØÙ\ÜÊ
+BˆYˆ]ØZ][[YKœÝ\\š\ÛÜ‹š\Ô]Y]YYY\ÜØYÙ\ÊY
+HÂˆ]ØZ]Ý\\›Š×JBˆ™]\›ˆYBˆBˆÝX\™]\ÝHÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\Ë›\Ý\Ýœ›ÛHOHœÞ\Ý[H[ÙHÂˆ]ØZ]\›Z[˜[›[™J“›Ý[™ÈÈÛÛ[YHY]ˆ\ÈÚ]\È›ÈY\ÜØYÙ\ËˆŠBˆ™]\›ˆ˜[ÙBˆBˆYˆ\Ýœ›ÛHOH˜\ÜÚ\Ý[\ÝÛÛØ[Ëš\Ñ[\HÂˆ]ØZ]\›Z[˜[›[™Jˆ“›Ý[™ÈÈÛÛ[YNˆH\Ý™\HØ\ÈÛÛ\]Kˆ\HHY\ÜØYÙH[œÝXYˆŠBˆ™]\›ˆ˜[ÙBˆBˆ]ØZ]™YÚ[•\›ŠÚ]™\]Y\Ý
+
+K›ØÙ\ÜÎˆYÚ[™ˆ˜Ú]
+Bˆ™]\›ˆYBˆB‚ˆËËÈ›ÛÈÚ][ˆ[\œ\Y[ˆY[™XYHYY[ÈHÚ]Ú]ˆËËÈ[žHÛÛØ[]™]™\ˆ[œÝÙ\™YX\šÙY\ÈÝXÚÛÈH™^\›ˆ8 %BˆËËÈ\YÛ™HÜˆØÛÛ[YH8 %Ý\Èœ›ÛH\™H[œÝXYÙˆœ›ÛH™Y›Ü™HBˆËËÈ[‹ˆ™]\›œÈÝÈX[žHY\ÜØYÙ\ÈÙ\™HÙ\‚ˆ[˜ÈÙY\\X[˜[œØÜš\
+Ùˆ\›Žˆ‘T\›‹™X\ÛÛŽˆÝš[™ÊH\Þ[˜ÈOˆ[ÂˆÝX\™]Ú]QH\›‹˜Ú]Q]Ý\œ™[HÝ\œ™[Y\ÜØYÙ\ÊÙŽˆÚ]Q
+H[ÙHÈ™]\›ˆBˆ]\X[H]ØZ][[YKœÝ\\š\ÛÜ‹˜[œØÜš\
+\›‹œY
+BˆÝX\™\\X[š\Ñ[\K\X[OHÝ\œ™[[ÙHÈ™]\›ˆBˆ]Ù\HX^
+\X[˜ÛÝ[H\›‹œÙ[˜ÛÝ[
+BˆÙ]JˆYÙ[˜[œØÜš\Y]Ü‹˜[œÝÙ\š[™Õ[˜[œÝÙ\™YÛÛØ[Ê[Žˆ\X[™X\ÛÛŽˆ™X\ÛÛŠKœ›ÛNˆ\›ŠBˆ™]\›ˆÙ\ˆB‚ˆËËÈHY\ÜØYÙ\ÈHÚ]ÛÈšYÚ›ÝÎˆHÙ\ÜÚ[Û‰ÜÈ›ÜˆHÚ]]BˆËËÈ›Û\HÛÜšÜÜXÙHÛÜH›Üˆ[žHÝ\‹ˆš[Û˜ÙHHÚ]\ÈÛÜÙY‚ˆ[˜ÈÝ\œ™[Y\ÜØYÙ\ÊÙˆÚ]QˆURQ
+HOˆÐYÙ[Y\ÜØYÙWOÈÂˆYˆÚ]QOHÙ\ÜÚ[Û‹šYÈ™]\›ˆÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\ÈBˆ™]\›ˆÛÜšÜÜXÙK˜Ú]Ë™š\œÝÈ	šYOHÚ]QOË›Y\ÜØYÙ\ÂˆB‚ˆËËÈ›ÛÈH[‰ÜÈ˜[œØÜš\[ÈHÚ]]Ý\Yœ›ÛKˆ]\ÂˆËËÈ\ÝX[HHÚ]]H›Û\]H\œÛÛˆX^H]™H[Ý™YÂˆËËÈ[›Ý\ˆÚ]ÜˆY]Y\ÈÛ™HÚ[HH[ˆØ\ÈÛÚ[™ÎÈH™\BˆËËÈÝ[[™ÈÚ\™HH[ˆ™YØ[‹Y\ˆ[žHY]ÈXYH\™HYX[Ú[K‚ˆËËÈ[œÝÙ\œÈ˜[ÙHÚ[ˆ]Ú]Ø\ÈÛÜÙY[ˆHYX[[YK‚ˆ\ØØ\™X›T™\Ý[ˆ[˜ÈÙ]JÈ˜[œØÜš\ˆÐYÙ[Y\ÜØYÙWKœ›ÛH\›Žˆ‘T\›ŠHOˆ›ÛÛÂˆÝX\™]Ú]QH\›‹˜Ú]Q]Ý\œ™[HÝ\œ™[Y\ÜØYÙ\ÊÙŽˆÚ]Q
+H[ÙHÂˆ™]\›ˆ˜[ÙBˆBˆ]Y\™ÙYHÙ[‹›Y\™ÙY˜[œØÜš\
+Ý\œ™[ˆÝ\œ™[Ù[ˆ\›‹œÙ[™\Ý[ˆ˜[œØÜš\
+BˆYˆÚ]QOHÙ\ÜÚ[Û‹šYÂˆÙ\ÜÚ[Û‹š\ÝÜžKœ™\XÙP[
+Ú]ˆY\™ÙY
+BˆH[ÙHYˆ˜\ˆÚ]HÛÜšÜÜXÙK˜Ú]Ë™š\œÝ
+Ú\™NˆÈ	šYOHÚ]QJHÂˆÚ]›Y\ÜØYÙ\ÈHY\™ÙYˆÚ]ÝXÚ
+
+BˆÛÜšÜÜXÙK\Ù\
+Ú]
+BˆBˆ™]\›ˆYBˆB‚ˆËËÈ[œÈHÛÛ[X[™Ú]H[›š[™È\›‰ÜÈÝ›
+ÐÈÙ]\ÚYKÛÈH›ÙÜ˜[BˆËËÈHÛÛ[X[™[™ÈHHÈ8 %[ˆY]Ü‹HÚ[8 %ÙY\È]ÈÝÛ‚ˆËËÈÝ›
+ÐÈ[œÝXYÙˆ[™[™ÈH[‹‚ˆ[˜ÈÚ]\›’[\œ\Ù]\ÚYJÈ›ÙNˆ
+
+H\Þ[˜ÈOˆ›ÚY
+H\Þ[˜ÈÂˆÝX\™]\›ˆHÛÜ˜XÝ]™U\›ˆ[ÙHÂˆ]ØZ]›ÙJ
+Bˆ™]\›‚ˆBˆ[\œ\[™\‹™XXÝ]˜]J
+Bˆ]ØZ]›ÙJ
+Bˆ[\œ\[™\‹˜XÝ]˜]HÈ\›‹\ÚË˜Ø[˜Ù[
+
+HBˆB‚ˆËËÈY\ˆHÛÛ[X[™˜[ˆ[™\ˆH\›ŽˆØ^\ÈÝÈÚ]]Ú[™ÙYYY]ÈBˆËËÈ[‹ˆH[ˆÙY\È]ÈÚ]Ú[ˆH›Û\[Ý™\ÈÈ[›Ý\‹Y]ÈÂˆËËÈ]ÈÚ]\™HÙ\Ú[ˆ]È™\H\È›ÛY[‹[™Ù][™ÜÈ™XXÚBˆËËÈ™^\›ˆ™XØ]\ÙHH[›š[™È™\]Y\ÝÛÜYY[HÚ[ˆ]Ý\Y‚ˆ[˜È›ÝU\›‘Y™™XÝÊÚ[˜ÙH™Y›Ü™Nˆ‘TÛÛ[X[™Û˜\ÚÝ
+H\Þ[˜ÈÂˆÝX\™]\›ˆHÛÜ˜XÝ]™U\›ˆ[ÙHÈ™]\›ˆBˆYˆÙ\ÜÚ[Û‹šYOH™Y›Ü™K˜Ú]QÂˆÝX\™\›‹˜Ú]QOH™Y›Ü™K˜Ú]Q[ÙHÈ™]\›ˆBˆYˆÛÜšÜÜXÙK˜Ú]Ë˜ÛÛZ[œÊÚ\™NˆÈ	šYOH™Y›Ü™K˜Ú]QJHÂˆ]ØZ]\›Z[˜[››ÝJˆ•H\›ˆ[›š[™È[ˆ	×
+™Y›Ü™K]JIÈš[š\Ú\È\™NÈ]È™\H[™È[ˆ]Ú]ˆŠBˆH[ÙHÂˆ]ØZ]\›Z[˜[››ÝJˆ•H\›ˆ[›š[™È[ˆ	×
+™Y›Ü™K]JIÈÛÙ\ÈÛˆÚ]Ý]]ÈÚ]ÈØYÙ[ÈÙÈ
+\›‹œYœ˜]Õ˜[YJHÚ[ÚÝÈ]È™\KÝ›
+ÐÈØ[˜Ù[È]ˆ‚ˆ
+BˆBˆ™]\›‚ˆBˆYˆÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\ÈOH™Y›Ü™K›Y\ÜØYÙ\Ë\›‹˜Ú]QOHÙ\ÜÚ[Û‹šYÂˆ]ØZ]\›Z[˜[››ÝJˆH\›ˆ\È[›š[™ÎÈÚ]]YÈÛÙ\ÈY\ˆ\ÈY]Ú[ˆ]š[š\Ú\ËˆŠBˆBˆYˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]OH™Y›Ü™K™\™XÝÜžHÂˆ]ØZ]\›Z[˜[››ÝJH\›ˆ\È[›š[™ÎÈ]ÈÛÛÈ›ÝÈÛÜšÈ[ˆH™]È\™XÝÜžKˆŠBˆH[ÙHYˆÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Yš[š][ÛˆOH™Y›Ü™K˜YÙ[ˆÛÛ™šYÝ\˜][ÛˆOH™Y›Ü™K˜ÛÛ™šYÝ\˜][Û‚ˆÂˆ]ØZ]\›Z[˜[››ÝJˆH\›ˆ\È[›š[™ÎÈ]ÙY\ÈHÙ][™ÜÈ]Ý\YÚ]ˆ\ÈÚ[™ÙH™XXÚ\ÈH™^\›‹ˆ‚ˆ
+BˆBˆB‚ˆËËÈ[œÈHÛ™K[Ù™ˆ›Û\Ú]HXÝ]™H›Ùš[H[™›ÈÛÛ™\œØ][Û‚ˆËËÈY\ÜØYÙ\Ëˆ]\ÈH™X[\›ˆÛÈÝ™X[Z[™ËÛÛË\›Ý˜[Ë[™Ý›
+ÐÂˆËËÈÛÜšÈ›Ü›X[K]]È˜[œØÜš\™]™\ˆ™\XÙ\ÈHÚ]	ÜË‚ˆ[˜ÈÝ\•ÊÈ^ˆÝš[™ÊH\Þ[˜ÈÂˆÝX\™]™\]Y\ÝHÔ™\]Y\Ý
+^›Ùš[NˆÙ\ÜÚ[Û‹œ›Ùš[JH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÈ“ÓTŠBˆ™]\›‚ˆBˆ]YH]ØZ][[YK˜[ØØ]T›ØÙ\ÜÊˆYÙ[QˆÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q\ÚÎˆ˜Îˆ
+^
+HŠBˆ]ØZ]™YÚ[•\›Š™\]Y\Ý›ØÙ\ÜÎˆYÚ[™ˆ˜ÊBˆB‚ˆËËÈÙ[™È\Y^Ú\™H]™[Û™ÜÎˆÈHÚ]\ÈH™]È\›ˆÚ[ˆ]ˆËËÈ\ÈYKÜˆ[È[ˆ[˜›ÞH[›š[™ÈYÙ[™XYÈ]]È™^\›‹‚ˆ[˜È[]™\ŠÈ^ˆÝš[™ËÈ\™Ù]ˆ‘TY\ÜØYÙU\™Ù]
+H\Þ[˜ÈÂˆÝÚ]Ú\™Ù]ÂˆØ\ÙH›XZ[Ž‚ˆÝX\™ÛÜ˜XÝ]™U\›ˆOHš[[ÙHÂˆ]YH]ØZ]XZ[”›ØÙ\ÜÊ
+Bˆ]ÛÝ[H]ØZ][[YKœÝ\\š\ÛÜ‹œ]Y]YYY\ÜØYÙ\Ê›ÜŽˆY
+K˜ÛÝ[ˆYˆÛÝ[ˆÂˆÛÜœ[™[™Ô]Y]YSY\ÜØYÙHH^ˆ]ØZ]\›Z[˜[›[™Jˆ—
+ÛÝ[
+H]Y]YYY\ÜØYÙJÊKˆÝX›Z][H™Y›Ü™H\ÈY\ÜØYÙKYÛ›Ü™H[H›Üˆ\È\›‹ÜˆÛX\ˆ[OÈÜÝX›Z]ÚYÛ›Ü™KØÛX\—HŠBˆH[ÙHÂˆ]ØZ]Ý\\›ŠÝ^JBˆBˆ™]\›‚ˆBˆ]YH]ØZ]XZ[”›ØÙ\ÜÊ
+Bˆ]ØZ][[YKœÝ\\š\ÛÜ‹œÜÝ
+\Ù\Š^
+KÎˆY
+Bˆ]ØZ][™ÈH]ØZ][[YKœÝ\\š\ÛÜ‹œ]Y]YYY\ÜØYÙ\Ê›ÜŽˆY
+K˜ÛÝ[ˆ]ØZ]\›Z[˜[››ÝJˆœ]Y]YY
+
+ØZ][™ÊHØZ][™ÊNˆ]›Ú[œÈHÛÛ™\œØ][Ûˆ]H™^[Ù[\›ˆ0­ÈÜ]Y]YHŠBˆØ\ÙH˜YÙ[
+]Y
+N‚ˆÝX\™][™›ÈH]ØZ][[YKœÝ\\š\ÛÜ‹š[™›ÊY
+H[ÙHÂˆ]ØZ]\›Z[˜[››ÝJ“›ÈYÙ[×
+Yœ˜]Õ˜[YJKˆØYÙ[È™YH\ÝÈH[›š[™ÈÛ™\ËˆŠBˆ™]\›‚ˆBˆYˆYOHÚ]›ØÙ\ÜÒQÖÜÙ\ÜÚ[Û‹šYHÂˆ]ØZ][]™\Š^Îˆ›XZ[ŠBˆ™]\›‚ˆBˆËÈHÜ[]™[Yœ›ÛH[›Ý\ˆÚ]ÝÛœÈHY™™\™[[˜›Þ]™[‚ˆËÈÚ[ˆ]Ú]\ÈYKˆ™]™\ˆ™Y\™XÝ]ÈH›ØÝ\ÙYÚ]‚ˆÝX\™[™›Ë™\OHZ[™›ËœÝ]Kš\Õ\›Z[˜[[ÙHÂˆ]ØZ]\›Z[˜[››ÝJˆ˜YÙ[×
+Yœ˜]Õ˜[YJH
+
+[™›Ë˜YÙ[Q
+JH\Èš[š\ÚYÈØYÙ[ÈÙÈ
+Yœ˜]Õ˜[YJHÚÝÜÈÚ]]Yˆ‚ˆ
+BˆYˆÛÜ™›ØÝ\ÈOH˜YÙ[
+Y
+HÈÛÜ™›ØÝ\ÈH›XZ[ˆBˆ™]\›‚ˆBˆ]ØZ][[YKœÝ\\š\ÛÜ‹œÜÝ
+\Ù\Š^
+KÎˆY
+Bˆ]ØZ][™ÈH]ØZ][[YKœÝ\\š\ÛÜ‹œ]Y]YYY\ÜØYÙ\Ê›ÜŽˆY
+K˜ÛÝ[ˆ]Ú[ˆBˆ]ØZ][[YKœÝ\\š\ÛÜ‹š\Ô]\ÙY
+Y
+BˆÈš]\È]\ÙYÛÈØYÙ[ÈÛÛ[YH
+Yœ˜]Õ˜[YJH[]™\œÈ]‚ˆˆ™[]™\™Y]]È™^[Ù[\›ˆ‚ˆ]ØZ]\›Z[˜[››ÝJˆœ]Y]YY›ÜˆYÙ[×
+Yœ˜]Õ˜[YJH
+
+[™›Ë˜YÙ[Q
+JH
+
+ØZ][™ÊHØZ][™ÊNˆ
+Ú[ŠH‚ˆ
+BˆBˆ]ØZ]™Yœ™\ÚÝ]\Ê
+BˆB‚ˆËËÈ™X]ÈH\Y[™H\ÈH[œÝÙ\ˆÈH\›Ý˜[]HXYÙˆBˆËËÈ]Y]YHÚ[ˆ]™XYÈ\ÈÛ™NÈ[ž][™È[ÙHÝ^\È[ˆÜ™[˜\žH[™H[™ˆËËÈH]Y\Ý[ÛˆÙY\ÈØZ][™Ë‚ˆ[˜È[œÝÙ\\›Ý˜[
+È^ˆÝš[™ÊH\Þ[˜ÈOˆ›ÛÛÂˆYˆ]Y][™ÈHÛÜ™Y][™Ð\›Ý˜[ÂˆÛÜ™Y][™Ð\›Ý˜[Hš[ˆYˆ]]HH^™]J\Ú[™Îˆ]Ž
+Kˆ]˜[YHHžOÈ”ÓÓ‘XÛÙ\Š
+K™XÛÙJ”ÓÓ•˜[YKœÙ[‹œ›ÛNˆ]JKˆ˜[YK›Øš™XÝ˜[YHOHš[ˆÂˆY][™Ëœ™\Kœ™\Ý[YJÚ]ˆ˜\›Ý™J\™Ý[Y[Îˆ˜[YJJBˆ]ØZ]\›Z[˜[››ÝJ˜\›Ý™Y
+Y][™Ëœ™\]Y\ÝÛÛ›˜[YJHÚ]HY]Y\™Ý[Y[ÈŠBˆH[ÙHÂˆY][™Ëœ™\Kœ™\Ý[YJÚ]ˆ™[žJ™X\ÛÛŽˆ‘Y]Y\™Ý[Y[ÈÙ\™H›ÝH”ÓÓˆØš™XÝˆŠJBˆ]ØZ]\›Z[˜[››ÝJˆ™[šYY
+Y][™Ëœ™\]Y\ÝÛÛ›˜[YJNˆH\™Ý[Y[ÈÙ\™H›ÝH”ÓÓˆØš™XÝŠBˆBˆ™]\›ˆYBˆBˆÝX\™]ØZ][™ÈHÛÜ˜\›Ý˜[Ë™š\œÝ[ÙHÈ™]\›ˆ˜[ÙHBˆ]ÛÛHØZ][™Ëœ™\]Y\ÝÛÛ›˜[YBˆÝÚ]Ú^›ÝÙ\˜Ø\ÙY
+
+HÂˆØ\ÙHžH‹žY\ÈŽ‚ˆØZ][™Ëœ™\Kœ™\Ý[YJÚ]ˆ˜\›Ý™J\™Ý[Y[ÎˆØZ][™Ëœ™\]Y\Ý˜Ø[˜\™Ý[Y[ÊJBˆ]ØZ]\›Z[˜[››ÝJ˜\›Ý™Y
+ÛÛ
+HŠBˆØ\ÙH˜H‹˜[Ø^\ÈŽ‚ˆ]ØZ]š\ÝX[˜\›Ý˜[[™\‹œÙ]SÓÑ[˜X›Y
+YJBˆØZ][™Ëœ™\Kœ™\Ý[YJÚ]ˆ˜\›Ý™J\™Ý[Y[ÎˆØZ][™Ëœ™\]Y\Ý˜Ø[˜\™Ý[Y[ÊJBˆ]ØZ]\›Z[˜[››ÝJ˜\›Ý™Y
+ÛÛ
+NÈSÓÈ[ÙH\ÈÛˆ›Üˆ\ÈÙ\ÜÚ[ÛˆŠBˆØ\ÙH›ˆ‹››ÈŽ‚ˆØZ][™Ëœ™\Kœ™\Ý[YJÚ]ˆ™[žJ™X\ÛÛŽˆ‘[šYYžH\Ù\‹ˆŠJBˆ]ØZ]\›Z[˜[››ÝJ™[šYY
+ÛÛ
+HŠBˆØ\ÙH™H‹™Y]Ž‚ˆÛÜ˜\›Ý˜[Ëœ™[[Ý™Qš\œÝ
+
+BˆÛÜ™Y][™Ð\›Ý˜[HØZ][™Âˆ]ØZ]\›Z[˜[››ÝJ•\HH™\XÙ[Y[”ÓÓˆ\™Ý[Y[È›Üˆ
+ÛÛ
+NˆŠBˆ™]\›ˆYBˆØ\ÙH˜È‹˜Ø[˜Ù[Ž‚ˆØZ][™Ëœ™\Kœ™\Ý[YJÚ]ˆ˜Ø[˜Ù[[ŠBˆ]ØZ]\›Z[˜[››ÝJ˜Ø[˜Ù[[™ÈH[ˆ]\ÚÙY›Üˆ
+ÛÛ
+HŠBˆY˜][‚ˆ™]\›ˆ˜[ÙBˆBˆÛÜ˜\›Ý˜[Ëœ™[[Ý™Qš\œÝ
+
+Bˆ™]\›ˆYBˆB‚ˆ[˜È[™Q›ØÝ\ÊÈ\™Ý[Y[ˆÝš[™ÊH\Þ[˜ÈÂˆ]š[[YYH\™Ý[Y[š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™]š[[YYš\Ñ[\H[ÙHÂˆÝÚ]ÚÛÜ™›ØÝ\ÈÂˆØ\ÙH›XZ[Ž‚ˆ]ØZ]\›Z[˜[›[™Jˆ“Y\ÜØYÙ\ÈÛÈÈ\ÈÚ]ˆØYÙ[È›ØÝ\ÈQÙ[™È[HÈH[›š[™ÈYÙ[ˆŠBˆØ\ÙH˜YÙ[
+]Y
+N‚ˆ]ØZ]\›Z[˜[›[™Jˆ“Y\ÜØYÙ\ÈÛÈÈYÙ[×
+Yœ˜]Õ˜[YJKˆØYÙ[È›ØÝ\ÈXZ[ˆ™]\›œÈÈHÚ]ˆŠBˆBˆ™]\›‚ˆBˆÝX\™]\™Ù]H›ØÝ\Õ\™Ù]
+š[[YY
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØYÙ[È›ØÝ\ÈQXZ[ˆŠBˆ™]\›‚ˆBˆÝÚ]Ú\™Ù]ÂˆØ\ÙH›XZ[Ž‚ˆÛÜ™›ØÝ\ÈH›XZ[‚ˆ]ØZ]\›Z[˜[›[™J“Y\ÜØYÙ\ÈÛÈÈ\ÈÚ]YØZ[‹ˆŠBˆØ\ÙH˜YÙ[
+]Y
+N‚ˆÝX\™][™›ÈH]ØZ][[YKœÝ\\š\ÛÜ‹š[™›ÊY
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J“›ÈYÙ[×
+Yœ˜]Õ˜[YJKˆØYÙ[È™YH\ÝÈH[›š[™ÈÛ™\ËˆŠBˆ™]\›‚ˆBˆÝX\™[™›Ë™\ˆZ[™›ËœÝ]Kš\Õ\›Z[˜[[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ[™›Ë™\OHˆÈ˜YÙ[×
+Yœ˜]Õ˜[YJH\È\ÈÚ]ÈØYÙ[È›ØÝ\ÈXZ[ˆ\ÈHØ[YH[™Ëˆ‚ˆˆ˜YÙ[×
+Yœ˜]Õ˜[YJH
+
+[™›Ë˜YÙ[Q
+JH\Èš[š\ÚYÈXÚÈH[›š[™ÈÛ™Hœ›ÛHØYÙ[È™YKˆ‚ˆ
+Bˆ™]\›‚ˆBˆÛÜ™›ØÝ\ÈH˜YÙ[
+Y
+Bˆ]ØZ]\›Z[˜[›[™Jˆ“Y\ÜØYÙ\ÈÛÈÈYÙ[×
+Yœ˜]Õ˜[YJH
+
+[™›Ë˜YÙ[Q
+JH[[ØYÙ[È›ØÝ\ÈXZ[ŽÈXZ[ˆVÝ[™XXÚ\ÈHÚ]ˆ‚ˆ
+BˆBˆB‚ˆ]ØZ]™\ÝÜ™TØ]™YÝX˜YÙ[Ê
+Bˆ™XY\‹œÝ\
+
+Bˆ]ØZ]™[X\ÙT™XY\ŠÛÜšÜÜXÙNˆÛÜšÜÜXÙJB‚ˆ]™[Îˆ›Üˆ]ØZ]]™[[ˆ]™[ÈÂˆÝÚ]Ú]™[ÂˆØ\ÙH›[™J]˜]Ë]\™YØÊN‚ˆÛÜœ™XY\”\šÙYHYBˆ]\YH\™YØÈÈ˜]Èˆ˜]Ëš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆËÈ	SQHÕVX\ÈHÚÜ›Ü›HÙˆÜ›Û\ÈSQHÕVX‚ˆ]^BˆZ\™YØÈ	‰ˆ\Yš\Ô™Yš^
+‰ŠBˆÈ
+‹Ü›Û\Èˆ
+È\Y™›Üš\œÝ
+
+JKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆˆ\YˆÝX\™]^š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKš\Ñ[\H[ÙHÂˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆZ\™YØË^OH‹ÜÝÜˆÂˆËÈ\ÙHHØ[YH]™[\ÈÝ›
+ÐË[˜ÛY[™È[™[™È]Y]YHXÚ\Ú[ÛœË‚ˆÛÛ[X][Û‹žZY[
+š[\œ\
+BˆÛÛ[YBˆBˆYˆ][™[™ÈHÛÜœ[™[™Ô]Y]YSY\ÜØYÙHÂˆÝÚ]Ú^›ÝÙ\˜Ø\ÙY
+
+HÂˆØ\ÙHœÝX›Z]‹œÈŽ‚ˆÛÜœ[™[™Ô]Y]YSY\ÜØYÙHHš[ˆ]ØZ]Ý\\›ŠÜ[™[™×JBˆØ\ÙHšYÛ›Ü™H‹šHŽ‚ˆÛÜœ[™[™Ô]Y]YSY\ÜØYÙHHš[ˆ]ØZ]Ý\\›ŠÜ[™[™×KYÛ›Üš[™Ô]Y]YNˆYJBˆØ\ÙH˜ÛX\ˆ‹˜ÈŽ‚ˆÛÜœ[™[™Ô]Y]YSY\ÜØYÙHHš[ˆ]YH]ØZ]XZ[”›ØÙ\ÜÊ
+Bˆ]ØZ][[YKœÝ\\š\ÛÜ‹˜ÛX\”]Y]YYY\ÜØYÙ\Ê›ÜŽˆY
+Bˆ]ØZ]Ý\\›ŠÜ[™[™×JBˆY˜][‚ˆ]ØZ]\›Z[˜[›[™JÚÛÜÙHÝX›Z]YÛ›Ü™KÜˆÛX\‹ˆÝ›
+ÐÈÜˆÜÝÜØ[˜Ù[È\È™]ÈY\ÜØYÙH[™ÙY\ÈH]Y]YKˆŠBˆBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆZ\™YØË]ØZ][œÝÙ\\›Ý˜[
+^
+HÂˆ]ØZ]™Yœ™\ÚÝ]\Ê
+Bˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆZ\™YØË]Y™\ÜÙYHY™\ÜÙYY\ÜØYÙJ^
+HÂˆ]ØZ][]™\ŠY™\ÜÙY˜›ÙKÎˆY™\ÜÙY\™Ù]
+Bˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆZ\™YØË^š\Ô™Yš^
+ˆHŠHÂˆYˆÛÜ˜XÝ]™U\›ˆOHš[Âˆ]ØZ]\›Z[˜[››ÝJH\›ˆ\È[›š[™ÎÈÚ]]š[ÈØZ]È[[HÛÛ[X[™[™ËˆŠBˆBˆ]ØZ]Ú]\›’[\œ\Ù]\ÚYHÂˆ]ØZ][”Ú[ÛÛ[X[™
+Ýš[™Ê^™›Üš\œÝ
+
+JK\›Z[˜[ˆ\›Z[˜[
+BˆBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆZ\™YØË^š\Ô™Yš^
+‹ÈŠHÂˆ]ÛÛ[X[™H^œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJBˆ]˜[YHHÝš[™ÊÛÛ[X[™ÌJBˆ]\™Ý[Y[BˆÛÛ[X[™˜ÛÝ[ˆBˆÈÛÛ[X[™ÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHˆˆ‚ˆYˆ˜[YHOH‹Ü]Y]YHˆÂˆ]XZ[ˆH]ØZ]XZ[”›ØÙ\ÜÊ
+Bˆ]ØZ][™T]Y]YPÛÛ[X[™
+ˆ\™Ý[Y[›ØÝ\ÎˆÛÜ™›ØÝ\ËXZ[ŽˆXZ[‹[[YNˆ[[YK\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]™Yœ™\ÚÝ]\Ê
+Bˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆ˜[YHOH‹ØYÙ[Èˆ˜[YHOH‹ØYÙ[‹ˆ\™Ý[Y[OH™›ØÝ\Èˆ\™Ý[Y[š\Ô™Yš^
+™›ØÝ\ÈŠBˆÂˆ]ØZ][™Q›ØÝ\ÊÝš[™Ê\™Ý[Y[™›Üš\œÝ
+™›ØÝ\È‹˜ÛÝ[
+JJBˆ]ØZ]™Yœ™\ÚÝ]\Ê
+Bˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆ˜[YHOH‹ØYÙ[Èˆ˜[YHOH‹ØYÙ[‹\™Ý[Y[›ÝÙ\˜Ø\ÙY
+
+HOH˜ÛX\ˆˆÂˆ]ÛX\™YHÙ]
+]ØZ][[YKœÝ\\š\ÛÜ‹˜ÛX\‘š[š\ÚY
+
+JBˆËÈHÚ]ÚÜÙHYH›ØÙ\ÜÈÙ[Ú][HÙ]ÈHœ™\ÚÛ™H]ˆËÈ]È™^\›ŽÈ›Ý[™È]ØZY\ÈÜÝHÙ\ÜÚ[Ûˆ\È]‚ˆÚ]›ØÙ\ÜÒQÈHÚ]›ØÙ\ÜÒQË™š[\ˆÈXÛX\™Y˜ÛÛZ[œÊ	˜[YJHBˆËÈÛX\š[™È\È[ÛÈÝÈHYÙ[ÈØ]™YÚ]\ÈÚ]\™BˆËÈ\™ÙYˆÚ]Ý^\È[ˆ]Èš[H\ÈÚ]HX›HÝ[ÛË‚ˆ]›ÜYH]ØZ]›Ü›Ü™ÛÝ[”ÝX˜YÙ[Ê
+BˆYˆ›ÜYˆÂˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆ]ØZ]Ø]™UÛÜšÜÜXÙJ	ÛÜšÜÜXÙKÝÜ™NˆÝÜ™K\›Z[˜[ˆ\›Z[˜[
+BˆBˆ]Ý[[X\žHBˆÝÚ]Ú
+ÛX\™Y˜ÛÝ[›ÜY
+HÂˆØ\ÙH
+
+Nˆ“›Èš[š\ÚYYÙ[ÈÈÛX\‹ˆ‚ˆØ\ÙH
+]ÛÝ[
+N‚ˆÛX\™Y
+ÛÝ[
+Hš[š\ÚYYÙ[
+ÛÝ[OHHÈˆˆˆœÈŠNÈØYÙ[È™YH\ÝÈÚ]Ý[[œËˆ‚ˆØ\ÙH
+]›ÜY
+N‚ˆ‘›ÜY
+›ÜY
+HYÙ[
+›ÜYOHHÈˆˆˆœÈŠHØ]™YÚ]\ÈÚ]ˆ‚ˆØ\ÙH
+]ÛÝ[]›ÜY
+N‚ˆÛX\™Y
+ÛÝ[
+Hš[š\ÚYYÙ[
+ÛÝ[OHHÈˆˆˆœÈŠH[™›ÜY
+›ÜY
+HØ]™YÚ]\ÈÚ]ÈØYÙ[È™YH\ÝÈÚ]Ý[[œËˆ‚ˆBˆ]ØZ]\›Z[˜[›[™JÝ[[X\žJBˆ]ØZ]™Yœ™\ÚÝ]\Ê
+Bˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆ˜[YHOH‹Ù^]ˆ˜[YHOH‹Ü]Z]ˆÂˆÛÜ™^][™ÈHYBˆYˆ]\›ˆHÛÜ˜XÝ]™U\›ˆÂˆ\›‹\ÚË˜Ø[˜Ù[
+
+BˆÛÛ[YBˆBˆœ™XZÈ]™[ÂˆBˆYˆ˜[YHOH‹ØÛÛ[YHˆÂˆYˆÛÜ˜XÝ]™U\›ˆOHš[Âˆ]ØZ]\›Z[˜[››ÝJH\›ˆ\È[™XYH[›š[™ÎÈÝ›
+ÐÈØ[˜Ù[È]ˆŠBˆH[ÙHÂˆ]ØZ]ÛÛ[YU\›Š
+BˆBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆ˜[YHOH‹Ü›Û\ÈˆÂˆ]™Y›Ü™HH‘TÛÛ[X[™Û˜\ÚÝ
+Ù\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛŠBˆÝÚ]Ú]ØZ][™T›Û\ÐÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆÚÚ[Îˆš\ÝX[œÚÚ[Ë˜Ø][ÙËˆ\›Z[˜[ˆ\›Z[˜[
+BˆÂˆØ\ÙHš[™Y‚ˆœ™XZÂˆØ\ÙHœÙ[™
+]Y\ÜØYÙK]]JN‚ˆÙ\ÜÚ[Û‹œ™Yœ™\Ú]Jœ›ÛNˆ]JBˆ]ØZ][]™\ŠY\ÜØYÙKÎˆÛÜ™›ØÝ\ÊBˆØ\ÙHœÙ[XÝÞ\Ý[T›Û\
+]›Û\˜[YK]Y\ÜØYÙJN‚ˆ]ØZ]Ù[XÝÞ\Ý[T›Û\
+ˆ›Û\˜[YKˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆ]ØZ]Ø]™UÛÜšÜÜXÙJ	ÛÜšÜÜXÙKÝÜ™NˆÝÜ™K\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]›ÝU\›‘Y™™XÝÊÚ[˜ÙNˆ™Y›Ü™JBˆYˆ]Y\ÜØYÙHÈ]ØZ][]™\ŠY\ÜØYÙKÎˆÛÜ™›ØÝ\ÊHBˆBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆ˜[YHOH‹ÜÚÚ[Èˆ˜[YHOH‹ÜÚÚ[‹]™\]Y\ÝHÚÚ[›Û\™\]Y\Ý
+\™Ý[Y[
+HÂˆYˆ™\]Y\Ý›˜[YKš\Ñ[\HÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÚÚ[È›Û\SQHÕVH
+ÜÚÚ[È\ÝÈH˜[Y\ÊHŠBˆH[ÙHYˆ]ÚÚ[Hš\ÝX[œÚÚ[Ë˜Ø][ÙËœÚÚ[
+˜[YYˆ™\]Y\Ý›˜[YJHÂˆÙ\ÜÚ[Û‹œ™Yœ™\Ú]Jœ›ÛNˆ—
+ÚÚ[›˜[YJH
+™\]Y\Ý˜\™Ý[Y[ÊHŠBˆ]ØZ][]™\ŠÚÚ[œ›Û\
+\™Ý[Y[Îˆ™\]Y\Ý˜\™Ý[Y[ÊKÎˆÛÜ™›ØÝ\ÊBˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆÚÚ[	×
+™\]Y\Ý›˜[YJIËˆÜÚÚ[È\ÝÈ[KˆŠBˆBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆ˜[YHOH‹ÙY]‹\™Ý[Y[›ÝÙ\˜Ø\ÙY
+
+HOHš[œ]ˆÂˆËÈHY]ÜˆZÙ\ÈH\›Z[˜[\È]Ù\È›ÜˆÜ™\K‚ˆ˜\ˆY\ÜØYÙNˆÝš[™ÏÂˆ]ØZ]Ú]\›’[\œ\Ù]\ÚYHÂˆY\ÜØYÙHH]ØZ]ÛÛ\ÜÙR[œ]
+\›Z[˜[ˆ\›Z[˜[
+BˆBˆYˆ]Y\ÜØYÙHÈ]ØZ][]™\ŠY\ÜØYÙKÎˆÛÜ™›ØÝ\ÊHBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆ˜[YHOH‹Ü™\HˆÂˆËÈHY]ÜˆZÙ\ÈH\›Z[˜[ÛÈH[›š[™È\›ˆÙY\È]ÂˆËÈÝ›
+ÐÈ˜]\ˆ[ˆ[™[™ÈÛˆHÛ™HYX[›ÜˆHY]Ü‹‚ˆ˜\ˆY\ÜØYÙNˆÝš[™ÏÂˆ]ØZ]Ú]\›’[\œ\Ù]\ÚYHÂˆY\ÜØYÙHH]ØZ]ÛÛ\ÜÙT™\J\™Ý[Y[Ù\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹\›Z[˜[ˆ\›Z[˜[
+BˆBˆYˆ]Y\ÜØYÙHÈ]ØZ][]™\ŠY\ÜØYÙKÎˆÛÜ™›ØÝ\ÊHBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆ˜[YHOH‹ØÈˆÂˆYˆÛÜ˜XÝ]™U\›ˆOHš[Âˆ]ØZ]\›Z[˜[››ÝJˆ‹ØÈØZ]È›ÜˆH[›š[™È\›ŽÈÝ›
+ÐÈØ[˜Ù[È]ˆY\ÜØYÙ\È\Y›ÝÈ\™H]Y]YYˆ‚ˆ
+BˆH[ÙHÂˆ]ØZ]Ý\•Ê\™Ý[Y[
+BˆBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆÚYˆPRWÒT×Õ’TÕPSˆYˆ˜[YHOH‹Ýš\ÝX[‹ÛÜ˜XÝ]™U\›ˆOHš[Âˆ]ØZ]\›Z[˜[››ÝJˆ•š\ÝX[[ÙHZÙ\ÈHÚÛHØÜ™Y[‹ÛÈ]ØZ]È›ÜˆH[›š[™È\›ŽÈÝ›
+ÐÈØ[˜Ù[È]ˆ‚ˆ
+Bˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆÙ[™Y‚ˆËÈ]™\žHÝ\ˆÛÛ[X[™[œÈ›ÝËˆÚ]]Ú[™Ù\È[™H[›š[™ÂˆËÈ\›ˆYY]\È›ÝU\›‘Y™™XÝÈ\ØÜšX™\ËÚ]H›ÝK›ÝHØZ]‚ˆ]™Y›Ü™HH‘TÛÛ[X[™Û˜\ÚÝ
+Ù\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛŠBˆYˆ˜[YHOH‹Ü›Ú™XÝˆÂˆ]ØZ][™T›Ú™XÝÛÛ[X[™
+ˆ\™Ý[Y[ˆ›Ú™XÝˆ	œ›Ú™XÝˆÛYNˆÛYKˆÝÜ™NˆÝÜ™Kˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆ˜[YHOH‹ØÚ]ˆÂˆ]ØZ]™XÛÜ™ÝX˜YÙ[Ê
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆ]ØZ][™UÛÜšÜÜXÙPÚ]ÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆÛÜšÜÜXÙNˆ	ÛÜšÜÜXÙKˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ˆÚ]›ØÙ\ÜÎˆÚ]›ØÙ\ÜÒQÖÜÙ\ÜÚ[Û‹šYKˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]™\ÝÜ™TØ]™YÝX˜YÙ[Ê
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆ]ØZ]Ø]™UÛÜšÜÜXÙJ	ÛÜšÜÜXÙKÝÜ™NˆÝÜ™K\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]›ÝU\›‘Y™™XÝÊÚ[˜ÙNˆ™Y›Ü™JBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆYˆ˜[YHOH‹Ú[\ÜˆÂˆ]ØZ]™XÛÜ™ÝX˜YÙ[Ê
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆ]ØZ]Ú]\›’[\œ\Ù]\ÚYHÂˆ]ØZ][™R[\ÜÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆÛÜšÜÜXÙNˆ	ÛÜšÜÜXÙKˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆØ][ÙÜÎˆ	˜Ø][ÙÜËˆš\ÝX[ˆš\ÝX[ˆÙ[XÝ[\ÜYÚ]ˆÛÜ˜XÝ]™U\›ˆOHš[ˆ\›Z[˜[ˆ\›Z[˜[
+BˆBˆ]ØZ]™\ÝÜ™TØ]™YÝX˜YÙ[Ê
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆ]ØZ]Ø]™UÛÜšÜÜXÙJ	ÛÜšÜÜXÙKÝÜ™NˆÝÜ™K\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]›ÝU\›‘Y™™XÝÊÚ[˜ÙNˆ™Y›Ü™JBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆ]ØZ]™XÛÜ™ÝX˜YÙ[Ê
+BˆÚYˆPRWÒT×Õ’TÕPSˆYˆ^OH‹Ýš\ÝX[ˆÂˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆÙ\ÜÚ[Û‹š\ÝX[Û˜\ÚÝHš\ÝX[Û˜\ÚÝ
+›ÜŽˆÛÜšÜÜXÙJBˆBˆÙ[™Y‚ˆ˜\ˆ^]ÈH˜[ÙBˆ]ØZ]Ú]\›’[\œ\Ù]\ÚYHÂˆ^]ÈH]ØZ][™PÛÛ[X[™
+ˆ^ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆØÜ”›ÝšY\ŽˆØÜ”›ÝšY\‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆØ][ÙÜÎˆ	˜Ø][ÙÜËˆš\ÝX[ˆš\ÝX[ˆÚ]›ØÙ\ÜÎˆÚ]›ØÙ\ÜÒQÖÜÙ\ÜÚ[Û‹šYKˆY]ÜŽˆY]Ü‹ˆ\›Z[˜[ˆ\›Z[˜[
+BˆBˆYˆ^]ÈÂˆÛÜ™^][™ÈHYBˆœ™XZÈ]™[ÂˆBˆÚYˆPRWÒT×Õ’TÕPSˆYˆ^OH‹Ýš\ÝX[‹]Û˜\ÚÝHÙ\ÜÚ[Û‹š\ÝX[Û˜\ÚÝÂˆÛÜšÜÜXÙHHÚ]ÛÜšÜÜXÙJœ›ÛNˆÛ˜\ÚÝ›ØÝ\ÙYQˆÙ\ÜÚ[Û‹šY™]š[Ý\ÎˆÛÜšÜÜXÙJBˆÙ\ÜÚ[ÛˆH‘TÙ\ÜÚ[ÛŠÚ]ˆÛÜšÜÜXÙKœÙ[XÝYÚ]JBˆH[ÙHÂˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆBˆÙ[ÙBˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆÙ[™Y‚ˆ]ØZ]Ø]™UÛÜšÜÜXÙJ	ÛÜšÜÜXÙKÝÜ™NˆÝÜ™K\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]™\ÝÜ™TØ]™YÝX˜YÙ[Ê
+Bˆ]ØZ]›ÝU\›‘Y™™XÝÊÚ[˜ÙNˆ™Y›Ü™JBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJBˆÛÛ[YBˆBˆ]ØZ][]™\Š^ÎˆÛÜ™›ØÝ\ÊBˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJB‚ˆØ\ÙHš[\œ\‚ˆÛÜœ™XY\”\šÙYHYBˆËÈ™Y›XÝÝ›
+ÐÈ[[YYX][K˜]\ˆ[ˆØZ][™È›ÜˆH›ÝšY\ˆÜ‚ˆËÈÛÛØ[˜Ù[][ÛˆÈXZÙH]ÈØ^H›ÝYÚHÝ\\š\ÛÜ‹‚ˆXÝ]š]UØ\Ò[\œ\YHYBˆYˆÛÜœ[™[™Ô]Y]YSY\ÜØYÙHOHš[ÂˆÛÜœ[™[™Ô]Y]YSY\ÜØYÙHHš[ˆ]ØZ]\›Z[˜[››ÝJ“™]ÈY\ÜØYÙHØ[˜Ù[YÈH]Y]YH\È[˜Ú[™ÙYˆŠBˆH[ÙHYˆ]\›ˆHÛÜ˜XÝ]™U\›ˆÂˆ\›‹\ÚË˜Ø[˜Ù[
+
+BˆH[ÙHYˆ]ØZ][™ÈHÛÜ˜\›Ý˜[Ë™š\œÝÂˆÛÜ˜\›Ý˜[Ëœ™[[Ý™Qš\œÝ
+
+BˆØZ][™Ëœ™\K™˜Z[
+Ø[˜Ù[][Û‘\œ›ÜŠ
+JBˆH[ÙHYˆÛÜ™Y][™Ð\›Ý˜[OHš[ÂˆÛÜ™Y][™Ð\›Ý˜[Ëœ™\Kœ™\Ý[YJÚ]ˆ™[žJ™X\ÛÛŽˆ‘Y]Ø[˜Ù[YˆŠJBˆÛÜ™Y][™Ð\›Ý˜[Hš[ˆH[ÙHYˆØÜ™Y[ˆOHš[Âˆ]ØZ]\›Z[˜[››ÝJ“›Ý[™ÈÈØ[˜Ù[ˆÙ^]ÜˆÝ›
+Ñ]Z]ËˆŠBˆBˆ]ØZ]™Yœ™\ÚÝ]\Ê
+Bˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJB‚ˆØ\ÙH™[™Ù‘š[N‚ˆÛÜœ™XY\”\šÙYHYBˆÛÜ™^][™ÈHYBˆYˆ]\›ˆHÛÜ˜XÝ]™U\›ˆÂˆ\›‹\ÚË˜Ø[˜Ù[
+
+BˆÛÛ[YBˆBˆœ™XZÈ]™[Â‚ˆØ\ÙH\›‘š[š\ÚY
+]Ý]ÛÛYJN‚ˆ[\œ\[™\‹™XXÝ]˜]J
+Bˆ]\›ˆHÛÜ˜XÝ]™U\›‚ˆÛÜ˜XÝ]™U\›ˆHš[ˆ˜\ˆÝXØÙYYYH˜[ÙBˆ˜\ˆ]\ÙYˆYÙ[[’[\œ\[ÛÂˆ˜\ˆÙ\Hˆ˜\ˆÙ]YHYBˆÝÚ]ÚÝ]ÛÛYHÂˆØ\ÙHœÝXØÙ\ÜÊ]™\Ý[
+N‚ˆYˆ]\›‹\›‹˜Ú]QOHš[ÂˆÙ]YHÙ]J™\Ý[˜[œØÜš\œ›ÛNˆ\›ŠBˆBˆÝXØÙYYYHYBˆ]\ÙYH™\Ý[š[\œ\[Û‚ˆØ\ÙH™˜Z[\™J]\œ›ÜŠN‚ˆ]Ø[˜Ù[YBˆ\œ›Üˆ\ÈØ[˜Ù[][Û‘\œ›Üˆ[\œ\[™\‹š[\œ\YXÝ]™SÜ\˜][ÛŠ
+BˆYˆØ[˜Ù[YÂˆ]ØZ]\›Z[˜[œ™XÛÝ™\Y\Ø[˜Ù[][ÛŠ
+BˆH[ÙHÂˆ]ØZ]\›Z[˜[œ™XÛÝ™\Y\‘\œ›ÜŠ\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠBˆBˆËÈÚ]H[ˆY™Y›Ü™H]œ›ÚÙHÙ™ˆ\È›Ý›ÝÛˆ]Ø^NˆBˆËÈÝ\\š\ÛÜˆ\È]È˜[œØÜš\[™ØÛÛ[YHXÚÜÈ]\‚ˆYˆ]\›‹\›‹˜Ú]QOHš[ÂˆÙ\H]ØZ]ÙY\\X[˜[œØÜš\
+ˆÙŽˆ\›‹™X\ÛÛŽˆØ[˜Ù[YÈH[ˆØ\ÈØ[˜Ù[YˆˆH[ˆ˜Z[YŠBˆBˆBˆËÈH[‰ÜÈÝÛˆÚ]\È\ÝX[HHÛ™H]H›Û\È[Ù]Ú\™XˆËÈ˜[Y\È]Ú[ˆH\œÛÛˆ[Ý™YÈ[›Ý\ˆÚ]\š[™ÈH[‹‚ˆ]]›Û\H\›Ë˜Ú]QOHÙ\ÜÚ[Û‹šYˆ˜\ˆ[Ù]Ú\™NˆÝš[™ÏÂˆYˆ]\›‹]Ú]QH\›‹˜Ú]QX]›Û\Âˆ[Ù]Ú\™HHÛÜšÜÜXÙK˜Ú]Ë™š\œÝÈ	šYOHÚ]QOË™\Ü^U]BˆBˆYˆ]\›ˆÂˆ]™Yš^H\›‹šÚ[™OH˜ÈÈ˜Èˆˆˆ‚ˆ˜\ˆÛÚÈH—
+™Yš^
+]ÛÚÈ
+[\ÙY\ØÜš\[ÛŠÚ[˜ÙNˆ\›‹œÝ\Y
+JH‚ˆYˆ][Ù]Ú\™HÂˆÛÚÈ
+ÏHˆ0­ÈØ]™Y[ˆ	×
+[Ù]Ú\™JIÈ‚ˆH[ÙHYˆ\Ù]YÂˆÛÚÈ
+ÏHˆ0­È]ÈÚ]Ø\ÈÛÜÙYÈØYÙ[ÈÙÈ
+\›‹œYœ˜]Õ˜[YJHÚÝÜÈH™\H‚ˆBˆYˆ]]\ÙYÂˆ]ØZ]\›Z[˜[››ÝJ¸£î
+ÛÚÊH0­È
+]\ÙYœÝ[[X\žJH‹ÛÛÜŽˆžY[ÝÈŠBˆH[ÙHÂˆ]ØZ]\›Z[˜[››ÝJˆÝXØÙYYYÈ¸§$È
+ÛÚÊHˆˆ¸§%È
+ÛÚÊH‹ÛÛÜŽˆÝXØÙYYYÈ˜ÞX[ˆˆˆœ™YŠBˆBˆBˆYˆ]\›‹\›‹˜Ú]QOHš[ÂˆËÈHYÙ[ÈH[ˆÝ\Y[™X\›Y\ˆÛ™\ÈÝ[ÛÚ[™Ë\™BˆËÈØ]™YÚ]Z\ˆÚ]\È^HÝ[™›ÝË‚ˆ]ØZ]™XÛÜ™ÝX˜YÙ[Ê
+BˆYˆ]›Û\ÂˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆBˆ]ØZ]Ø]™UÛÜšÜÜXÙJ	ÛÜšÜÜXÙKÝÜ™NˆÝÜ™K\›Z[˜[ˆ\›Z[˜[
+BˆBˆYˆÛÜ™^][™ÈÈœ™XZÈ]™[ÈBˆYˆ]\›ˆÂˆ]ØZ][™Îˆ[ˆYˆ]YHÚ]›ØÙ\ÜÒQÖÜÙ\ÜÚ[Û‹šYHÂˆØZ][™ÈH]ØZ][[YKœÝ\\š\ÛÜ‹œ]Y]YYY\ÜØYÙ\Ê›ÜŽˆY
+K˜ÛÝ[ˆH[ÙHÂˆØZ][™ÈHˆBˆËÈ[šY\È[X™\˜][HYÛ›Ü™YÜˆ\œš]š[™ÈY\ˆH\Ý[Ù[ˆËÈ\›‹Ý^H]Y]YY[[H\œÛÛˆÚÛÜÙ\ÈÈÝX›Z][K‚ˆYˆØZ][™ÈˆÂˆ]ØZ]\›Z[˜[››ÝJˆ—
+ØZ][™ÊH]Y]YYY\ÜØYÙW
+ØZ][™ÈOHHÈˆˆˆœÈŠHÝ[ØZ][™ÎˆÜ]Y]YHÚÝÜÈ[NÈØÛÛ[YHÝX›Z]È[NÈH™]ÈY\ÜØYÙH\ÚÜÈÚ]ÈËˆ‚ˆ
+BˆH[ÙHYˆ]]\ÙY]›Û\ÂˆËÈHÜ[\›ˆYÙ]\ÈHÚXÚÜÚ[[™Ú][ÛÈÛˆH\œÛÛ‚ˆËÈ\ÚÙY›ÝÈ™HÛÛœÝ[YÈ[YH[™ÚÙ[ˆØ\È\™HZ\œÈÈY‚ˆYˆ]\ÙYš\ÐÚXÚÜÚ[]ØZ]š\ÝX[˜\›Ý˜[[™\‹š\ÖSÓÑ[˜X›Y
+
+HÂˆ]ØZ]\›Z[˜[››ÝJˆ˜ÛÛ[Z[™Îˆ[ÛÈ\ÈÛ‹ÛÈHÜ[\›ˆYÙ]Ù\È›ÝÝÜH\ÚÈ
+ÜÙ][ÛÈÙ™ˆÈ™H\ÚÙY
+H‹ˆÛÛÜŽˆžY[ÝÈŠBˆ]ØZ]ÛÛ[YU\›Š
+BˆH[ÙHÂˆ]ØZ]\›Z[˜[››ÝJˆ‹ØÛÛ[YHXÚÜÈH\ÚÈ\Ú\™H]ÝÜY0­ÈÜÙ]
+]\ÙYœÙ][™ÒÙ^JHˆÛÙ\È\\ˆ[ˆÛ™HÛÈ‚ˆ
+BˆBˆH[ÙHYˆÙ\ˆ]›Û\Âˆ]ØZ]\›Z[˜[››ÝJˆšÙ\
+Ù\
+HY\ÜØYÙW
+Ù\OHHÈˆˆˆœÈŠHœ›ÛHH[\œ\Y[ˆ0­ÈØÛÛ[YH™\Ý[Y\È]‚ˆ
+BˆBˆYˆ][Ù]Ú\™HÂˆ]YH]ØZ][[YKœÝ\\š\ÛÜ‹œ]Y]YYY\ÜØYÙ\Ê›ÜŽˆ\›‹œY
+K˜ÛÝ[ˆYˆYˆÂˆ]ØZ]\›Z[˜[››ÝJˆ—
+Y
+H]Y]YYY\ÜØYÙW
+YOHHÈˆˆˆœÈŠHØZ][ˆ	×
+[Ù]Ú\™JIÎÈØÛÛ[YH\™HÝX›Z]È[NÈH™]ÈY\ÜØYÙH\ÚÜÈÚ]ÈËˆ‚ˆ
+BˆH[ÙHYˆ]\ÙYOHš[Ù\ˆÂˆ]ØZ]\›Z[˜[››ÝJˆ‹ØÛÛ[YH[ˆ	×
+[Ù]Ú\™JIÈXÚÜÈ]\ÚÈ\Ú\™H]ÝÜYˆŠBˆBˆBˆBˆ]ØZ]™Yœ™\ÚÝ]\Ê
+Bˆ]ØZ]™[X\ÙRY’YJÛÜšÜÜXÙNˆÛÜšÜÜXÙJB‚ˆØ\ÙH˜\›Ý˜[
+]™\]Y\Ý]™\JN‚ˆÛÜ˜\›Ý˜[Ë˜\[™
+
+™\]Y\Ý™\JJBˆ]ØZ]\›Z[˜[˜\›Ý˜[™\]Y\Ý
+™\]Y\Ý
+Bˆ]ØZ]™Yœ™\ÚÝ]\Ê
+B‚ˆØ\ÙHœÝ\\š\ÛÜŠ]Ú[™ÙJN‚ˆÝÚ]ÚÚ[™ÙHÂˆØ\ÙH™š[š\ÚY
+][™›ÊHÚ\™H[™›Ë™\ˆ‚ˆ]ØZ]\›Z[˜[œ›ØÙ\ÜÑ[™Y
+[™›ÊBˆYˆÛÜ™›ØÝ\ÈOH˜YÙ[
+[™›ËœY
+HÂˆÛÜ™›ØÝ\ÈH›XZ[‚ˆ]ØZ]\›Z[˜[››ÝJˆ˜YÙ[×
+[™›ËœYœ˜]Õ˜[YJH\È[™YÈY\ÜØYÙ\ÈÛÈÈ\ÈÚ]YØZ[‹ˆŠBˆBˆØ\ÙH˜][[ÛˆÚ\™HØÜ™Y[ˆOHš[‚ˆ]ØZ][››Ý[˜ÙPYÙ[][[ÛŠˆ[[YNˆ[[YK[››Ý[˜ÙYˆ	˜[››Ý[˜ÙY][[Û‹\›Z[˜[ˆ\›Z[˜[ˆÚÚ\[™Ð\›Ý˜[ÎˆYJBˆY˜][‚ˆœ™XZÂˆBˆ]ØZ]™Yœ™\ÚÝ]\Ê
+B‚ˆØ\ÙH˜XÝ]š]T[ÙN‚ˆ]ØZ]™Yœ™\ÚÝ]\Ê
+BˆBˆB‚ˆ›ÜˆØZ][™È[ˆÛÜ˜\›Ý˜[ÈÈØZ][™Ëœ™\K™˜Z[
+Ø[˜Ù[][Û‘\œ›ÜŠ
+JHBˆÛÜ™Y][™Ð\›Ý˜[Ëœ™\K™˜Z[
+Ø[˜Ù[][Û‘\œ›ÜŠ
+JBˆ™XY\‹œÝÜ
+
+BˆÝ\\š\ÛÜ‘™YY˜Ø[˜Ù[
+
+BˆXÝ]š]T[ÙK˜Ø[˜Ù[
+
+BˆÛÛ[X][Û‹™š[š\Ú
+
+Bˆ]ØZ]š\ÝX[˜\›Ý˜[[™\‹œÙ]›Û\\Šš[
+Bˆ]ØZ]™XÛÜ™ÝX˜YÙ[Ê
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆ]ØZ]Ø]™UÛÜšÜÜXÙJ	ÛÜšÜÜXÙKÝÜ™NˆÝÜ™K\›Z[˜[ˆ\›Z[˜[ÛÜÚ[™ÎˆYJBˆ]ØZ]\›Z[˜[˜]XÚ
+ØÜ™Y[Žˆš[
+BˆY]Ü‹š[œÝ[
+Ý\™˜XÙNˆš[
+Bˆ\›Z[˜[ØÜ™Y[‹š[œÝ[
+š[
+BˆØÜ™Y[Ë™XXÝ]˜]J
+BˆB‚ˆËËÈ[ØYÚ]Y™˜]š[H›Ý\Ë›Yˆ[œÈH[™H[ˆHÞ\Ý[HÚ[Ú]ˆËËÈH\›Z[˜[[™YÝ™\‹ÛÈ[\˜XÝ]™H›ÙÜ˜[\ÈÛÜšÈ[™Z\ˆÝ]]ˆËËÈ\È™Z]\ˆØ\\™Y›ÜˆÙ[ÈH[Ù[‚ˆš]˜]HÝ]XÈ[˜È[”Ú[ÛÛ[X[™
+ÈÛÛ[X[™ˆÝš[™Ë\›Z[˜[ˆ\›Z[˜[Üš]\ŠH\Þ[˜ÈÂˆ]š[[YYHÛÛ[X[™š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™]š[[YYš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆPÓÓSPS‘ŠBˆ™]\›‚ˆBˆ˜\ˆØZ]Ý]\ÎˆÒ[HLBˆ]][˜ÚHÈØZ]Ý]\ÈHš[[YYÚ]ÔÝš[™ÊÜÚ^Þ\Ý[JHBˆYˆ]ØÜ™Y[ˆH\›Z[˜[ØÜ™Y[‹˜Ý\œ™[ÂˆØÜ™Y[‹œÝ\Ü[™\›Z[˜[
+][˜Ú
+BˆH[ÙHÂˆ][˜Ú
+
+BˆBˆÝX\™ØZ]Ý]\ÈOHLH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ™\œ›ÜŽˆÛÝ[›Ý[ˆ	×
+š[[YY
+IÎˆ
+Ýš[™ÊÔÝš[™ÎˆÝ™\œ›ÜŠ\œ››ÊJJH‹ˆÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆËÈHØZ]Ý]\ÈXÚÜÈHÚYÛ˜[[ˆHÝÈš]È[™[ˆ^]ÛÙHX›Ý™K‚ˆ]ÚYÛ˜[[X™\ˆHØZ]Ý]\È	ˆÙ‚ˆYˆÚYÛ˜[[X™\ˆOHÂˆ]ØZ]\›Z[˜[››ÝJšÚ[YžHÚYÛ˜[
+ÚYÛ˜[[X™\ŠHŠBˆH[ÙHYˆ
+ØZ]Ý]\Èˆ
+H	ˆ™ˆOHÂˆ]ØZ]\›Z[˜[››ÝJ™^]Ý]\È
+
+ØZ]Ý]\Èˆ
+H	ˆ™ŠHŠBˆBˆB‚ˆËËÈ™\ÜÈ˜XÚÙÜ›Ý[™YÙ[È]\™HØZ][™ÈÛˆÛÛYX›ÙKÛ˜ÙHXXÚˆBˆËËÈ›ØÙ\ÜÈ]ÝÜÈ\ÚÚ[™È[™\ÚÜÈYØZ[ˆ\È[››Ý[˜ÙYYØZ[‹‚ˆš]˜]HÝ]XÈ[˜È[››Ý[˜ÙPYÙ[][[ÛŠˆ[[YNˆYÙ[[[YKˆ[››Ý[˜ÙYˆ[›Ý]Ù]YÙ[Q‹ˆ\›Z[˜[ˆ\›Z[˜[Üš]\‹ˆÚÚ\[™Ð\›Ý˜[Îˆ›ÛÛH˜[ÙBˆ
+H\Þ[˜ÈÂˆËÈÛˆH\œÚ\Ý[ØÜ™Y[ˆ[ˆ\›Ý˜[\È[™XYHH]Y\Ý[Ûˆ]BˆËÈ›Û\ÛÈÛ›HHÝ\ˆÚ[™ÈÙˆ][[Ûˆ™YYH[™H\™K‚ˆ]ØZ][™ÈH]ØZ][[YKœÝ\\š\ÛÜ‹œ›ØÙ\ÜÙ\Ó™YY[™Ð][[ÛŠ
+K™š[\ˆÈ›ØÙ\ÜÈ[‚ˆÝX\™ÚÚ\[™Ð\›Ý˜[ËØ\ÙH˜\›Ý˜[H›ØÙ\ÜË˜][[Ûˆ[ÙHÈ™]\›ˆYHBˆ™]\›ˆ˜[ÙBˆBˆ]YÈHÙ]
+ØZ][™Ë›X\
+œY
+JBˆ[››Ý[˜ÙY™›Ü›R[\œÙXÝ[ÛŠYÊBˆ›Üˆ›ØÙ\ÜÈ[ˆØZ][™ÈÚ\™HX[››Ý[˜ÙY˜ÛÛZ[œÊ›ØÙ\ÜËœY
+HÂˆ[››Ý[˜ÙYš[œÙ\
+›ØÙ\ÜËœY
+Bˆ]™\˜ˆBˆÝÚ]Ú›ØÙ\ÜË˜][[ÛˆÂˆØ\ÙH˜\›Ý˜[ˆ›™YYÈ\›Ý˜[‚ˆØ\ÙHš[œ]ˆš\ÈØZ][™È›Üˆ[ÝH‚ˆØ\ÙH™\œ›ÜŽˆœÝÜY‚ˆØ\ÙH™š[š\ÚYˆ™š[š\ÚY‚ˆØ\ÙHš[ˆ˜Ú[™ÙY‚ˆBˆ]ØZ]\›Z[˜[›[™Jˆ˜YÙ[
+›ØÙ\ÜËœY
+H
+
+›ØÙ\ÜË˜YÙ[Q
+JH
+™\˜ŠNˆ‚ˆ
+È—
+›ØÙ\ÜË˜][[ÛËœÝ[[X\žHÏÈˆŠH0­ÈØYÙ[ÈÙÈ
+›ØÙ\ÜËœYœ˜]Õ˜[YJHŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÝX›Z]
+ˆÈ^ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆ›ØÙ\ÜÎˆ[›Ý]YÙ[QËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‹ˆ[\œ\[™\Žˆ\›Z[˜[[\œ\[™\ÈHš[ˆ
+H\Þ[˜ÈOˆ›ÛÛÂˆ˜\ˆÛÛ[ˆÐÛÛ[\HHË^
+^
+WBˆÛÛ[˜\[™
+ÛÛ[ÓÙŽˆÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[
+BˆÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[œ™[[Ý™P[
+
+BˆÙ\ÜÚ[Û‹š\ÝÜžK˜\[™
+YÙ[Y\ÜØYÙJ›ÛNˆ\Ù\‹ÛÛ[ˆÛÛ[
+JBˆÙ\ÜÚ[Û‹œ™Yœ™\Ú]Jœ›ÛNˆ^
+Bˆ]ØZ]\›Z[˜[œ™\Ù]™\ÜÛœÙJ
+BˆÈÂˆ]›Ùš[HHÙ\ÜÚ[Û‹œ›Ùš[Bˆ]™\]Y\ÝHYÙ[™\]Y\Ý
+ˆYÙ[Qˆ›Ùš[K˜YÙ[Qˆ›ÝšY\Žˆ›Ùš[Kœ›ÝšY\‹ˆ[Ù[ˆ›Ùš[K›[Ù[ˆY\ÜØYÙ\ÎˆÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\ËˆÛÛ˜[Y\Îˆ›Ùš[KÛÛ˜[Y\ËˆÛÛÜ›Ý\˜[Y\Îˆ›Ùš[KÛÛÜ›Ý\˜[Y\ËˆÝX˜YÙ[˜[Y\Îˆ›Ùš[KœÝX˜YÙ[˜[Y\ËˆÛÛÚÚXÙNˆ›Ùš[KÛÛÚÚXÙKˆ™\ÜÛœÙQ›Ü›X]ˆ›Ùš[Kœ™\ÜÛœÙQ›Ü›X]ˆÜ[ÛœÎˆ›Ùš[K›Ü[ÛœËˆ[Z]Îˆ›Ùš[K›[Z]ËˆÝ™X[Nˆ›Ùš[KœÝ™X[KˆÛÛØ[[™ÔÝ˜]YÞNˆ›Ùš[KÛÛØ[[™ÔÝ˜]YÞKˆ\ÙUÛÛ›ÞNˆ›Ùš[K\ÙUÛÛ›ÞKˆ›ÞQ^ÜÙYÛÛÎˆ›Ùš[Kœ›ÞQ^ÜÙYÛÛËˆÛÛ[YØ][ÛŽˆ›Ùš[KÛÛ[YØ][Û‹ˆ™]žNˆ›Ùš[Kœ™]žKˆ]]ØÛÛ\XÝˆ›Ùš[K˜]]ØÛÛ\XÝˆÛÛ^ˆ›Ùš[K˜ÛÛ^ˆÙ\ÜÚ[Û’QˆÙ\ÜÚ[Û‹œÙ\ÜÚ[Û’Q
+Bˆ]^\Ý[™Ô›ØÙ\ÜÈH›ØÙ\ÜÂˆ]\ÚÈH\ÚÈÂˆžH]ØZ][[YKœ[Š™\]Y\Ý›ØÙ\ÜÎˆ^\Ý[™Ô›ØÙ\ÜÊHÈ]™[[‚ˆ]ØZ]\›Z[˜[˜ÛÛœÝ[YJ]™[
+BˆBˆBˆ[\œ\[™\Ë˜XÝ]˜]HÈ\ÚË˜Ø[˜Ù[
+
+HBˆY™\ˆÈ[\œ\[™\Ë™XXÝ]˜]J
+HBˆ]™\Ý[HžH]ØZ]\ÚË˜[YBˆ›ØÙ\ÜÈH]ØZ][[YKœÝ\\š\ÛÜ‹™YJ
+Kœ›ØÙ\ÜÙ\Ë™š\œÝÈ	œ[’QOH™\Ý[œ[’QOËœYˆÙ\ÜÚ[Û‹š\ÝÜžKœ™\XÙP[
+Ú]ˆ™\Ý[˜[œØÜš\
+BˆYˆ][\œ\[ÛˆH™\Ý[š[\œ\[ÛˆÂˆ]ØZ]\›Z[˜[››ÝJˆ¸£î
+[\œ\[Û‹œÝ[[X\žJH0­ÈÙ[™[›Ý\ˆY\ÜØYÙHÈÛÛ[YKÜˆ˜Z\ÙH
+[\œ\[Û‹œÙ][™ÒÙ^JH‹ˆÛÛÜŽˆžY[ÝÈŠBˆBˆ™]\›ˆYBˆHØ]ÚÂˆYˆ\œ›Üˆ\ÈØ[˜Ù[][Û‘\œ›Üˆ[\œ\[™\Ëš[\œ\YXÝ]™SÜ\˜][ÛŠ
+HOHYHÂˆ]ØZ]\›Z[˜[œ™XÛÝ™\Y\Ø[˜Ù[][ÛŠ
+Bˆ™]\›ˆ˜[ÙBˆBˆ]ØZ]\›Z[˜[œ™XÛÝ™\Y\‘\œ›ÜŠ\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠBˆ™]\›ˆ˜[ÙBˆBˆB‚ˆËËÈZ[ÈH›ÝØ]Ø^HÛÛ^\ÙYžHØØˆHXÝ]™HYÙ[	ÜÈÞ\Ý[BˆËËÈ›Û\\È\ÈÛ™H]Y\Ý[Û‹Ú]›Û™HÙˆHÚ]	ÜÈ˜[œØÜš\Ü‚ˆËËÈ[™[™È]XÚY[Ë‚ˆš]˜]HÝ]XÈ[˜ÈÔ™\]Y\Ý
+È^ˆÝš[™Ë›Ùš[NˆÙ\ÜÚ[Û”›Ùš[JHOˆYÙ[™\]Y\ÝÈÂˆ]›Û\H^š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™\›Û\š\Ñ[\H[ÙHÈ™]\›ˆš[Bˆ˜\ˆY\ÜØYÙ\ÈHYÙ[Ú]š[š]X[\ÝÜžJ›ÜŽˆ›Ùš[K˜YÙ[Yš[š][ÛŠBˆY\ÜØYÙ\Ë˜\[™
+\Ù\Š›Û\
+JBˆ™]\›ˆYÙ[™\]Y\Ý
+ˆYÙ[Qˆ›Ùš[K˜YÙ[Qˆ›ÝšY\Žˆ›Ùš[Kœ›ÝšY\‹ˆ[Ù[ˆ›Ùš[K›[Ù[ˆY\ÜØYÙ\ÎˆY\ÜØYÙ\ËˆÛÛ˜[Y\Îˆ›Ùš[KÛÛ˜[Y\ËˆÛÛÜ›Ý\˜[Y\Îˆ›Ùš[KÛÛÜ›Ý\˜[Y\ËˆÝX˜YÙ[˜[Y\Îˆ›Ùš[KœÝX˜YÙ[˜[Y\ËˆÛÛÚÚXÙNˆ›Ùš[KÛÛÚÚXÙKˆ™\ÜÛœÙQ›Ü›X]ˆ›Ùš[Kœ™\ÜÛœÙQ›Ü›X]ˆÜ[ÛœÎˆ›Ùš[K›Ü[ÛœËˆ[Z]Îˆ›Ùš[K›[Z]ËˆÝ™X[Nˆ›Ùš[KœÝ™X[KˆÛÛØ[[™ÔÝ˜]YÞNˆ›Ùš[KÛÛØ[[™ÔÝ˜]YÞKˆ\ÙUÛÛ›ÞNˆ›Ùš[K\ÙUÛÛ›ÞKˆ›ÞQ^ÜÙYÛÛÎˆ›Ùš[Kœ›ÞQ^ÜÙYÛÛËˆÛÛ[YØ][ÛŽˆ›Ùš[KÛÛ[YØ][Û‹ˆ™]žNˆ›Ùš[Kœ™]žKˆ]]ØÛÛ\XÝˆ›Ùš[K˜]]ØÛÛ\XÝˆÛÛ^ˆ›Ùš[K˜ÛÛ^
+BˆB‚ˆËËÈš\ÝX[[ÙH[œÈÛÛ[X[™È[ˆZ\ˆÝÛˆ\ÚÈ[™XYKÛÈ]Ø[ˆ]ØZ]BˆËËÈ\ÛÛ]Y\›ˆ\™XÝKˆH‘TÝ\ÈHØ[YH™\]Y\Ý[ˆ]È]™[ÛÜˆËËÈÈÙY\\›Ý˜[È[™Ý›
+ÐÈ™\ÜÛœÚ]™K‚ˆš]˜]HÝ]XÈ[˜È[™P•ÐÛÛ[X[™
+ˆÈ^ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™]™\]Y\ÝHÔ™\]Y\Ý
+^›Ùš[NˆÙ\ÜÚ[Û‹œ›Ùš[JH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÈ“ÓTŠBˆ™]\›‚ˆBˆ]ØZ]\›Z[˜[œ™\Ù]™\ÜÛœÙJ
+BˆÈÂˆÈHžH]ØZ][[YKœ[Š™\]Y\Ý
+HÈ]™[[‚ˆ]ØZ]\›Z[˜[˜ÛÛœÝ[YJ]™[
+BˆBˆHØ]Ú\ÈØ[˜Ù[][Û‘\œ›ÜˆÂˆ]ØZ]\›Z[˜[œ™XÛÝ™\Y\Ø[˜Ù[][ÛŠ
+BˆHØ]ÚÂˆ]ØZ]\›Z[˜[œ™XÛÝ™\Y\‘\œ›ÜŠ\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠBˆBˆB‚ˆËËÈHYÙ[\Ý[X]YÛÛ^[™[Ù[HÚ][œÈÛ‹ˆHÛÛ^\ÂˆËËÈ[X™\˜][H[[YYX][H™Y›Ü™HH[Ù[ÛÈ]Ý^\ÈX\ÞHÈÛÛ\\™K‚ˆš]˜]HÝ]XÈ[˜È›Û\Y[]JÈÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[ÛŠHOˆÝš[™ÈÂˆ]›Ùš[HHÙ\ÜÚ[Û‹œ›Ùš[Bˆ][Ù[H›Ùš[K›[Ù[š\Ñ[\HÈ›Ùš[Kœ›ÝšY\‹œ˜]Õ˜[YHˆ›Ùš[K›[Ù[ˆ™]\›ˆ–×
+›Ùš[K˜YÙ[Q
+WH0­È
+›Û\ÛÛ^Ý]\ÊÙ\ÜÚ[ÛŠJH0­È
+[Ù[
+H‚ˆB‚ˆËËÈHš[˜[ÛÛ\Û™[ÙˆHÛÜšÚ[™È\™XÝÜžKÚ]H\ÙY[›ÛÝX™[‚ˆš]˜]HÝ]XÈ[˜ÈÝ\œ™[\™XÝÜžS˜[YJ
+HOˆÝš[™ÈÂˆ]]Hš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]ˆYˆ]OH‹ÈˆÈ™]\›ˆ]Bˆ]˜[YHHT“
+š[UT“Ú]]ˆ]\Ñ\™XÝÜžNˆYJK›\Ý]ÛÛ\Û™[ˆ™]\›ˆ˜[YKš\Ñ[\HÈ]ˆ˜[YBˆB‚ˆËËÈ™[[Ý™\È\›Z[˜[ÛÛ›ÛÈœ›ÛHHÛÛ™šYÝ\™YX™[™Y›Ü™HÚÝÚ[™È]‚ˆš]˜]HÝ]XÈ[˜Èš\ÚX›URU]JÈ]NˆÝš[™ÊHOˆÝš[™ÈÂˆÝš[™Ê]K[šXÛÙTØØ[\œË™š[\ˆÈPÚ\˜XÝ\”Ù]˜ÛÛ›ÛÚ\˜XÝ\œË˜ÛÛZ[œÊ	
+HJBˆš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆB‚ˆËËÈÛ™H[šXÛÙHœ˜Z[H]\›ˆXZÙ\ÈHÛÛ\XÝ]™[HXÝ]š]HX\šÙ\‹‚ˆš]˜]HÝ]XÈ[˜È˜[™ÛPœ˜Z[TÝš[™Ê
+HOˆÝš[™ÈÂˆ]˜[™ÛU˜[YHH[œ˜[™ÛJ[ŽˆŽ‹‹ŒŽ‘ŠBˆ™]\›ˆÝš[™ÊÚ\˜XÝ\Š[šXÛÙK”ØØ[\Š˜[™ÛU˜[YJHJJBˆB‚ˆËËÈÝÈÛ™ÈH\›ˆÛÚË\È\Ø[MØÜˆšÛMØ‚ˆš]˜]HÝ]XÈ[˜È[\ÙY\ØÜš\[ÛŠÚ[˜ÙHÝ\ˆÛÛ[[Ý\ÐÛØÚË’[œÝ[
+HOˆÝš[™ÈÂˆ]\ÈH
+ÛÛ[[Ý\ÐÛØÚË››ÝÈHÝ\
+K˜ÛÛ\Û™[Âˆ]Ý[H[
+\ËœÙXÛÛ™ÊH
+È
+\Ë˜]ÜÙXÛÛ™ÈHLÌÌÌÌÌÈHˆ
+BˆÝX\™Ý[HH[ÙHÈ™]\›ˆ\ÈˆBˆ]
+Ý\œËZ[]\ËÙXÛÛ™ÊHH
+Ý[ÈÍŒÝ[	HÍŒÈŒÝ[	HŒ
+BˆYˆÝ\œÈˆÈ™]\›ˆ—
+Ý\œÊZ
+Z[]\Ê[W
+ÙXÛÛ™Ê\ÈˆBˆYˆZ[]\ÈˆÈ™]\›ˆ—
+Z[]\Ê[W
+ÙXÛÛ™Ê\ÈˆBˆ™]\›ˆ—
+ÙXÛÛ™Ê\È‚ˆB‚ˆËËÈH˜\Ý[X™\˜][H\›Þ[X]HÛÛ^[™XØ]Ü‹ˆ›ÝšY\œÈÚÙ[š^™BˆËËÈY™™\™[H[™È›Ý[^ÜÙHZ\ˆÛÛ^]Ú[™ÝÈÚ^™KÛÈÚÝÚ[™ÂˆËËÈ[ˆ\Ý[X]H\È[Ü™HÛ™\Ý[ˆ[\Z[™È[ˆ^XÝ\˜Ù[YÙK‚ˆš]˜]HÝ]XÈ[˜È›Û\ÛÛ^Ý]\ÊÈÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[ÛŠHOˆÝš[™ÈÂˆ]Ú\˜XÝ\œÈHÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\Ëœ™YXÙJ
+HÈÝ[Y\ÜØYÙH[‚ˆÝ[
+ÈY\ÜØYÙK˜ÛÛ[œ™YXÙJ
+HÈ	
+È™[™\‘[ÛÛ[
+	JK]Ž˜ÛÝ[BˆBˆ]\Ý[X]YÚÙ[œÈH
+Ú\˜XÝ\œÈ
+ÈŠHÈÂˆ]Y\ÜØYÙSX™[H—
+Ù\ÜÚ[Û‹š\ÝÜžK˜ÛÝ[
+H\ÙÈ‚ˆ™]\›ˆ—
+Y\ÜØYÙSX™[
+H
+[Ù[\ØYÙQ›Ü›X]ÚÙ[œÊ\Ý[X]YÚÙ[œË\Ý[X]YˆYJJH‚ˆB‚ˆš]˜]HÝ]XÈ[˜ÈÚ[™ÙUÛÜšÚ[™Ñ\™XÝÜžJÈ\™Ý[Y[ˆÝš[™Ë\›Z[˜[ˆ\›Z[˜[Üš]\ŠH\Þ[˜ÈÂˆ]]H\™Ý[Y[š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™\]š\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÙUŠBˆ™]\›‚ˆBˆ]^[™YH”ÔÝš[™ÊÝš[™Îˆ]
+K™^[™[™Õ[R[”]ˆ]Ý\œ™[HT“
+š[UT“Ú]]ˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]\Ñ\™XÝÜžNˆYJBˆ]\™Ù]HT“
+š[UT“Ú]]ˆ^[™Y™[]]™UÎˆÝ\œ™[
+KœÝ[™\™^™Yš[UT“ˆ˜\ˆ\Ñ\™XÝÜžNˆØšÐ›ÛÛH˜[ÙBˆÝX\™š[SX[˜YÙ\‹™Y˜][™š[Q^\ÝÊ]]ˆ\™Ù]œ]\Ñ\™XÝÜžNˆ	š\Ñ\™XÝÜžJKˆ\Ñ\™XÝÜžK˜›ÛÛ˜[YBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÝH\™XÝÜžNˆ
+\™Ù]œ]
+H‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆÝX\™š[SX[˜YÙ\‹™Y˜][˜Ú[™ÙPÝ\œ™[\™XÝÜžT]
+\™Ù]œ]
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆÛÝ[›ÝÚ[™ÙH\™XÝÜžHÈ
+\™Ù]œ]
+H‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ]ØZ]\›Z[˜[›[™Jš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]
+BˆB‚ˆš]˜]HÝ]XÈ[˜È[™PÛÛ[X[™
+ˆÈ[œ]ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆØÜ”›ÝšY\Žˆ[žHÐÔ”›ÝšY\‹ˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆØ][ÙÜÎˆ[›Ý]ÓPÔÙ\™\Ø][Ù×Kˆš\ÝX[ˆš\ÝX[œšYÙKˆÚ]›ØÙ\ÜÎˆYÙ[QÈHš[ˆY]ÜŽˆ\›Z[˜[[™QY]ÜÈHš[ˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈOˆ›ÛÛÂˆ]\ÈH[œ]œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+Ýš[™Ëš[š]
+Bˆ]\™Ý[Y[H\Ë˜ÛÝ[ˆHÈ\ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHˆˆ‚‚ˆÝÚ]Ú\ÖÌHÂˆØ\ÙH‹Ù^]‹‹Ü]Z]Ž‚ˆ™]\›ˆYBˆØ\ÙH‹Ý™\œÚ[ÛˆŽ‚ˆ]ØZ]\›Z[˜[›[™J™\œÚ[ÛŠBˆØ\ÙH‹Ú[Ž‚ˆÝÚ]Ú\™Ý[Y[›ÝÙ\˜Ø\ÙY
+
+HÂˆØ\ÙHˆŽ‚ˆ]ØZ]\›Z[˜[›[™J™\[
+BˆØ\ÙHœÙ]‹‹ÜÙ]Ž‚ˆ]ØZ]\›Z[˜[›[™JÙ][
+BˆØ\ÙH›Y[[ÜžH‹‹ÛY[[ÜžHŽ‚ˆ]ØZ]\›Z[˜[›[™JY[[ÜžR[
+BˆØ\ÙHÙÈ‹‹ÝÙÈŽ‚ˆ]ØZ]\›Z[˜[›[™JÙÒ[
+BˆØ\ÙHœ›Û\‹œ›Û\È‹‹Ü›Û\‹‹Ü›Û\ÈŽ‚ˆ]ØZ]\›Z[˜[›[™J›Û\[
+BˆØ\ÙH˜YÙ[È‹˜YÙ[‹‹ØYÙ[È‹‹ØYÙ[Ž‚ˆ]ØZ]\›Z[˜[›[™JYÙ[Ò[
+BˆØ\ÙH›XÜ‹‹ÛXÜŽ‚ˆ]ØZ]\›Z[˜[›[™JXÜÛÛ[X[™[
+BˆØ\ÙH˜Ú]‹‹ØÚ]Ž‚ˆ]ØZ]\›Z[˜[›[™JÚ][
+BˆØ\ÙH™Y]‹‹ÙY]Ž‚ˆ]ØZ]\›Z[˜[›[™JY][
+BˆØ\ÙHÛÛÈ‹‹ÝÛÛÈŽ‚ˆ]ØZ]\›Z[˜[›[™JÛÛ[
+BˆØ\ÙHœ]Y]YH‹‹Ü]Y]YHŽ‚ˆ]ØZ]\›Z[˜[›[™J]Y]YR[
+BˆØ\ÙH™^Ü‹‹Ù^ÜŽ‚ˆ]ØZ]\›Z[˜[›[™J^Ü[
+BˆØ\ÙHš[\Ü‹‹Ú[\ÜŽ‚ˆ]ØZ]\›Z[˜[›[™J[\Ü[
+BˆØ\ÙHœ™\H‹‹Ü™\HŽ‚ˆ]ØZ]\›Z[˜[›[™J™\R[
+BˆØ\ÙH˜ÛÜH‹‹ØÛÜHŽ‚ˆ]ØZ]\›Z[˜[›[™JÛÜR[
+BˆØ\ÙHœÝ]È‹‹ÜÝ]ÈŽ‚ˆ]ØZ]\›Z[˜[›[™JÝ]Ò[
+BˆØ\ÙHœÚÚ[È‹œÚÚ[‹‹ÜÚÚ[È‹‹ÜÚÚ[Ž‚ˆ]ØZ]\›Z[˜[›[™JÚÚ[Ò[
+BˆY˜][‚ˆ]ØZ]\›Z[˜[›[™Jˆ•[šÛ›ÝÛˆ[ÜXÈ	×
+\™Ý[Y[
+IËˆžHÚ[ÜˆÚ[Ù]Y[[ÜžKÙË›Û\ËYÙ[ËXÜÚ]Y]ÛÛËÚÚ[Ë]Y]YK^Ü[\ÜÛÜKÜˆÝ]Ëˆ‚ˆ
+BˆBˆØ\ÙH‹ØÝÙ‹‹ÜÙŽ‚ˆ]ØZ]\›Z[˜[›[™Jš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]
+BˆØ\ÙH‹ØÙŽ‚ˆ]ØZ]Ú[™ÙUÛÜšÚ[™Ñ\™XÝÜžJ\™Ý[Y[\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹Û›Ý[šÈŽ‚ˆ]ØZ][™QY™›ÜÛÛ[X[™
+ˆ›Ù™ˆ‹Ù\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹[[YNˆ[[YKÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹ÜÙ]Ž‚ˆ]ØZ][™TÙ]ÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆ\›Ý˜[[™\Žˆš\ÝX[˜\›Ý˜[[™\‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹Ü›ÝšY\œÈŽ‚ˆ›Üˆ›ÝšY\ˆ[ˆ]ØZ][[YK˜]˜Z[X›T›ÝšY\œÊ
+HÂˆ]Ù[XÝYH›ÝšY\‹šYOHÙ\ÜÚ[Û‹œ›Ùš[Kœ›ÝšY\ˆÈŠˆˆˆˆ‚ˆ]˜\ÙUT“Bˆ
+š\ÝX[œ›ÝšY\˜\ÙUT“Ë\›
+›ÜŽˆ›ÝšY\‹šYœ˜]Õ˜[YJBˆÏÈÛÛ™šYÝ\˜][ÛËœ›ÝšY\œË™š\œÝÈ	šYOH›ÝšY\‹šYœ˜]Õ˜[YHOË˜˜\ÙUT“
+Bˆ›X\Èˆ8 %
+	˜XœÛÛ]TÝš[™ÊHˆHÏÈˆ‚ˆ]ØZ]\›Z[˜[›[™J—
+Ù[XÝY
+H
+›ÝšY\‹šY
+H8 %
+›ÝšY\‹™\Ü^S˜[YJW
+˜\ÙUT“
+HŠBˆBˆØ\ÙH‹ÜYÚ[œÈŽ‚ˆ›ÜˆYÚ[ˆ[ˆ]ØZ]YÚ[œËš[œÝ[YYÚ[œÊ
+HÂˆ]Ø\Xš[]Y\ÈHYÚ[‹›X[šY™\Ý˜Ø\Xš[]Y\Ë›X\
+œ˜]Õ˜[YJKœÛÜY
+
+Kš›Ú[™Y
+ˆÙ\\˜]ÜŽˆ‹ŠBˆ]ÜšYÚ[ˆHYÚ[‹›ÜšYÚ[‹›X\Èˆ8 %
+	
+HˆHÏÈˆ‚ˆ]ØZ]\›Z[˜[›[™Jˆ—
+YÚ[‹›X[šY™\ÝšY
+H
+YÚ[‹›X[šY™\Ý™\œÚ[ÛŠH×
+Ø\Xš[]Y\ÊWW
+ÜšYÚ[ŠHŠBˆBˆØ\ÙH‹Û[Ù[ÈŽ‚ˆ]›ÝšY\’QH\™Ý[Y[š\Ñ[\HÈÙ\ÜÚ[Û‹œ›Ùš[Kœ›ÝšY\ˆˆ›ÝšY\’Q
+\™Ý[Y[
+BˆÈÂˆ][Ù[ÈHžH]ØZ][[YK˜]˜Z[X›S[Ù[Ê›ÝšY\Žˆ›ÝšY\’Q
+BˆYˆ[Ù[Ëš\Ñ[\HÂˆ]ØZ]\›Z[˜[›[™J”›ÝšY\ˆ	×
+›ÝšY\’Q
+IÈ™]\›™Y›È[Ù[ËˆŠBˆBˆ›Üˆ[Ù[[ˆ[Ù[ÈÂˆ]Ù[XÝYBˆ›ÝšY\’QOHÙ\ÜÚ[Û‹œ›Ùš[Kœ›ÝšY\ˆ	‰ˆ[Ù[šYOHÙ\ÜÚ[Û‹œ›Ùš[K›[Ù[ˆÈŠˆˆˆˆ‚ˆ]ÝÛ™\ˆH[Ù[›ÝÛ™YžK›X\Èˆ8 %
+	
+HˆHÏÈˆ‚ˆ]X™[Bˆ[Ù[™\Ü^S˜[YHOH[Ù[šYÈ[Ù[šYˆ—
+[Ù[šY
+H
+
+[Ù[™\Ü^S˜[YJJH‚ˆ]ØZ]\›Z[˜[›[™J—
+Ù[XÝY
+H
+X™[
+W
+ÝÛ™\ŠHŠBˆBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆØ\ÙH‹ØÈŽ‚ˆ]ØZ][™P•ÐÛÛ[X[™
+\™Ý[Y[Ù\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹[[YNˆ[[YK\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹ÝÙÈŽ‚ˆ]ØZ][™UÙÐÛÛ[X[™
+\™Ý[Y[ÙÎˆš\ÝX[ÙË\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹ÜÚÚ[È‹‹ÜÚÚ[Ž‚ˆ]ØZ][™TÚÚ[ÐÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÚÚ[Îˆš\ÝX[œÚÚ[ËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹ÛY[[ÜžHŽ‚ˆ]ØZ][™SY[[ÜžPÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆY[[ÜžNˆš\ÝX[›Y[[ÜžKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹Ü›Û\ÈŽ‚ˆËÈH‘TÛÜ[œÝÙ\œÈÜ›Û\È™Y›Ü™H]Ù]È\™KÛÈH›Û\Ø[‚ˆËÈ™HÙ[Èœ›ÛH[ž]Ú\™H[ÙHHØ][ÙÈ\È\ÝY[™Ù\‚ˆÝÚ]Ú]ØZ][™T›Û\ÐÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆÚÚ[Îˆš\ÝX[œÚÚ[Ë˜Ø][ÙËˆ\›Z[˜[ˆ\›Z[˜[
+BˆÂˆØ\ÙHš[™Y‚ˆœ™XZÂˆØ\ÙHœÙ[™œÙ[XÝÞ\Ý[T›Û\‚ˆ]ØZ]\›Z[˜[›[™J•\ÙH	SQHÕVHÜˆÜ›Û\ÈSQHÕVH]HÚ]›Û\ˆŠBˆBˆØ\ÙH‹Ü›Û\Ž‚ˆ]ØZ][™T›Û\ÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆÚÚ[Îˆš\ÝX[œÚÚ[Ë˜Ø][ÙËˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹ØÚ]Ž‚ˆ]ØZ][™PÚ]ÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ\XÝ›Û\ˆÛÛ™šYÝ\˜][ÛËœ›Û\ÏË˜ÛÛ\XÝˆÚ]›ØÙ\ÜÎˆÚ]›ØÙ\ÜËˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹ÙY]Ž‚ˆ]ØZ][™QY]ÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆY[[ÜžNˆš\ÝX[›Y[[ÜžKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆ›ÝšY\˜\ÙUT“Îˆš\ÝX[œ›ÝšY\˜\ÙUT“Ëˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹Ü›ÝšY\ˆŽ‚ˆ]ØZ][™T›ÝšY\ÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆ›ÝšY\˜\ÙUT“Îˆš\ÝX[œ›ÝšY\˜\ÙUT“Ëˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹Ø˜\Ù]\›Ž‚ˆ]ØZ][™P˜\ÙUT“ÛÛ[X[™
+ˆ\™Ý[Y[ˆÝ\œ™[›ÝšY\ŽˆÙ\ÜÚ[Û‹œ›Ùš[Kœ›ÝšY\‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆ›ÝšY\˜\ÙUT“Îˆš\ÝX[œ›ÝšY\˜\ÙUT“Ëˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹Û[Ù[Ž‚ˆYˆ\™Ý[Y[š\Ñ[\HÂˆ]ØZ]\›Z[˜[›[™JˆÙ\ÜÚ[Û‹œ›Ùš[K›[Ù[š\Ñ[\HÈ“›È[Ù[Ù[XÝYˆˆˆ“[Ù[ˆ
+Ù\ÜÚ[Û‹œ›Ùš[K›[Ù[
+HŠBˆH[ÙHÂˆÙ\ÜÚ[Û‹œ›Ùš[K›[Ù[H\™Ý[Y[ˆ]Ø]™YH]ØZ]\œÚ\ÝYÙ[›Ùš[JˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆ[[YNˆ[[YKˆ\›Z[˜[ˆ\›Z[˜[
+BˆYˆØ]™YÂˆ]ØZ]\›Z[˜[›[™J“[Ù[ˆ
+\™Ý[Y[
+H
+Ø]™Y›ÜˆYÙ[
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+JHŠBˆBˆBˆØ\ÙH‹ØYÙ[ÈŽ‚ˆ]ØZ][™PYÙ[ÐÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆ›ÝšY\˜\ÙUT“Îˆš\ÝX[œ›ÝšY\˜\ÙUT“Ëˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹ØYÙ[Ž‚ˆ]ØZ][™PYÙ[ÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆ›ÝšY\˜\ÙUT“Îˆš\ÝX[œ›ÝšY\˜\ÙUT“ËœÛ˜\ÚÝ
+
+Kˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹ÝÛÛÈŽ‚ˆ]ØZ][™UÛÛÐÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹ÛXÜŽ‚ˆ]ØZ][™SPÔÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆØ][ÙÜÎˆ	˜Ø][ÙÜËˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹ÛXÜÈŽ‚ˆ]ØZ][™SPÔÛÛ[X[™
+ˆ›\Ý‹ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆØ][ÙÜÎˆ	˜Ø][ÙÜËˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹Ú[XYÙHŽ‚ˆ][XYÙP\™Ý[Y[ÈH\™Ý[Y[œÜ]
+ˆX^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙBˆ
+K›X\
+Ýš[™Ëš[š]
+BˆÝX\™[XYÙP\™Ý[Y[Ë˜ÛÝ[OH‹ˆ][ÙHH[XYÙP]XÚY[[ÙJ˜]Õ˜[YNˆ[XYÙP\™Ý[Y[ÖÌK›ÝÙ\˜Ø\ÙY
+
+JBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÚ[XYÙH[ž_ÛX[YY][_šYß[ØÜˆUŠBˆ™]\›ˆ˜[ÙBˆBˆÈÂˆ]]H[XYÙP\™Ý[Y[ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[˜\[™
+ˆžH]ØZ][XYÙPÛÛ[
+]ˆ][ÙNˆ[ÙKØÜ”›ÝšY\ŽˆØÜ”›ÝšY\ŠJBˆYˆ[ÙHOH›ØÜˆÂˆ]X\šÙÝÛ“˜[YHH
+]\È”ÔÝš[™ÊK›\Ý]ÛÛ\Û™[ˆ]ØZ]\›Z[˜[›[™Jˆ“ÐÔˆ^]Y]YY\È
+
+X\šÙÝÛ“˜[YH\È”ÔÝš[™ÊK™[][™Ô]^[œÚ[ÛŠK›YŠBˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™J’[XYÙH]Y]YY]
+[ÙKœ˜]Õ˜[YJHÚ^™Nˆ
+]
+HŠBˆBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆØ\ÙH‹Ø]XÚŽ‚ˆ]ØZ]]XÚØÝ[Y[
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆØÜ”›ÝšY\ŽˆØÜ”›ÝšY\‹ˆY]ÜŽˆY]Ü‹ˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹ØÛÜHŽ‚ˆ]ØZ]ÛÜUÐÛ\›Ø\™
+\™Ý[Y[Ù\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹Ù^ÜŽ‚ˆ]ØZ][™Q^ÜÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆ›ØÙ\ÜÎˆÚ]›ØÙ\ÜËˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ˆÚÚ[Îˆš\ÝX[œÚÚ[Ë˜Ø][ÙËˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH‹Ú[\ÜŽ‚ˆ]ØZ]\›Z[˜[›[™J•\ÙHÚ[\ÜU]H[\˜XÝ]™HÚ]›Û\ˆŠBˆØ\ÙH‹ÜÝ]ÈŽ‚ˆ]ØZ][™TÝ]ÐÛÛ[X[™
+\™Ý[Y[ÝÜ™Nˆš\ÝX[\ØYÙTÝ]Ë\›Z[˜[ˆ\›Z[˜[
+BˆÚYˆPRWÒT×Õ’TÕPSˆØ\ÙH‹Ýš\ÝX[Ž‚ˆ]ØZ][•š\ÝX[[ÙJˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆØÜ”›ÝšY\ŽˆØÜ”›ÝšY\‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆØ][ÙÜÎˆ	˜Ø][ÙÜËˆš\ÝX[ˆš\ÝX[ˆ\›Z[˜[ˆ\›Z[˜[
+BˆÙ[™Y‚ˆØ\ÙH‹ØÛX\ˆŽ‚ˆÙ\ÜÚ[Û‹œ™\Ù]
+
+BˆËÈHYÙ[ÈHÛX\™Y[œÈÝ\YX]™HHX›HÚ][KÛÂˆËÈH™^Ø]™HÙ\È›Ýœš[™È[H˜XÚÎÈ[›š[™ÈÛ™\ÈÝ^K‚ˆYˆ]Ú]›ØÙ\ÜÈÈ]ØZ][[YKœÝ\\š\ÛÜ‹˜ÛX\‘š[š\ÚY
+[™\ŽˆÚ]›ØÙ\ÜÊHBˆ]ØZ]\›Z[˜[›[™JÛÛ™\œØ][ÛˆÛX\™YˆŠBˆØ\ÙH‹Ü]Y]YHŽ‚ˆ]ØZ]\›Z[˜[›[™J•HY\ÜØYÙH]Y]YH]™\È]H\›Z[˜[›Û\—ˆˆ
+È]Y]YR[
+BˆØ\ÙH‹Ü™\HŽ‚ˆ]ØZ]\›Z[˜[›[™Jˆ•\ÙHÜ™\H]HÚ]›Û\È]Ü[œÈH\Ý™\H][ÝY[ˆ	QUÔ‹ˆŠBˆØ\ÙH‹ÜÝÜŽ‚ˆ]ØZ]\›Z[˜[›[™J•\ÙHÜÝÜ]HÚ]›Û\È[\œ\H[›š[™È\›ˆ[™ÙY\]È]Y]YKˆŠBˆØ\ÙH‹ØÛÛ[YHŽ‚ˆ]ØZ]\›Z[˜[›[™Jˆ•\ÙHØÛÛ[YH]HÚ]›Û\È[ˆš\ÝX[[ÙKÙ[™˜ÛÛ[YWˆ\ÈHY\ÜØYÙKˆŠBˆY˜][‚ˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆÛÛ[X[™ˆ\HÚ[ˆŠBˆBˆ™]\›ˆ˜[ÙBˆB‚ˆš]˜]HÝ]XÈ[˜È[™SPÔÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆØ][ÙÜÎˆ[›Ý]ÓPÔÙ\™\Ø][Ù×Kˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]YXÙ\ÈH\™Ý[Y[œÜ]
+ˆX^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙBˆ
+K›X\
+Ýš[™Ëš[š]
+Bˆ]XÝ[ÛˆHYXÙ\Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+HÏÈ›\Ý‚ˆÝÚ]ÚXÝ[ÛˆÂˆØ\ÙHˆ‹›\ÝŽ‚ˆ]ÛÛ™šYÝ\™YHÛÛ™šYÝ\˜][ÛË›XÜÙ\™\œÈÏÈ×Bˆ]ÛÛ›™XÝYHXÝ[Û˜\žJ[š\]YRÙ^\ÕÚ]˜[Y\ÎˆØ][ÙÜË›X\È
+	œÙ\™\’Q	
+HJBˆYˆÛÛ™šYÝ\™Yš\Ñ[\KØ][ÙÜËš\Ñ[\HÂˆ]ØZ]\›Z[˜[›[™J“›ÈÛÛ™šYÝ\™YPÔÙ\™\œËˆŠBˆ™]\›‚ˆBˆ›ÜˆÙ\™\ˆ[ˆÛÛ™šYÝ\™YÂˆ]˜[œÜÜBˆÙ\™\‹šÚ[™OHœÝ[È‚ˆÈÙ\™\‹˜ÛÛ[X[™ÏÈœÝ[ÈˆˆÙ\™\‹\›Ë˜XœÛÛ]TÝš[™ÈÏÈÙ\™\‹šÚ[™ˆ]Ý]NˆÝš[™ÂˆYˆ\Ù\™\‹™[˜X›YÂˆÝ]HH™\ØX›Y‚ˆH[ÙHYˆ]Ø][ÙÈHÛÛ›™XÝYÜÙ\™\‹šYHÂˆÝ]HBˆ˜ÛÛ›™XÝY8 %
+Ø][ÙËÛÛË˜ÛÝ[
+HÛÛË
+Ø][ÙËœ™\ÛÝ\˜Ù\Ë˜ÛÝ[
+H™\ÛÝ\˜Ù\ËPÔ
+Ø][ÙËœ›ÝØÛÛ™\œÚ[ÛŠH‚ˆH[ÙHÂˆÝ]HH››ÝÛÛ›™XÝY‚ˆBˆ]ØZ]\›Z[˜[›[™J—
+Ù\™\‹šY
+H8 %
+˜[œÜÜ
+H×
+Ý]JWHŠBˆBˆ]ÛÛ™šYÝ\™YQÈHÙ]
+ÛÛ™šYÝ\™Y›X\
+šY
+JBˆ›ÜˆØ][ÙÈ[ˆØ][ÙÜÈÚ\™HXÛÛ™šYÝ\™YQË˜ÛÛZ[œÊØ][ÙËœÙ\™\’Q
+HÂˆ]ØZ]\›Z[˜[›[™Jˆ—
+Ø][ÙËœÙ\™\’Q
+H8 %
+Ø][ÙËÛÛË˜ÛÝ[
+HÛÛË
+Ø][ÙËœ™\ÛÝ\˜Ù\Ë˜ÛÝ[
+H™\ÛÝ\˜Ù\ËPÔ
+Ø][ÙËœ›ÝØÛÛ™\œÚ[ÛŠHØÛÛ›™XÝYH‚ˆ
+BˆB‚ˆØ\ÙH˜YŽ‚ˆÝX\™]˜]ÐY\™Ý[Y[ÈHYXÙ\Ë™›Üš\œÝ
+
+K™š\œÝ[ÙHÂˆ]ØZ]\›Z[˜[›[™JXÜÛÛ[X[™[
+Bˆ™]\›‚ˆBˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆÈÂˆ]Ù\™\ˆHžH\œÙTÝ[ÓPÔY\™Ý[Y[Ê˜]ÐY\™Ý[Y[ÊBˆÝX\™Y˜Y›XÜÙ\™\œË˜ÛÛZ[œÊÚ\™NˆÈ	šYOHÙ\™\‹šYJH[ÙHÂˆ›ÝÈPÔÛÛ[X[™\œ›Ü‹™\XØ]RQ
+Ù\™\‹šY
+BˆBˆ]ÛÝ\˜ÙHHžH]ØZ]YÚ[œË›XZÙSPÔÛÛÛÝ\˜ÙJˆÚ[™ˆÙ\™\‹šÚ[™ˆÛÛ™šYÝ\˜][ÛŽˆÙ\™\‹ˆ[š\›Û›Y[ˆ›ØÙ\ÜÒ[™›Ëœ›ØÙ\ÜÒ[™›Ë™[š\›Û›Y[
+Bˆ]ÛÛÐ™Y›Ü™HHÙ]
+]ØZ][[YK˜]˜Z[X›UÛÛÊ
+K›X\
+›˜[YJJBˆ]Ø][ÙÈHžH]ØZ][[YKœ™YÚ\Ý\ŠXÜˆÛÝ\˜ÙJBˆ]YYÛÛÈHÙ]
+]ØZ][[YK˜]˜Z[X›UÛÛÊ
+K›X\
+›˜[YJJKœÝX˜XÝ[™ÊÛÛÐ™Y›Ü™JB‚ˆ˜Y›XÜÙ\™\œË˜\[™
+Ù\™\ŠBˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜YˆØ][ÙÜË˜\[™
+Ø][ÙÊBˆ]ØZ]\›Z[˜[›[™JˆYY[™ÛÛ›™XÝYÝ[ÈPÔ	×
+Ù\™\‹šY
+IÎÈ[˜X›Y[
+YYÛÛË˜ÛÝ[
+HÛÛÈ›Üˆ]™\žHYÙ[ˆ‚ˆ
+BˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆB‚ˆØ\ÙH™[˜X›HŽ‚ˆÝX\™YXÙ\Ë˜ÛÝ[OHˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™JXÜÛÛ[X[™[
+Bˆ™]\›‚ˆBˆ]YHYXÙ\ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”]ˆ]Ù\™\’[™^H˜Y›XÜÙ\™\œË™š\œÝ[™^
+Ú\™NˆÈ	šYOHYJBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆPÔÙ\™\ˆ	×
+Y
+IÈ\È›ÝÛÛ™šYÝ\™Yˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆYˆØ][ÙÜË˜ÛÛZ[œÊÚ\™NˆÈ	œÙ\™\’QOHYJHÂˆ]ØZ]\›Z[˜[›[™J“PÔÙ\™\ˆ	×
+Y
+IÈ\È[™XYH[˜X›Y[™ÛÛ›™XÝYˆŠBˆ™]\›‚ˆBˆÈÂˆ˜\ˆÙ\™\ˆH˜Y›XÜÙ\™\œÖÜÙ\™\’[™^BˆÙ\™\‹™[˜X›YHYBˆ]ÛÝ\˜ÙHHžH]ØZ]YÚ[œË›XZÙSPÔÛÛÛÝ\˜ÙJˆÚ[™ˆÙ\™\‹šÚ[™ˆÛÛ™šYÝ\˜][ÛŽˆÙ\™\‹ˆ[š\›Û›Y[ˆ›ØÙ\ÜÒ[™›Ëœ›ØÙ\ÜÒ[™›Ë™[š\›Û›Y[
+Bˆ]ÛÛÐ™Y›Ü™HHÙ]
+]ØZ][[YK˜]˜Z[X›UÛÛÊ
+K›X\
+›˜[YJJBˆ]Ø][ÙÈHžH]ØZ][[YKœ™YÚ\Ý\ŠXÜˆÛÝ\˜ÙJBˆ]YYÛÛÈHÙ]
+]ØZ][[YK˜]˜Z[X›UÛÛÊ
+K›X\
+›˜[YJJKœÝX˜XÝ[™ÊÛÛÐ™Y›Ü™JBˆ˜Y›XÜÙ\™\œÖÜÙ\™\’[™^HHÙ\™\‚ˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜YˆØ][ÙÜË˜\[™
+Ø][ÙÊBˆ]ØZ]\›Z[˜[›[™Jˆ‘[˜X›Y[™ÛÛ›™XÝYPÔ	×
+Y
+IÎÈ[˜X›Y[
+YYÛÛË˜ÛÝ[
+HÛÛÈ›Üˆ]™\žHYÙ[ˆ‚ˆ
+BˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆB‚ˆØ\ÙH™\ØX›HŽ‚ˆÝX\™YXÙ\Ë˜ÛÝ[OHˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™JXÜÛÛ[X[™[
+Bˆ™]\›‚ˆBˆ]YHYXÙ\ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”]ˆ]Ù\™\’[™^H˜Y›XÜÙ\™\œË™š\œÝ[™^
+Ú\™NˆÈ	šYOHYJBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆPÔÙ\™\ˆ	×
+Y
+IÈ\È›ÝÛÛ™šYÝ\™Yˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆYˆY˜Y›XÜÙ\™\œÖÜÙ\™\’[™^K™[˜X›YÂˆ]ØZ]\›Z[˜[›[™J“PÔÙ\™\ˆ	×
+Y
+IÈ\È[™XYH\ØX›YˆŠBˆ™]\›‚ˆBˆ]˜[Y\ÜXÙHHXÜ˜[Y\ÜXÙJ›ÜŽˆ˜Y›XÜÙ\™\œÖÜÙ\™\’[™^JBˆ]™YÚ\Ý\™YÛÛÈHÙ]
+]ØZ][[YK˜]˜Z[X›UÛÛÊ
+K›X\
+›˜[YJJBˆ]™[[Ý™YÛÛÈH™YÚ\Ý\™YÛÛË™š[\ˆÈ	š\Ô™Yš^
+—
+˜[Y\ÜXÙJNŽˆŠHBˆ˜Y›XÜÙ\™\œÖÜÙ\™\’[™^K™[˜X›YH˜[ÙBˆ›Üˆ[™^[ˆ˜Y˜YÙ[Ëš[™XÙ\ÈÂˆ˜Y˜YÙ[ÖÚ[™^KÛÛ˜[Y\ËœÝX˜XÝ
+™[[Ý™YÛÛÊBˆBˆ˜\ˆ›Ùš[HHÙ\ÜÚ[Û‹œ›Ùš[Bˆ›Ùš[KÛÛ˜[Y\ËœÝX˜XÝ
+™[[Ý™YÛÛÊBˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÈH]ØZ][[YK[œ™YÚ\Ý\“PÔ
+Ù\™\’QˆY
+Bˆ›ÜˆYÙ[[ˆ˜Y˜YÙ[ÈÂˆžH]ØZ][[YKœ™YÚ\Ý\ŠYÙ[ˆYÙ[™\XÚ[™Ñ^\Ý[™ÎˆYJBˆBˆÙ\ÜÚ[Û‹œ›Ùš[HH›Ùš[BˆÛÛ™šYÝ\˜][ÛˆH˜YˆØ][ÙÜËœ™[[Ý™P[È	œÙ\™\’QOHYBˆ]ØZ]\›Z[˜[›[™J‘\ØX›YPÔ	×
+Y
+IÈ[™™[[Ý™Y
+™[[Ý™YÛÛË˜ÛÝ[
+H]™HÛÛËˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆB‚ˆY˜][‚ˆ]ØZ]\›Z[˜[›[™JXÜÛÛ[X[™[
+BˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈXÜ˜[Y\ÜXÙJ›ÜˆÙ\™\ŽˆÛÛ™šYÝ\™YPÔÙ\™\ŠHOˆÝš[™ÈÂˆ]™Yš^HÙ\™\‹ÛÛ˜[YT™Yš^Ëš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆ™]\›ˆ™Yš^™›]X\È	š\Ñ[\HÈš[ˆ	HÏÈÙ\™\‹šYˆB‚ˆš]˜]HÝ]XÈ[˜È\œÙTÝ[ÓPÔY\™Ý[Y[ÊÈ\™Ý[Y[ÎˆÝš[™ÊH›ÝÜÂˆOˆÛÛ™šYÝ\™YPÔÙ\™\‚ˆÂˆ]ÛÜ™ÈHžHÚ[ÛÜ™Ê\™Ý[Y[ÊBˆÝX\™]ÛÜ™Ëš\Ñ[\H[ÙHÈ›ÝÈPÔÛÛ[X[™\œ›Ü‹›Z\ÜÚ[™ÐÛÛ[X[™Bˆ˜\ˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×HHÎ—Bˆ˜\ˆÛÜšÚ[™Ñ\™XÝÜžNˆÝš[™ÏÂˆ˜\ˆ[Y[Ý]ˆ[YR[\˜[Âˆ˜\ˆ™Yš^ˆÝš[™ÏÂˆ˜\ˆ\›Ý˜[HÛÛ\›Ý˜[™\]Z\™[Y[˜ÛÛ™š\›Bˆ˜\ˆYˆÝš[™ÏÂˆ]Ù\\˜]Ü’[™^HÛÜ™Ë™š\œÝ[™^
+ÙŽˆ‹KHŠBˆ]Ü[Û•ÛÜ™Îˆ\œ˜^TÛXÙOÝš[™Ï‚ˆ]ÛÛ[X[™ÛÜ™Îˆ\œ˜^TÛXÙOÝš[™Ï‚ˆYˆ]Ù\\˜]Ü’[™^Âˆ˜\ˆÜ[ÛœÔÝ\HÛÜ™ËœÝ\[™^ˆYˆÜ[ÛœÔÝ\Ù\\˜]Ü’[™^]ÛÜ™ÖÛÜ[ÛœÔÝ\Kš\Ô™Yš^
+‹HŠHÂˆYHÛÜ™ÖÛÜ[ÛœÔÝ\BˆÜ[ÛœÔÝ\
+ÏHBˆBˆÜ[Û•ÛÜ™ÈHÛÜ™ÖÛÜ[ÛœÔÝ\‹Ù\\˜]Ü’[™^BˆÛÛ[X[™ÛÜ™ÈHÛÜ™ÖÝÛÜ™Ëš[™^
+Y\ŽˆÙ\\˜]Ü’[™^
+K‹‹—BˆH[ÙHÂˆÜ[Û•ÛÜ™ÈH×BˆÛÛ[X[™ÛÜ™ÈHÛÜ™ÖË‹‹—BˆB‚ˆ˜\ˆ[™^HÜ[Û•ÛÜ™ËœÝ\[™^ˆÚ[H[™^Ü[Û•ÛÜ™Ë™[™[™^ÂˆÝÚ]ÚÜ[Û•ÛÜ™ÖÚ[™^HÂˆØ\ÙH‹K[˜[YHŽ‚ˆ[™^
+ÏHBˆÝX\™[™^Ü[Û•ÛÜ™Ë™[™[™^[ÙHÂˆ›ÝÈPÔÛÛ[X[™\œ›Ü‹›Z\ÜÚ[™ÓÜ[Û•˜[YJ‹K[˜[YHŠBˆBˆYHÜ[Û•ÛÜ™ÖÚ[™^Bˆ[™^
+ÏHBˆØ\ÙH‹KY[ˆŽ‚ˆ[™^
+ÏHBˆÝX\™[™^Ü[Û•ÛÜ™Ë™[™[™^ˆ]Ù\\˜]ÜˆHÜ[Û•ÛÜ™ÖÚ[™^K™š\œÝ[™^
+ÙŽˆHŠKˆÙ\\˜]ÜˆOHÜ[Û•ÛÜ™ÖÚ[™^KœÝ\[™^ˆ[ÙHÈ›ÝÈPÔÛÛ[X[™\œ›Ü‹š[˜[Y[š\›Û›Y[Bˆ[š\›Û›Y[ÔÝš[™ÊÜ[Û•ÛÜ™ÖÚ[™^VË‹Ù\\˜]Ü—JWHHÝš[™ÊˆÜ[Û•ÛÜ™ÖÚ[™^VÛÜ[Û•ÛÜ™ÖÚ[™^Kš[™^
+Y\ŽˆÙ\\˜]ÜŠK‹‹—JBˆ[™^
+ÏHBˆØ\ÙH‹KXÝÙŽ‚ˆ[™^
+ÏHBˆÝX\™[™^Ü[Û•ÛÜ™Ë™[™[™^[ÙHÂˆ›ÝÈPÔÛÛ[X[™\œ›Ü‹›Z\ÜÚ[™ÓÜ[Û•˜[YJ‹KXÝÙŠBˆBˆÛÜšÚ[™Ñ\™XÝÜžHHÜ[Û•ÛÜ™ÖÚ[™^Bˆ[™^
+ÏHBˆØ\ÙH‹K][Y[Ý]Ž‚ˆ[™^
+ÏHBˆÝX\™[™^Ü[Û•ÛÜ™Ë™[™[™^ˆ]˜[YHH[YR[\˜[
+Ü[Û•ÛÜ™ÖÚ[™^JK˜[YHˆˆ[ÙHÂˆ›ÝÈPÔÛÛ[X[™\œ›Ü‹š[˜[Y[Y[Ý]ˆBˆ[Y[Ý]H˜[YBˆ[™^
+ÏHBˆØ\ÙH‹K\™Yš^Ž‚ˆ[™^
+ÏHBˆÝX\™[™^Ü[Û•ÛÜ™Ë™[™[™^[ÙHÂˆ›ÝÈPÔÛÛ[X[™\œ›Ü‹›Z\ÜÚ[™ÓÜ[Û•˜[YJ‹K\™Yš^ŠBˆBˆ™Yš^HÜ[Û•ÛÜ™ÖÚ[™^Bˆ[™^
+ÏHBˆØ\ÙH‹KX\›Ý˜[Ž‚ˆ[™^
+ÏHBˆÝX\™[™^Ü[Û•ÛÜ™Ë™[™[™^ˆ]˜[YHHÛÛ\›Ý˜[™\]Z\™[Y[
+˜]Õ˜[YNˆÜ[Û•ÛÜ™ÖÚ[™^K›ÝÙ\˜Ø\ÙY
+
+JBˆ[ÙHÈ›ÝÈPÔÛÛ[X[™\œ›Ü‹š[˜[Y\›Ý˜[Bˆ\›Ý˜[H˜[YBˆ[™^
+ÏHBˆY˜][‚ˆ›ÝÈPÔÛÛ[X[™\œ›Ü‹š[˜[YÜ[ÛŠÜ[Û•ÛÜ™ÖÚ[™^JBˆBˆBˆÝX\™]ÛÛ[X[™HÛÛ[X[™ÛÜ™Ë™š\œÝXÛÛ[X[™š\Ñ[\H[ÙHÂˆ›ÝÈPÔÛÛ[X[™\œ›Ü‹›Z\ÜÚ[™ÐÛÛ[X[™ˆBˆ][™™\œ™YQHT“
+š[UT“Ú]]ˆÛÛ[X[™
+K›\Ý]ÛÛ\Û™[ˆ]™\ÛÛ™YQHYÏÈ[™™\œ™YQˆÝX\™\™\ÛÛ™YQš\Ñ[\H[ÙHÈ›ÝÈPÔÛÛ[X[™\œ›Ü‹›Z\ÜÚ[™ÒQBˆÝX\™\Õ˜[YPÔQ
+™\ÛÛ™YQ
+H[ÙHÈ›ÝÈPÔÛÛ[X[™\œ›Ü‹š[˜[YQ
+™\ÛÛ™YQ
+HBˆ™]\›ˆÛÛ™šYÝ\™YPÔÙ\™\ŠˆYˆ™\ÛÛ™YQˆÚ[™ˆœÝ[È‹ˆÛÛ[X[™ˆÛÛ[X[™ˆ\™ÜÎˆ\œ˜^JÛÛ[X[™ÛÜ™Ë™›Üš\œÝ
+
+JKˆ[Žˆ[š\›Û›Y[ˆÝÙˆÛÜšÚ[™Ñ\™XÝÜžKˆ[Y[Ý]ˆ[Y[Ý]ˆÛÛ˜[YT™Yš^ˆ™Yš^ˆY˜][\›Ý˜[ˆ\›Ý˜[
+BˆB‚ˆš]˜]HÝ]XÈ[˜È\Õ˜[YPÔQ
+ÈYˆÝš[™ÊHOˆ›ÛÛÂˆÝX\™YOH‹ˆ‹YOH‹‹ˆ‹ˆY™š\œÝ›X\
+È	š\Ó]\ˆ	š\Ó[X™\ˆJHOHYBˆ[ÙHÂˆ™]\›ˆ˜[ÙBˆBˆ™]\›ˆY˜[Ø]\ÙžHÈ	š\Ó]\ˆ	š\Ó[X™\ˆ‹—ËH‹˜ÛÛZ[œÊ	
+HBˆB‚ˆš]˜]HÝ]XÈ[˜È™\ÛÛ™YÞ\Ý[T›Û\˜[YJˆÈ™\]Y\ÝYˆÝš[™ËˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛÂˆ
+HOˆÝš[™ÏÈÂˆ]˜[Y\ÈHÛÛ™šYÝ\˜][ÛËœ›Û\ÏËœÞ\Ý[KšÙ^\ÈÏÈÔÝš[™ÎˆÝš[™×J
+KšÙ^\ÂˆYˆ˜[Y\Ë˜ÛÛZ[œÊ™\]Y\ÝY
+HÈ™]\›ˆ™\]Y\ÝYBˆ]X]Ú\ÈH˜[Y\Ë™š[\ˆÈ	˜Ø\ÙR[œÙ[œÚ]]™PÛÛ\\™J™\]Y\ÝY
+HOH›Ü™\™YØ[YHBˆ™]\›ˆX]Ú\Ë˜ÛÝ[OHHÈX]Ú\ÖÌHˆš[ˆB‚ˆËËÈÝÙØ[ˆ[ˆHØ[YH\ÝHÙ×Ê˜ÛÛÈš]™K›ÜˆH\œÛÛ‚ˆËËÈ]HÙ^X›Ø\™ˆ]™\žHXÝ[Ûˆ™XYÈHš[HYœ™\ÚÛÈH\Ý[‚ˆËËÈYÙ[\ÝÚ[™ÙY\ÈÚ]Ù]ÈÚÝÛˆÜˆY]Y‚ˆš]˜]HÝ]XÈ[˜È[™UÙÐÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙÎˆÙÔÝ]Kˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]šY[ÈH\™Ý[Y[œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+Bˆ]XÝ[ÛˆHšY[Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+HÏÈˆ‚ˆ]™\ÝHšY[Ë˜ÛÝ[ˆHÈšY[ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHˆˆ‚ˆ˜\ˆ\ÝHÙË˜Ý\œ™[‚ˆÝÚ]ÚXÝ[ÛˆÂˆØ\ÙHˆ‹œÚÝÈ‹›\ÝŽ‚ˆ]ØZ]\›Z[˜[›[™J\Ý›\Ý[™ÊB‚ˆØ\ÙH˜YŽ‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÝÙÈYVŠBˆ™]\›‚ˆBˆ]ØZ]\›Z[˜[›[™JˆXZUÙÕÛÛË™^XÝ]Jˆ˜[YNˆXZUÙÕÛÛË˜Y˜[YK\™Ý[Y[ÎˆÈ]HŽˆœÝš[™Ê™\Ý
+WK\Ýˆ	›\Ý
+JBˆ]ØZ]ÝÜ™UÙÊ\Ý[ŽˆÙË\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙH™Û™H‹˜ÚXÚÈŽ‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÝÙÈÛ™H•SP‘TŸVŠBˆ™]\›‚ˆBˆ]ØZ]\›Z[˜[›[™JˆXZUÙÕÛÛË™^XÝ]Jˆ˜[YNˆXZUÙÕÛÛË™Û™S˜[YK\™Ý[Y[ÎˆÈ\ÚÈŽˆœÝš[™Ê™\Ý
+WK\Ýˆ	›\Ý
+JBˆ]ØZ]ÝÜ™UÙÊ\Ý[ŽˆÙË\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHœ™[[Ý™H‹œ›H‹™[]H‹™[Ž‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÝÙÈ™[[Ý™H•SP‘TŸVŠBˆ™]\›‚ˆBˆÝX\™][™^H\Ýš[™^
+X]Ú[™Îˆ™\Ý
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ\Ýš\Ñ[\HÈ•HÙÈ\Ý\È[\Kˆˆˆ“›ÈÙÈX]ÚY	×
+™\Ý
+IË——
+\Ý›\Ý[™ÊHŠBˆ™]\›‚ˆBˆÝX\™]™[[Ý™YH\Ýœ™[[Ý™J]ˆ[™^
+H[ÙHÈ™]\›ˆBˆ]ØZ]\›Z[˜[›[™J”™[[Ý™Yˆ
+™[[Ý™Y]JW—
+\Ý›\Ý[™ÊHŠBˆ]ØZ]ÝÜ™UÙÊ\Ý[ŽˆÙË\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHœÝÙY\Ž‚ˆ]™[[Ý™YH\Ýœ™[[Ý™PÛÛ\]Y
+
+BˆÝX\™™[[Ý™Yˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J“›ÈÛÛ\]YÙÈ][\ËˆŠBˆ™]\›‚ˆBˆ]ØZ]\›Z[˜[›[™J”™[[Ý™Y
+™[[Ý™Y
+HÛÛ\]YÙÈ][W
+™[[Ý™YOHHÈˆˆˆœÈŠKˆŠBˆ]ØZ]ÝÜ™UÙÊ\Ý[ŽˆÙË\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙH™Y]Ž‚ˆÝX\™ˆ]Y]YH]ØZ]Y][\Ü˜\žU^
+ˆ\Ý›X\šÙÝÛ‹ÝY™š^ˆYÙ[ÙÓ\Ý™š[[˜[YK\›Z[˜[ˆ\›Z[˜[
+Bˆ[ÙHÈ™]\›ˆBˆ]ØZ]ÝÜ™UÙÊYÙ[ÙÓ\Ý
+X\šÙÝÛŽˆY]Y
+K[ŽˆÙË\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙH˜ÛX\ˆŽ‚ˆ]ØZ]ÝÜ™UÙÊYÙ[ÙÓ\Ý
+
+K[ŽˆÙË\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHœ]Ž‚ˆ]ØZ]\›Z[˜[›[™JÙË\›Ëœ]ÏÈYÙ[ÙÓ\Ý™š[[˜[YJB‚ˆY˜][‚ˆ]ØZ]\›Z[˜[›[™JÙÒ[
+BˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÝÜ™UÙÊˆÈ\ÝˆYÙ[ÙÓ\Ýˆ[ˆÙÎˆÙÔÝ]Kˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÈÂˆžHÙËœØ]™J\Ý
+Bˆ]ØZ]\›Z[˜[›[™Jˆ\Ýš\Ñ[\BˆÈ•ÙÈ\ÝÛX\™Yˆ‚ˆˆ•ÙÈ\ÝØ]™YÈ
+ÙË\›Ëœ]ÏÈYÙ[ÙÓ\Ý™š[[˜[YJH
+
+\Ýœ[™[™ÐÛÝ[
+H[™[™Ë
+\Ý™Û™PÛÝ[
+HÛ™JKˆ‚ˆ
+BˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆËËÈÛY[[ÜžX[ˆ[ˆ™XY]Y]]^[™]œ›ÛHÚ]Ø\ÈØZY[™ˆËËÈXÚYHÝÈ˜\ˆHÚ]ÛÛÈX^HÛÚË‚ˆš]˜]HÝ]XÈ[˜È[™SY[[ÜžPÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆY[[ÜžNˆY[[ÜžTÝ]KˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]šY[ÈH\™Ý[Y[œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+Bˆ]XÝ[ÛˆHšY[Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+HÏÈˆ‚ˆ]™\ÝHšY[Ë˜ÛÝ[ˆHÈšY[ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHˆˆ‚ˆ]Ù][™ÜÈHY[[ÜžK˜ÛÛ™šYÝ\˜][Û‚‚ˆÝÚ]ÚXÝ[ÛˆÂˆØ\ÙHˆ‹œÚÝÈŽ‚ˆ]Ý\œ™[HY[[ÜžK˜Ý\œ™[ˆ]Ý]HHÙ][™ÜË™[˜X›YÈ›Ûˆˆˆ›Ù™ˆ‚ˆ]ØZ]\›Z[˜[›[™Jˆ“Y[[ÜžNˆ
+Ý]JH0­ÈØÛÜH
+Ù][™ÜËœØÛÜKœ˜]Õ˜[YJH0­È
+Ý\œ™[›[™PÛÝ[
+H[™W
+Ý\œ™[›[™PÛÝ[OHHÈˆˆˆœÈŠH‚ˆ
+Bˆ]ØZ]\›Z[˜[›[™JÝ\œ™[š\Ñ[\HÈŠ[\JHˆˆÝ\œ™[^
+B‚ˆØ\ÙH™Y]Ž‚ˆÝX\™ˆ]Y]YH]ØZ]Y][\Ü˜\žU^
+ˆY[[ÜžK˜Ý\œ™[^ÝY™š^ˆ›Y[[ÜžK›Y‹\›Z[˜[ˆ\›Z[˜[
+Bˆ[ÙHÈ™]\›ˆBˆ]ØZ]ÝÜ™JˆYÙ[Y[[ÜžJ^ˆY]Y
+K[ŽˆY[[ÜžK[[YNˆ[[YK\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHœÙ]‹œ™\XÙHŽ‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÛY[[ÜžHÙ]VŠBˆ™]\›‚ˆBˆ]ØZ]ÝÜ™JYÙ[Y[[ÜžJ^ˆ™\Ý
+K[ŽˆY[[ÜžK[[YNˆ[[YK\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙH˜Y‹˜\[™Ž‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÛY[[ÜžHYVŠBˆ™]\›‚ˆBˆ˜\ˆ\]YHY[[ÜžK˜Ý\œ™[ˆ\]Y˜\[™
+™\Ý
+Bˆ]ØZ]ÝÜ™J\]Y[ŽˆY[[ÜžK[[YNˆ[[YK\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙH˜ÛX\ˆ‹™›Ü™Ù]Ž‚ˆ]ØZ]ÝÜ™JYÙ[Y[[ÜžJ
+K[ŽˆY[[ÜžK[[YNˆ[[YK\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHœ™[ØYŽ‚ˆY[[ÜžKœ™[ØY
+
+Bˆ]ØZ][[YK˜ÛÛ™šYÝ\™SY[[ÜžJY[[ÜžKœ›Û\ÙXÝ[ÛŠBˆ]ØZ]\›Z[˜[›[™J”™[ØYY
+Y[[ÜžK\›Ëœ]ÏÈYÙ[Y[[ÜžK™š[[˜[YJKˆŠB‚ˆØ\ÙH›X\›ˆŽ‚ˆ]ØZ]X\›“Y[[ÜžJˆ™\ÝˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆY[[ÜžNˆY[[ÜžKˆ›Û\[\]NˆÛÛ™šYÝ\˜][ÛËœ›Û\ÏË›Y[[ÜžKˆ\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHœØÛÜHŽ‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J“Y[[ÜžHØÛÜNˆ
+Ù][™ÜËœØÛÜKœ˜]Õ˜[YJHŠBˆ™]\›‚ˆBˆÝX\™]ØÛÜHHY[[ÜžTØÛÜJ˜]Õ˜[YNˆ™\Ý›ÝÙ\˜Ø\ÙY
+
+JH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÛY[[ÜžHØÛÜH›Û™_›Ú™XÝ[ˆŠBˆ™]\›‚ˆBˆ]ØZ]\œÚ\ÝY[[ÜžTÙ][™ÜÊˆÛÛ™šYÝ\™YY[[ÜžJ[˜X›YˆÙ][™ÜË™[˜X›YØÛÜNˆØÛÜJKˆY[[ÜžNˆY[[ÜžKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ›ÝN‚ˆ•HÚ]ÛÛÈ›ÝÈ™XY
+ØÛÜHOH››Û™HÈ››Ý[™ÈˆˆØÛÜK™\Ü^S˜[YK›ÝÙ\˜Ø\ÙY
+
+JKˆ‹ˆ\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙH›Ûˆ‹›Ù™ˆŽ‚ˆ]ØZ]\œÚ\ÝY[[ÜžTÙ][™ÜÊˆÛÛ™šYÝ\™YY[[ÜžJ[˜X›YˆXÝ[ÛˆOH›Ûˆ‹ØÛÜNˆÙ][™ÜËœØÛÜJKˆY[[ÜžNˆY[[ÜžKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ›ÝN‚ˆXÝ[ÛˆOH›Ûˆ‚ˆÈ“Y[[ÜžH\ÈYYÈHÞ\Ý[H›Û\YØZ[‹ˆ‚ˆˆ“Y[[ÜžH\ÈÙ\]›ÈÛ™Ù\ˆÙ[ÈH[Ù[ˆ‹ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ][[YK˜ÛÛ™šYÝ\™SY[[ÜžJY[[ÜžKœ›Û\ÙXÝ[ÛŠB‚ˆY˜][‚ˆ]ØZ]\›Z[˜[›[™JY[[ÜžR[
+BˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÝÜ™JˆÈ\]YˆYÙ[Y[[ÜžKˆ[ˆY[[ÜžNˆY[[ÜžTÝ]Kˆ[[YNˆYÙ[[[YKˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÈÂˆžHY[[ÜžKœØ]™J\]Y
+Bˆ]ØZ][[YK˜ÛÛ™šYÝ\™SY[[ÜžJY[[ÜžKœ›Û\ÙXÝ[ÛŠBˆ]ØZ]\›Z[˜[›[™Jˆ\]Yš\Ñ[\BˆÈ“Y[[ÜžHÛX\™Yˆ‚ˆˆ“Y[[ÜžHØ]™YÈ
+Y[[ÜžK\›Ëœ]ÏÈYÙ[Y[[ÜžK™š[[˜[YJH
+
+\]Y›[™PÛÝ[
+H[™W
+\]Y›[™PÛÝ[OHHÈˆˆˆœÈŠJKˆ‚ˆ
+BˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È\œÚ\ÝY[[ÜžTÙ][™ÜÊˆÈÙ][™ÜÎˆÛÛ™šYÝ\™YY[[ÜžKˆY[[ÜžNˆY[[ÜžTÝ]KˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ›ÝNˆÝš[™Ëˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆY[[ÜžK˜\JÙ][™ÜÊBˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J—
+›ÝJH
+›ÝØ]™Yˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™KŠHŠBˆ™]\›‚ˆBˆ˜Y›Y[[ÜžHHÙ][™ÜÂˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ØZ]\›Z[˜[›[™J›ÝJBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆËËÈ›ÛÈÛÛ™\œØ][ÛœÈ[ÈH›Ý\ËˆH[Ù[\ÈÚ]™[ˆÚ]\È[™XYBˆËËÈÛ›ÝÛˆ[™™]\›œÈHY\™ÙYÙ]ÛÈX\›š[™È™]™\ˆÚ[[H›Ü™Ù]Ë‚ˆš]˜]HÝ]XÈ[˜ÈX\›“Y[[ÜžJˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆY[[ÜžNˆY[[ÜžTÝ]Kˆ›Û\[\]NˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ˜\ˆ›ØÝ\ÈH\™Ý[Y[ˆ˜\ˆ]™\žPÚ]H˜[ÙBˆ›Üˆ›YÈ[ˆÈ‹KX[‹‹XH—HÚ\™H›ØÝ\ÈOH›YÈ›ØÝ\Ëš\Ô™Yš^
+›YÈ
+ÈˆŠHÂˆ]™\žPÚ]HYBˆ›ØÝ\ÈHÝš[™Ê›ØÝ\Ë™›Üš\œÝ
+›YË˜ÛÝ[
+JKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆBˆ]Ú]ÈBˆ]™\žPÚ]ÈY[[ÜžKœ›Ú™XÝÚ]Ê
+HˆÓY[[ÜžPÚ]
+Ù\ÜÚ[Û‹˜Ú]ØÛÜNˆÙ\ÜÚ[Û‹]JWBˆ]˜[œØÜš\HYÙ[Y[[ÜžT›Û\˜[œØÜš\
+ÙŽˆÚ]ÊBˆÝX\™]˜[œØÜš\š\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ]™\žPÚ]È“›ÈÛÛ™\œØ][ÛœÈ[ˆ\È›Ú™XÝY]ˆˆˆ“›Ý[™ÈØZY[ˆ\ÈÚ]Y]ˆŠBˆ™]\›‚ˆBˆYˆ][\]HH›Û\[\]Kˆ]Z\ÜÚ[™ÈHYÙ[Y[[ÜžT›Û\›Z\ÜÚ[™ÔXÙZÛ\Š[Žˆ[\]JBˆÂˆ]ØZ]\›Z[˜[›[™Jˆ™\œ›ÜŽˆHY[[ÜžH›Û\]\ÝÛÛZ[ˆ
+Z\ÜÚ[™ÊKˆY]]Ú]ÙY]Y[[ÜžK\›Û\ˆ‹ˆÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆB‚ˆ]^\Ý[™ÈHY[[ÜžK˜Ý\œ™[ˆ]›Ùš[HHÙ\ÜÚ[Û‹œ›Ùš[Bˆ]™\]Y\ÝHYÙ[™\]Y\Ý
+ˆYÙ[Qˆ›Ùš[K˜YÙ[Qˆ›ÝšY\Žˆ›Ùš[Kœ›ÝšY\‹ˆ[Ù[ˆ›Ùš[K›[Ù[ˆY\ÜØYÙ\ÎˆÂˆ\Ù\ŠˆYÙ[Y[[ÜžT›Û\œ™[™\Šˆ^\Ý[™Îˆ^\Ý[™Ëˆ˜[œØÜš\ˆ˜[œØÜš\ˆ›ØÝ\Îˆ›ØÝ\Ëˆ[\]Nˆ›Û\[\]JJBˆKˆÛÛÚÚXÙNˆ››Û™KˆÜ[ÛœÎˆ›Ùš[K›Ü[ÛœËˆ[Z]Îˆ›Ùš[K›[Z]ËˆÝ™X[Nˆ˜[ÙKˆÙ\ÜÚ[Û’QˆÙ\ÜÚ[Û‹œÙ\ÜÚ[Û’Q
+Bˆ]ØZ]\›Z[˜[›[™Jˆ“X\›š[™Èœ›ÛH
+]™\žPÚ]È—
+Ú]Ë˜ÛÝ[
+HÚ]
+Ú]Ë˜ÛÝ[OHHÈˆˆˆœÈŠHˆˆ\ÈÚ]Šx )ˆ‚ˆ
+BˆÈÂˆ]™\Ý[HžH]ØZ][[YKœ[Š™\]Y\Ý
+HÈÈ[ˆBˆ]X\›™YHY\ÜØYÙPÛÛ[š[\‹œ›Û\ØY™U^
+œ›ÛNˆ™\Ý[œ™\ÜÛœÙK^
+Bˆš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™[X\›™Yš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J“›Ý[™È\˜X›HÈ™[Y[X™\ŽÈY[[ÜžH\È[˜Ú[™ÙYˆŠBˆ™]\›‚ˆBˆ]ØZ]ÝÜ™JYÙ[Y[[ÜžJ^ˆX\›™Y
+K[ŽˆY[[ÜžK[[YNˆ[[YK\›Z[˜[ˆ\›Z[˜[
+BˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆËËÈÜ›Û\Øˆ]™\žH›Û\H˜[YHØ[ˆ[ˆ\™KžHÚ[™[ˆBˆËËÈ[\]\È]\™H›Ý[ˆžH˜[YK‚ˆš]˜]HÝ]XÈ[˜ÈÚÝÔ›Û\ÊˆÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛËˆÚÚ[ÎˆYÙ[ÚÚ[Ø][ÙËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]Ø][ÙÈBˆÛÛ™šYÝ\˜][ÛËœ›Û\Ø][ÙÊÚÚ[ÎˆÚÚ[ËœÚÚ[ÊHÏÈ›Û\Ø][ÙÊÚÚ[ÎˆÚÚ[ËœÚÚ[ÊBˆ]ÚYHX^
+LØ][ÙË™[šY\Ë›X\È	˜ÛÛ[X[™˜[YK˜ÛÝ[K›X^
+
+HÏÈ
+Bˆ[˜È›ÝÊÈX\šÙ\ŽˆÝš[™ËÈ˜[YNˆÝš[™ËÈ]Z[ˆÝš[™ÊHOˆÝš[™ÈÂˆ—
+X\šÙ\ŠH
+˜[YKœY[™ÊÓ[™ÝˆÚYÚ]Yˆˆ‹Ý\[™Ð]ˆ
+JH
+]Z[
+H‚ˆBˆ˜\ˆ[™\ÈHÂˆ”Þ\Ý[H›Û\È8 %[ˆYÙ[	ÜÈ[œÝXÝ[ÛœÈ
+Ü›Û\X[˜YÙ\È[NÈ	SQHÝÚ]Ú\È\ÈYÙ[ÈÛ™JNˆ‚ˆBˆ]Þ\Ý[HHØ][ÙË™[šY\ÊÙŽˆœÞ\Ý[JBˆ›Üˆ[žH[ˆÞ\Ý[HÂˆ]Ù[XÝYHÙ\ÜÚ[Û‹œ›Ùš[KœÞ\Ý[T›Û\OH[žK›˜[YHÈŠˆˆˆˆ‚ˆ]YÙ[ÈHÛÛ™šYÝ\˜][ÛË˜YÙ[Õ\Ú[™ÔÞ\Ý[T›Û\
+[žK›˜[YJHÏÈ×Bˆ[™\Ë˜\[™
+ˆ›ÝÊˆÙ[XÝY[žK˜ÛÛ[X[™˜[YKˆYÙ[Ëš\Ñ[\HÈ[\ÙYˆˆ˜YÙ[Îˆ
+YÙ[Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJHŠJBˆBˆYˆÞ\Ý[Kš\Ñ[\HÈ[™\Ë˜\[™
+ˆ›Û™NÈÜ›Û\YSQHVÜ™X]\ÈÛ™KˆŠHBˆ[™\Ë˜\[™
+ˆ•\Ù\ˆ›Û\È8 %Y\ÜØYÙ\ÈÙ[žH˜[YH
+›Û\Ë\Ù\ŽÈÜ›Û\ÈYSQHVÙY]\Ù\ˆSQJNˆ‚ˆ
+Bˆ]\Ù\ˆHØ][ÙË™[šY\ÊÙŽˆ\Ù\ŠBˆ›Üˆ[žH[ˆ\Ù\ˆÈ[™\Ë˜\[™
+›ÝÊˆ‹[žK˜ÛÛ[X[™˜[YK[žKœÝ[[X\žJJHBˆYˆ\Ù\‹š\Ñ[\HÈ[™\Ë˜\[™
+ˆ›Û™HY]ˆŠHBˆ]\Ù\ÛÛ[X[™ÈHÙ]
+\Ù\‹›X\È›Û\Û\ÚÛÛ[X[™››Ü›X[^™Y
+	˜ÛÛ[X[™˜[YJHJBˆ[™\Ë˜\[™
+Z[[ˆ›Û\È8 %XZPÛÜ™IÜÎÈH\Ù\ˆ›Û\ÙˆHØ[YH˜[YH™\XÙ\ÈÛ™NˆŠBˆ›Üˆ[žH[ˆØ][ÙË™[šY\ÊÙŽˆ˜Z[[ŠHÂˆ]™\XÙYH\Ù\ÛÛ[X[™Ë˜ÛÛZ[œÊ›Û\Û\ÚÛÛ[X[™››Ü›X[^™Y
+[žK˜ÛÛ[X[™˜[YJJBˆ[™\Ë˜\[™
+ˆ›ÝÊˆ‹[žK˜ÛÛ[X[™˜[YK™\XÙYÈœ™\XÙYžHH\Ù\ˆ›Û\X›Ý™Hˆˆ[žKœÝ[[X\žJJBˆBˆ[™\Ë˜\[™
+”ÚÚ[È8 %ÜÚÚ[ÎÈ	SQHÙ[™ÈÛ™HÚ]\ˆÜˆ›Ý\ÈYÙ[X^HØ[]ˆŠBˆ]ÚÚ[[šY\ÈHØ][ÙË™[šY\ÊÙŽˆœÚÚ[
+Bˆ›Üˆ[žH[ˆÚÚ[[šY\ÈÈ[™\Ë˜\[™
+›ÝÊˆ‹[žK˜ÛÛ[X[™˜[YK[žKœÝ[[X\žJJHBˆYˆÚÚ[[šY\Ëš\Ñ[\HÈ[™\Ë˜\[™
+ˆ›Û™H›Ý[™ÈÜÚÚ[È]\ÝÈH›Û\œÈ™XYˆŠHBˆ][\]\ÎˆÊÝš[™ËÝš[™ÏÊWHHÂˆ
+˜ÛÛ\XÝ‹ÛÛ™šYÝ\˜][ÛËœ›Û\ÏË˜ÛÛ\XÝ
+Kˆ
+™[YØ][Ûˆ‹ÛÛ™šYÝ\˜][ÛËœ›Û\ÏË™[YØ][ÛŠKˆ
+ÛÜšÙ\ˆ‹ÛÛ™šYÝ\˜][ÛËœ›Û\ÏËÛÜšÙ\ŠKˆ
+›Y[[ÜžH‹ÛÛ™šYÝ\˜][ÛËœ›Û\ÏË›Y[[ÜžJKˆBˆ[™\Ë˜\[™
+ˆ•[\]\È8 %›ÝÙ[žH˜[YNÈÙY]ÛÛ\XÝÙY][YØ][Û‹ÙY]ÛÜšÙ\‹ÙY]Y[[ÜžK\›Û\ˆ‚ˆ
+Bˆ›Üˆ
+˜[YK^
+H[ˆ[\]\ÈÂˆ]Ý\ÝÛHH^Ëš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKš\Ñ[\HOH˜[ÙBˆ[™\Ë˜\[™
+›ÝÊˆ‹˜[YKÝ\ÝÛHÈ˜Ý\ÝÛHˆˆ˜Z[Z[ˆŠJBˆBˆ[™\Ë˜\[™
+ˆ‰SQHÕVHÙ[™ÈH›Û\Ú]VY\ˆ]
+Ü›Û\ÈSQHÕVH\ÈHÛ™È›Ü›JNÈÜ›Û\ÈÚÝÈSQHš[ÈÛ™Kˆ‚ˆ
+Bˆ]ØZ]\›Z[˜[›[™J[™\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ—ˆŠJBˆB‚ˆËËÈÚ]H‘TÛÜÙ\ÈY\ˆÜ›Û\Øˆ›Ý[™È[Ü™KÙ[™BˆËËÈY\ÜØYÙKÜˆÝÚ]ÚHYÙ[ÈHÞ\Ý[H›Û\[™[ˆÙ[™Û™K‚ˆš]˜]H[[H›Û\ÐÛÛ[X[™Ý]ÛÛYHÂˆØ\ÙH[™YˆØ\ÙHÙ[™
+Ýš[™Ë]NˆÝš[™ÊBˆØ\ÙHÙ[XÝÞ\Ý[T›Û\
+Ýš[™Ë[ŽˆÝš[™ÏÊBˆB‚ˆËËÈÜ›Û\Ø8 %[™	]ÈÚÜ›Ü›H8 %[ˆ[ˆHØ][ÙÈ\ÝYÛ™BˆËËÈ›Û\ÚÝÛ‹\Ù\ˆ›Û\ÈÙ\œ›ÛHÛ™H[™K[™H˜[YHÚ]ÛÜ™ÂˆËËÈY\ˆ]Ù[\ÈHY\ÜØYÙKˆHÞ\Ý[H›Û\\È›ÝHY\ÜØYÙNˆHYÙ[ˆËËÈ\ÈÝÚ]ÚYÈ][™HÛÜ™ÈY\ˆH˜[YH\™HÙ[\È^H\™K‚ˆš]˜]HÝ]XÈ[˜È[™T›Û\ÐÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆÚÚ[ÎˆYÙ[ÚÚ[Ø][ÙËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈOˆ›Û\ÐÛÛ[X[™Ý]ÛÛYHÂˆ]šY[ÈH\™Ý[Y[œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+Bˆ]XÝ[ÛˆHšY[Ë™š\œÝÏÈˆ‚ˆ]™\ÝHšY[Ë˜ÛÝ[ˆHÈšY[ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHˆˆ‚ˆ]Ø][ÙÈBˆÛÛ™šYÝ\˜][ÛËœ›Û\Ø][ÙÊÚÚ[ÎˆÚÚ[ËœÚÚ[ÊHÏÈ›Û\Ø][ÙÊÚÚ[ÎˆÚÚ[ËœÚÚ[ÊB‚ˆÝÚ]ÚXÝ[Û‹›ÝÙ\˜Ø\ÙY
+
+HÂˆØ\ÙHˆ‹›\Ý‹›ÈŽ‚ˆ]ØZ]ÚÝÔ›Û\ÊˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ÚÚ[ÎˆÚÚ[Ë\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHš[Ž‚ˆ]ØZ]\›Z[˜[›[™J›Û\[
+B‚ˆØ\ÙHœÚÝÈ‹˜Ø]Ž‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜ›Û\ÈÚÝÈSQHŠBˆ™]\›ˆš[™YˆBˆÝX\™][žHHØ][ÙË™[žJ˜[YYˆ™\Ý
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆ›Û\	×
+™\Ý
+IËˆÜ›Û\È\ÝÈ[KˆŠBˆ™]\›ˆš[™YˆBˆ]XY[™ÎˆÝš[™Âˆ]^ˆÝš[™ÂˆÝÚ]Ú[žKšÚ[™ÂˆØ\ÙHœÞ\Ý[N‚ˆ]\Ù\œÈHÛÛ™šYÝ\˜][ÛË˜YÙ[Õ\Ú[™ÔÞ\Ý[T›Û\
+[žK›˜[YJHÏÈ×BˆXY[™ÈBˆ”Þ\Ý[H›Û\	×
+[žK›˜[YJIÈ8 %
+\Ù\œËš\Ñ[\HÈ[\ÙYˆˆ˜YÙ[Îˆ
+\Ù\œËš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJHŠNÈ	
+[žK˜ÛÛ[X[™˜[YJHÕVHÝÚ]Ú\È\ÈYÙ[È]ˆ‚ˆ^H[žK^ˆØ\ÙHœÚÚ[‚ˆXY[™ÈH”ÚÚ[	×
+[žK›˜[YJIÈ8 %
+[žKœÝ[[X\žJNÈ	
+[žK˜ÛÛ[X[™˜[YJHÕVHÙ[™Îˆ‚ˆ^H[žK›Y\ÜØYÙJ\™Ý[Y[ÎˆˆŠHÏÈ[žK^ˆØ\ÙH\Ù\‹˜Z[[Ž‚ˆ]X™[H[žKšÚ[™›X™[œ™Yš^
+JK\\˜Ø\ÙY
+
+H
+È[žKšÚ[™›X™[™›Üš\œÝ
+
+BˆXY[™ÈH—
+X™[
+H	×
+[žK›˜[YJIÎÈ	
+[žK˜ÛÛ[X[™˜[YJHÕVHÙ[™Îˆ‚ˆ^H[žK^ˆBˆ]ØZ]\›Z[˜[›[™JXY[™ÊBˆ]ØZ]\›Z[˜[›[™J^š\Ñ[\HÈŠ[\JHˆˆ^
+B‚ˆØ\ÙH˜Y‹œÙ]‹›™]È‹˜Ü™X]HŽ‚ˆ]\ÈH™\ÝœÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+Ýš[™Ëš[š]
+BˆÝX\™\Ë˜ÛÝ[OHˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜ›Û\È
+XÝ[ÛŠHSQHVŠBˆ™]\›ˆš[™YˆBˆ]ØZ]ÝÜ™U\Ù\”›Û\
+ˆ˜[YYˆ\ÖÌKˆ^ˆ\ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙH™Y]Ž‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜ›Û\ÈY]SQH
+ÙY]\Ù\ˆSQH\ÈHØ[YJHŠBˆ™]\›ˆš[™YˆBˆ]ØZ]Y]\Ù\”›Û\
+ˆ˜[YYˆ™\ÝˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHœ™[[Ý™H‹œ›H‹™[]H‹™[Ž‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜ›Û\È›HSQHŠBˆ™]\›ˆš[™YˆBˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›ˆš[™YˆBˆÝX\™]˜[YHH˜Y\Ù\”›Û\˜[YJX]Ú[™Îˆ™\Ý
+H[ÙHÂˆ][BˆØ][ÙË™[žJ˜[YYˆ™\Ý
+K›X\ÂˆÝÚ]Ú	šÚ[™ÂˆØ\ÙHœÞ\Ý[Nˆˆ	×
+™\Ý
+IÈ\ÈHÞ\Ý[H›Û\ˆÜ›Û\›H›ÜÈÛ™Kˆ‚ˆØ\ÙH˜Z[[Ž‚ˆˆ	×
+™\Ý
+IÈ\ÈHZ[[ˆ›Û\ÚXÚÝ^\ÎÈH\Ù\ˆ›Û\Ùˆ]˜[YH™\XÙ\È]ˆ‚ˆØ\ÙHœÚÚ[ˆˆ	×
+™\Ý
+IÈ\ÈHÚÚ[ˆ™[[Ý™H]È›Û\ˆ
+ÜÚÚ[È]
+Kˆ‚ˆØ\ÙH\Ù\Žˆˆ‚ˆBˆHÏÈˆ‚ˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆ\Ù\ˆ›Û\	×
+™\Ý
+IËˆÜ›Û\È\ÝÈ[K—
+[
+HŠBˆ™]\›ˆš[™YˆBˆ˜Yœ™[[Ý™U\Ù\”›Û\
+˜[YJBˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ÛÛ[X[™H›Û\Û\ÚÛÛ[X[™˜ÛÛ[X[™˜[YJ›ÜŽˆ˜[YJBˆ][˜ÛÝ™\™YH\Ù\”›Û\˜Z[[œË˜ÛÛZ[œÈÂˆ›Û\Û\ÚÛÛ[X[™››Ü›X[^™Y
+	˜ÛÛ[X[™˜[YJHOH›Û\Û\ÚÛÛ[X[™››Ü›X[^™Y
+ÛÛ[X[™
+BˆBˆ]ØZ]\›Z[˜[›[™Jˆ”™[[Ý™Y\Ù\ˆ›Û\	×
+˜[YJIËˆ‚ˆ
+È
+[˜ÛÝ™\™YÈˆHZ[[ˆ›Û\Ùˆ]˜[YH\È˜XÚËˆˆˆˆŠJBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆB‚ˆY˜][‚ˆÝX\™][žHHØ][ÙË™[žJ˜[YYˆXÝ[ÛŠH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ•[šÛ›ÝÛˆ›Û\	×
+XÝ[ÛŠIËˆÜ›Û\È\ÝÈ[NÈHY\ÜØYÙH]Ý\ÈÚ]	Ø[ˆ™HÙ[[œÚYHSÑ‹ˆ‚ˆ
+Bˆ™]\›ˆš[™YˆBˆÝÚ]Ú[žKšÚ[™ÂˆØ\ÙHœÞ\Ý[N‚ˆ™]\›ˆœÙ[XÝÞ\Ý[T›Û\
+[žK›˜[YK[Žˆ™\Ýš\Ñ[\HÈš[ˆ™\Ý
+BˆØ\ÙH\Ù\‹˜Z[[‹œÚÚ[‚ˆ™]\›ˆœÙ[™
+[žK›Y\ÜØYÙJ\™Ý[Y[Îˆ™\Ý
+HÏÈ™\Ý]Nˆ—
+[žK›˜[YJH
+™\Ý
+HŠBˆBˆBˆ™]\›ˆš[™YˆB‚ˆ\ØØ\™X›T™\Ý[ˆš]˜]HÝ]XÈ[˜ÈÝÜ™U\Ù\”›Û\
+ˆ˜[YY˜[YNˆÝš[™Ëˆ^ˆÝš[™ËˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈOˆ›ÛÛÂˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›ˆ˜[ÙBˆBˆ]š[[YY˜[YHH˜[YKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™]š[[YY˜[YKš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™JH\Ù\ˆ›Û\™YYÈH˜[YKˆŠBˆ™]\›ˆ˜[ÙBˆBˆ]Ü™X]YH˜YœÙ]\Ù\”›Û\
+š[[YY˜[YK^ˆ^
+BˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ÛÛ[X[™H›Û\Û\ÚÛÛ[X[™˜ÛÛ[X[™˜[YJ›ÜŽˆš[[YY˜[YJBˆ]™\XÙ\ÈH\Ù\”›Û\˜Z[[œË˜ÛÛZ[œÈÂˆ›Û\Û\ÚÛÛ[X[™››Ü›X[^™Y
+	˜ÛÛ[X[™˜[YJHOH›Û\Û\ÚÛÛ[X[™››Ü›X[^™Y
+ÛÛ[X[™
+BˆBˆ]ØZ]\›Z[˜[›[™Jˆ—
+Ü™X]YÈÜ™X]Yˆˆ”Ø]™YŠH\Ù\ˆ›Û\	×
+š[[YY˜[YJIÎˆ	
+ÛÛ[X[™
+HÕVHÙ[™È]‚ˆ
+È
+™\XÙ\ÈÈˆ[œÝXYÙˆHZ[[ˆ›Û\Ùˆ]˜[YKˆˆˆ‹ˆŠJBˆ™]\›ˆYBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›ˆ˜[ÙBˆBˆB‚ˆËËÈÜ[œÈH\Ù\ˆ›Û\[ˆHY]ÜŽÈH™]ÈÛ™H˜[YYZÙHHZ[[‚ˆËËÈ›Û\Ý\Èœ›ÛHHZ[[‰ÜÈ^ÚXÚ\ÈÝÈÛ™H\ÈY\ÝY‚ˆš]˜]HÝ]XÈ[˜ÈY]\Ù\”›Û\
+ˆ˜[YY™\]Y\ÝYˆÝš[™ËˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™ÛÛ™šYÝ\˜][ÛˆOHš[ÛÛ™šYÝ\˜][Û”]OHš[[ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ]š[[YYH™\]Y\ÝYš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™]š[[YYš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÙY]\Ù\ˆSQHŠBˆ™]\›‚ˆBˆ]˜[YHHÛÛ™šYÝ\˜][ÛË\Ù\”›Û\˜[YJX]Ú[™Îˆš[[YY
+HÏÈš[[YYˆ]ÛÛ[X[™H›Û\Û\ÚÛÛ[X[™››Ü›X[^™Y
+›Û\Û\ÚÛÛ[X[™˜ÛÛ[X[™˜[YJ›ÜŽˆ˜[YJJBˆ]™]š[Ý\ÈBˆÛÛ™šYÝ\˜][ÛËœ›Û\ÏË\Ù\–Û˜[YWBˆÏÈ\Ù\”›Û\˜Z[[œË™š\œÝÈ›Û\Û\ÚÛÛ[X[™››Ü›X[^™Y
+	˜ÛÛ[X[™˜[YJHOHÛÛ[X[™OÂˆ^ÏÈˆ‚ˆÝX\™ˆ]Y]YH]ØZ]Y][\Ü˜\žU^
+™]š[Ý\ËÝY™š^ˆ\Ù\‹\›Û\›Y‹\›Z[˜[ˆ\›Z[˜[
+Bˆ[ÙHÈ™]\›ˆBˆ]ØZ]ÝÜ™U\Ù\”›Û\
+ˆ˜[YYˆ˜[YKˆ^ˆY]Yš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆB‚ˆËËÈÜ›Û\[ˆ[ˆ˜[YYÞ\Ý[H›Û\È\™HÜ™X]YY]Y›ÜYˆËËÈ[™Ú[Y]œ›ÛHÛ™H[™HXXÚÈH˜\™H˜[YHÝ[Ù[XÝÈÛ™H›Ü‚ˆËËÈHÝ\œ™[YÙ[‚ˆš]˜]HÝ]XÈ[˜È[™T›Û\ÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆÚÚ[ÎˆYÙ[ÚÚ[Ø][ÙËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]šY[ÈH\™Ý[Y[œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+Bˆ]XÝ[ÛˆHšY[Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+HÏÈˆ‚ˆ]™\ÝHšY[Ë˜ÛÝ[ˆHÈšY[ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHˆˆ‚‚ˆÝÚ]ÚXÝ[ÛˆÂˆØ\ÙHˆŽ‚ˆ]˜[YHHÙ\ÜÚ[Û‹œ›Ùš[KœÞ\Ý[T›Û\ÏÈš[›[™H‚ˆ]ØZ]\›Z[˜[›[™J”Þ\Ý[H›Û\›ÜˆYÙ[	×
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+IÎˆ
+˜[YJHŠBˆ]ØZ]\›Z[˜[›[™JˆÙ\ÜÚ[Û‹œ›Ùš[Kš[œÝXÝ[ÛœËš\Ñ[\HÈŠ[\JHˆˆÙ\ÜÚ[Û‹œ›Ùš[Kš[œÝXÝ[ÛœÊB‚ˆØ\ÙH›\Ý‹›ÈŽ‚ˆ]ØZ]ÚÝÔ›Û\ÊˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ÚÚ[ÎˆÚÚ[Ë\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHœÚÝÈ‹˜Ø]Ž‚ˆ]™\]Y\ÝYH™\Ýš\Ñ[\HÈÙ\ÜÚ[Û‹œ›Ùš[KœÞ\Ý[T›Û\ÏÈˆˆˆ™\ÝˆÝX\™]˜[YHH™\ÛÛ™YÞ\Ý[T›Û\˜[YJ™\]Y\ÝYÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛŠKˆ]^HÛÛ™šYÝ\˜][ÛËœ›Û\ÏËœÞ\Ý[VÛ˜[YWBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆÞ\Ý[H›Û\	×
+™\]Y\ÝY
+IËˆÜ›Û\È\ÝÈ[KˆŠBˆ™]\›‚ˆBˆ]\Ù\œÈHÛÛ™šYÝ\˜][ÛË˜YÙ[Õ\Ú[™ÔÞ\Ý[T›Û\
+˜[YJHÏÈ×Bˆ]ØZ]\›Z[˜[›[™Jˆ”Þ\Ý[H›Û\	×
+˜[YJIÈ8 %
+\Ù\œËš\Ñ[\HÈ[\ÙYˆˆ˜YÙ[Îˆ
+\Ù\œËš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJHŠH‚ˆ
+Bˆ]ØZ]\›Z[˜[›[™J^š\Ñ[\HÈŠ[\JHˆˆ^
+B‚ˆØ\ÙH˜Y‹œÙ]‹›™]È‹˜Ü™X]HŽ‚ˆ]\ÈH™\ÝœÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+Ýš[™Ëš[š]
+BˆÝX\™\Ë˜ÛÝ[OHˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜ›Û\
+XÝ[ÛŠHSQHVŠBˆ™]\›‚ˆBˆ]ØZ]ÝÜ™TÞ\Ý[T›Û\
+ˆ˜[YYˆ\ÖÌKˆ^ˆ\ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙH™Y]Ž‚ˆ]ØZ]Y]Þ\Ý[T›Û\
+ˆ˜[YYˆ™\Ýš\Ñ[\HÈÙ\ÜÚ[Û‹œ›Ùš[KœÞ\Ý[T›Û\ÏÈÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Qˆ™\ÝˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHœ™[[Ý™H‹œ›H‹™[]H‹™[Ž‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜ›Û\›HSQHŠBˆ™]\›‚ˆBˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆÝX\™]˜[YHH™\ÛÛ™YÞ\Ý[T›Û\˜[YJ™\ÝÛÛ™šYÝ\˜][ÛŽˆ˜Y
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆÞ\Ý[H›Û\	×
+™\Ý
+IËˆÜ›Û\È\ÝÈ[KˆŠBˆ™]\›‚ˆBˆ]\Ù\œÈH˜Y˜YÙ[Õ\Ú[™ÔÞ\Ý[T›Û\
+˜[YJBˆÝX\™\Ù\œËš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ”Þ\Ý[H›Û\	×
+˜[YJIÈ\È\ÙYžH
+\Ù\œËš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJKˆÚ[[H[Ù]Ú\™Hš\œÝˆØYÙ[›Û\QÕT‹ˆ‚ˆ
+Bˆ™]\›‚ˆBˆ˜Yœ™[[Ý™TÞ\Ý[T›Û\
+˜[YJBˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ØZ]\›Z[˜[›[™J”™[[Ý™YÞ\Ý[H›Û\	×
+˜[YJIËˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆB‚ˆØ\ÙH\ÙH‹œÙ[XÝŽ‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜ›Û\\ÙHSQHŠBˆ™]\›‚ˆBˆ]ØZ]Ù[XÝÞ\Ý[T›Û\
+ˆ™\ÝˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHš[Ž‚ˆ]ØZ]\›Z[˜[›[™J›Û\[
+B‚ˆY˜][‚ˆËÈÜ›Û\SQXÙY\ÈÙ[XÝ[™ÈH›Û\›ÜˆHÝ\œ™[YÙ[‚ˆ]ØZ]Ù[XÝÞ\Ý[T›Û\
+ˆ\™Ý[Y[š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆBˆB‚ˆËËÈÚ[ÈHÝ\œ™[YÙ[]H˜[YY›Û\[™Ø]™\ÈH\ÜÛØÚX][Û‹‚ˆš]˜]HÝ]XÈ[˜ÈÙ[XÝÞ\Ý[T›Û\
+ˆÈ™\]Y\ÝYˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™ˆ]˜[YHH™\ÛÛ™YÞ\Ý[T›Û\˜[YJ™\]Y\ÝYÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛŠKˆ][œÝXÝ[ÛœÈHÛÛ™šYÝ\˜][ÛËœ›Û\ÏËœÞ\Ý[VÛ˜[YWBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ•[šÛ›ÝÛˆÞ\Ý[H›Û\	×
+™\]Y\ÝY
+IËˆÜ›Û\È\ÝÈ[NÈÜ›Û\YSQHVÜ™X]\ÈÛ™Kˆ‚ˆ
+Bˆ™]\›‚ˆBˆ]™]š[Ý\ÈHÙ\ÜÚ[Û‹œ›Ùš[Kš[œÝXÝ[ÛœÂˆÈÂˆžH\TÞ\Ý[R[œÝXÝ[ÛœÊ[œÝXÝ[ÛœË™\XÚ[™Îˆ™]š[Ý\ËÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[ÛŠBˆÙ\ÜÚ[Û‹œ›Ùš[KœÞ\Ý[T›Û\H˜[YBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆYˆ]ØZ]\œÚ\ÝYÙ[›Ùš[JˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ[[YNˆ[[YKˆ\›Z[˜[ˆ\›Z[˜[
+BˆÂˆ]ØZ]\›Z[˜[›[™JˆYÙ[	×
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+IÈ›ÝÈ\Ù\ÈÞ\Ý[H›Û\	×
+˜[YJIËˆŠBˆBˆB‚ˆËËÈÜš]\ÈÛ™H˜[YYÞ\Ý[H›Û\[™™Yœ™\Ú\È]™\žHYÙ[]\Ù\È]ˆËËÈ[ˆHš[K[ˆH]™H[[YK[™[ˆ\ÈÚ]Ú[ˆ]\ÈÛ™HÙ‚ˆËËÈ[Kˆ[œÝÙ\œÈ˜[ÙK]š[™ÈØZYÚKÚ[ˆ›Ý[™ÈØ\ÈØ]™Y‚ˆ\ØØ\™X›T™\Ý[ˆš]˜]HÝ]XÈ[˜ÈÝÜ™TÞ\Ý[T›Û\
+ˆ˜[YY˜[YNˆÝš[™Ëˆ^ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈOˆ›ÛÛÂˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›ˆ˜[ÙBˆBˆÝX\™[˜[YKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™JHÞ\Ý[H›Û\™YYÈH˜[YKˆŠBˆ™]\›ˆ˜[ÙBˆBˆ]Ü™X]YH˜Yœ›Û\ÏËœÞ\Ý[VÛ˜[YWHOHš[ˆ]™Yœ™\ÚYH˜YœÙ]Þ\Ý[T›Û\
+˜[YK^ˆ^
+BˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ›ÜˆYÙ[[ˆ˜Y˜YÙ[ÈÚ\™H™Yœ™\ÚY˜ÛÛZ[œÊYÙ[šY
+HÂˆžH]ØZ][[YKœ™YÚ\Ý\ŠYÙ[ˆYÙ[™\XÚ[™Ñ^\Ý[™ÎˆYJBˆBˆYˆÙ\ÜÚ[Û‹œ›Ùš[KœÞ\Ý[T›Û\OH˜[YHÂˆžH\TÞ\Ý[R[œÝXÝ[ÛœÊˆ^™\XÚ[™ÎˆÙ\ÜÚ[Û‹œ›Ùš[Kš[œÝXÝ[ÛœËÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[ÛŠBˆBˆ]\ØYÙHBˆ™Yœ™\ÚYš\Ñ[\BˆÈ››ÈYÙ[\Ù\È]Y]ÈØYÙ[›Û\Q
+˜[YJHÜˆØYÙ[YXÚÜÈ]‚ˆˆ\ÙYžH
+™Yœ™\ÚYš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJH‚ˆ]ØZ]\›Z[˜[›[™J—
+Ü™X]YÈÜ™X]Yˆˆ”Ø]™YŠHÞ\Ý[H›Û\	×
+˜[YJIÈ
+
+\ØYÙJJKˆŠBˆ™]\›ˆYBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›ˆ˜[ÙBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È\TÞ\Ý[R[œÝXÝ[ÛœÊˆÈ[œÝXÝ[ÛœÎˆÝš[™Ëˆ™\XÚ[™È™]š[Ý\ÎˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‚ˆ
+H›ÝÜÈÂˆÙ\ÜÚ[Û‹œ›Ùš[Kš[œÝXÝ[ÛœÈH[œÝXÝ[ÛœÂˆYˆ][™^HÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\Ë™š\œÝ[™^
+Ú\™NˆÂˆ	œ›ÛHOHœÞ\Ý[H	‰ˆ	^OH™]š[Ý\ÂˆJHÂˆYˆ[œÝXÝ[ÛœËš\Ñ[\HÂˆÈHžHÙ\ÜÚ[Û‹š\ÝÜžKœ™[[Ý™SY\ÜØYÙJ]ˆ[™^
+BˆH[ÙHÂˆžHÙ\ÜÚ[Û‹š\ÝÜžK™Y]Y\ÜØYÙJ]ˆ[™^^ˆ[œÝXÝ[ÛœÊBˆBˆH[ÙHYˆZ[œÝXÝ[ÛœËš\Ñ[\HÂˆÙ\ÜÚ[Û‹š\ÝÜžKœ™\XÙP[
+Ú]ˆËœÞ\Ý[J[œÝXÝ[ÛœÊWH
+ÈÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\ÊBˆBˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆB‚ˆš]˜]HÝ]XÈ[˜ÈY]Þ\Ý[T›Û\
+ˆ˜[YY™\]Y\ÝYˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™ÛÛ™šYÝ\˜][ÛˆOHš[ÛÛ™šYÝ\˜][Û”]OHš[[ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ]š[[YYH™\]Y\ÝYš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™]š[[YYš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜ›Û\Y]ÓSQWHŠBˆ™]\›‚ˆBˆ]˜[YHH™\ÛÛ™YÞ\Ý[T›Û\˜[YJš[[YYÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛŠHÏÈš[[YYˆ]™]š[Ý\ÈHÛÛ™šYÝ\˜][ÛËœ›Û\ÏËœÞ\Ý[VÛ˜[YWHÏÈˆ‚ˆÝX\™ˆ]Y]YH]ØZ]Y][\Ü˜\žU^
+ˆ™]š[Ý\ËÝY™š^ˆœÞ\Ý[K\›Û\›Y‹\›Z[˜[ˆ\›Z[˜[
+Bˆ[ÙHÈ™]\›ˆBˆ]ØZ]ÝÜ™TÞ\Ý[T›Û\
+ˆ˜[YYˆ˜[YKˆ^ˆY]Yš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆB‚ˆš]˜]HÝ]XÈ[˜ÈÚ[ÛÜ™ÊÈ[œ]ˆÝš[™ÊH›ÝÜÈOˆÔÝš[™×HÂˆ[[H][ÝHÈØ\ÙHÚ[™ÛKÝX›HBˆ˜\ˆÛÜ™ÎˆÔÝš[™×HH×Bˆ˜\ˆÛÜ™Hˆ‚ˆ˜\ˆ][ÝNˆ][ÝOÂˆ˜\ˆ\ØØ\YH˜[ÙBˆ˜\ˆÝ\YH˜[ÙBˆ›ÜˆÚ\˜XÝ\ˆ[ˆ[œ]ÂˆYˆ\ØØ\YÂˆÛÜ™˜\[™
+Ú\˜XÝ\ŠBˆ\ØØ\YH˜[ÙBˆÝ\YHYBˆÛÛ[YBˆBˆYˆÚ\˜XÝ\ˆOH—‹][ÝHOHœÚ[™ÛHÂˆ\ØØ\YHYBˆÝ\YHYBˆÛÛ[YBˆBˆYˆÚ\˜XÝ\ˆOH‰È‹][ÝHOH™ÝX›HÂˆ][ÝHH][ÝHOHœÚ[™ÛHÈš[ˆœÚ[™ÛBˆÝ\YHYBˆÛÛ[YBˆBˆYˆÚ\˜XÝ\ˆOH—ˆ‹][ÝHOHœÚ[™ÛHÂˆ][ÝHH][ÝHOH™ÝX›HÈš[ˆ™ÝX›BˆÝ\YHYBˆÛÛ[YBˆBˆYˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙK][ÝHOHš[ÂˆYˆÝ\YÂˆÛÜ™Ë˜\[™
+ÛÜ™
+BˆÛÜ™Hˆ‚ˆÝ\YH˜[ÙBˆBˆÛÛ[YBˆBˆÛÜ™˜\[™
+Ú\˜XÝ\ŠBˆÝ\YHYBˆBˆÝX\™][ÝHOHš[[ÙHÈ›ÝÈPÔÛÛ[X[™\œ›Ü‹[\›Z[˜]Y][ÝHBˆÝX\™Y\ØØ\Y[ÙHÈ›ÝÈPÔÛÛ[X[™\œ›Ü‹™[™Û[™Ñ\ØØ\HBˆYˆÝ\YÈÛÜ™Ë˜\[™
+ÛÜ™
+HBˆ™]\›ˆÛÜ™ÂˆB‚ˆËËÈÜ[œÈH^˜[YHœ›ÛHHXÝ]™H‘TÙ\ÜÚ[Ûˆ[ˆH\Ù\‰ÜÈ\›Z[˜[ˆËËÈY]Ü‹ˆ˜[œØÜš\[™ÛÛ™šYÝ\˜][ÛˆY]È[X™\˜][HÛÈ›ÝYÚBˆËËÈØ[YHÛÜ™H\\È\ÙYžHHSÔÈ\[™H\œÚ\Ý[Ú]ÛÜšÜÜXÙK‚ˆš]˜]HÝ]XÈ[˜È[™QY]ÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆY[[ÜžNˆY[[ÜžTÝ]KˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ›ÝšY\˜\ÙUT“Îˆ›ÝšY\˜\ÙUT“ÝÜ™Kˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]\™Ù]H\™Ý[Y[š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™]\™Ù]š\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™JY][
+Bˆ™]\›‚ˆBˆ]šY[ÈH\™Ù]œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+Bˆ]XÝ[ÛˆHšY[ÖÌK›ÝÙ\˜Ø\ÙY
+
+Bˆ]XÝ[Û\™Ý[Y[HšY[Ë˜ÛÝ[OHˆÈšY[ÖÌWHˆˆ‚‚ˆÝÚ]ÚXÝ[ÛˆÂˆØ\ÙHœÞ\Ý[HŽ‚ˆ]ØZ]Y]Þ\Ý[T›Û\
+ˆ˜[YYˆXÝ[Û\™Ý[Y[š\Ñ[\BˆÈÙ\ÜÚ[Û‹œ›Ùš[KœÞ\Ý[T›Û\ÏÈÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[QˆXÝ[Û\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙH\Ù\ˆ‹\Ù\œ›Û\Ž‚ˆÝX\™XXÝ[Û\™Ý[Y[š\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÙY]\Ù\ˆSQHŠBˆ™]\›‚ˆBˆ]ØZ]Y]\Ù\”›Û\
+ˆ˜[YYˆXÝ[Û\™Ý[Y[ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHœ›Û\Ž‚ˆËÈÚ]Ý]H˜[YKHÝ\œ™[YÙ[	ÜÈÞ\Ý[H›Û\ˆÚ]Û™KBˆËÈ›Û\Ùˆ]˜[YKÚXÚ]™\ˆÚ[™]\ÎÈHÞ\Ý[H›Û\[™BˆËÈ\Ù\ˆ›Û\\™HY™™\™[[™ÜËÛÈH™]ÈÛ™H\ÈÜ™X]YÚ]ˆËÈÙY]Þ\Ý[HSQHÜˆÙY]\Ù\ˆSQK‚ˆÝX\™XXÝ[Û\™Ý[Y[š\Ñ[\H[ÙHÂˆ]ØZ]Y]Þ\Ý[T›Û\
+ˆ˜[YYˆÙ\ÜÚ[Û‹œ›Ùš[KœÞ\Ý[T›Û\ÏÈÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[QˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆ]Ø[YH›Û\Û\ÚÛÛ[X[™››Ü›X[^™Y
+XÝ[Û\™Ý[Y[
+BˆYˆ]˜[YHH™\ÛÛ™YÞ\Ý[T›Û\˜[YJXÝ[Û\™Ý[Y[ÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛŠHÂˆ]ØZ]Y]Þ\Ý[T›Û\
+ˆ˜[YYˆ˜[YKˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆH[ÙHYˆ]˜[YHHÛÛ™šYÝ\˜][ÛË\Ù\”›Û\˜[YJX]Ú[™ÎˆXÝ[Û\™Ý[Y[
+HÂˆ]ØZ]Y]\Ù\”›Û\
+ˆ˜[YYˆ˜[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆH[ÙHYˆ\Ù\”›Û\˜Z[[œË˜ÛÛZ[œÊÚ\™NˆÂˆ›Û\Û\ÚÛÛ[X[™››Ü›X[^™Y
+	˜ÛÛ[X[™˜[YJHOHØ[YˆJHÂˆ]ØZ]Y]\Ù\”›Û\
+ˆ˜[YYˆXÝ[Û\™Ý[Y[ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ“›È›Û\˜[YY	×
+XÝ[Û\™Ý[Y[
+IËˆÙY]Þ\Ý[HSQHÜ™X]\ÈHÞ\Ý[H›Û\ÙY]\Ù\ˆSQHH\Ù\ˆ›Û\ÈÜ›Û\È\ÝÈ›Ýˆ‚ˆ
+BˆB‚ˆØ\ÙH˜YÙ[Ž‚ˆ]ØZ]Y]YÙ[Yš[š][ÛŠˆ˜[YYˆXÝ[Û\™Ý[Y[š\Ñ[\HÈÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[QˆXÝ[Û\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHœ›ÝšY\ˆŽ‚ˆ]ØZ]Y]ÛÛ™šYÝ\™Y›ÝšY\Šˆ˜[YYˆXÝ[Û\™Ý[Y[š\Ñ[\HÈÙ\ÜÚ[Û‹œ›Ùš[Kœ›ÝšY\‹œ˜]Õ˜[YHˆXÝ[Û\™Ý[Y[ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ›ÝšY\˜\ÙUT“Îˆ›ÝšY\˜\ÙUT“Ëˆ\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙHš[œ]Ž‚ˆËÈHÚ]›Û\[\˜Ù\È\ÈÛ™K™XØ]\ÙHHY\ÜØYÙH]Üš]\È\ÂˆËÈÙ[œ›ÛH\™NÈ\™H]Ø[ˆÛ›HØ^HÚ\™H]ÛÜšÜË‚ˆ]ØZ]\›Z[˜[›[™Jˆ•\ÙHÙY][œ]]HÚ]›Û\È]Ü[œÈ[ˆ[\Hš[H[™Ù[™ÈÚ][ÝHÜš]H[ˆ]ˆ‚ˆ
+B‚ˆØ\ÙH˜ÛÛ\XÝŽ‚ˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ]™]š[Ý\ÈH˜Yœ›Û\ÏË˜ÛÛ\XÝÏÈY˜][ÛÛ\XÝ›Û\ˆÝX\™ˆ]Y]YH]ØZ]Y][\Ü˜\žU^
+ˆ™]š[Ý\ËÝY™š^ˆ˜ÛÛ\XÝ\›Û\›Y‹\›Z[˜[ˆ\›Z[˜[
+Bˆ[ÙHÈ™]\›ˆBˆ]Ø[™Y]HHY]Yš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™Ø[™Y]Kš\Ñ[\HØ[™Y]K˜ÛÛZ[œÊžÞÝ˜[œØÜš\_HŠH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ™\œ›ÜŽˆHÛÛ\XÝ›Û\]\ÝÛÛZ[ˆÞÝ˜[œØÜš\_NÈ›ÈÚ[™Ù\ÈÙ\™HØ]™Yˆ‹ˆÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ]Ý\ÝÛT›Û\BˆØ[™Y]Kš\Ñ[\HØ[™Y]HOHY˜][ÛÛ\XÝ›Û\Èš[ˆØ[™Y]Bˆ˜\ˆ›Û\ÈH˜Yœ›Û\ÈÏÈÛÛ™šYÝ\™Y›Û\Ê
+Bˆ›Û\Ë˜ÛÛ\XÝHÝ\ÝÛT›Û\ˆ˜Yœ›Û\ÈH›Û\ÂˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆ]ØZ][[YK˜ÛÛ™šYÝ\™PÛÛ\XÝ[ÛŠ›Û\ˆÝ\ÝÛT›Û\
+BˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ØZ]\›Z[˜[›[™JˆÝ\ÝÛT›Û\OHš[ˆÈÛÛ\XÝ›Û\™\ÝÜ™YÈHZ[Z[ˆY˜][ˆ‚ˆˆÛÛ\XÝ›Û\Ø]™YÈ
+ÛÛ™šYÝ\˜][Û”]
+KˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆB‚ˆØ\ÙH›Y[[ÜžHŽ‚ˆÝX\™ˆ]Y]YH]ØZ]Y][\Ü˜\žU^
+ˆY[[ÜžK˜Ý\œ™[^ÝY™š^ˆ›Y[[ÜžK›Y‹\›Z[˜[ˆ\›Z[˜[
+Bˆ[ÙHÈ™]\›ˆBˆ]ØZ]ÝÜ™JYÙ[Y[[ÜžJ^ˆY]Y
+K[ŽˆY[[ÜžK[[YNˆ[[YK\›Z[˜[ˆ\›Z[˜[
+B‚ˆØ\ÙH›Y[[ÜžK\›Û\‹›X\›ˆŽ‚ˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ˜\ˆ›Û\ÈH˜Yœ›Û\ÈÏÈÛÛ™šYÝ\™Y›Û\Ê
+BˆÝX\™ˆ]Y]YH]ØZ]Y][\Ü˜\žU^
+ˆ›Û\Ë›Y[[ÜžHÏÈYÙ[Y[[ÜžT›Û\[\]KˆÝY™š^ˆ›Y[[ÜžK\›Û\›Y‹ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ[ÙHÈ™]\›ˆBˆ]Ø[™Y]HHY]Yš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆYˆ]Z\ÜÚ[™ÈHYÙ[Y[[ÜžT›Û\›Z\ÜÚ[™ÔXÙZÛ\Š[ŽˆØ[™Y]JHÂˆ]ØZ]\›Z[˜[›[™Jˆ™\œ›ÜŽˆHY[[ÜžH›Û\]\ÝÛÛZ[ˆ
+Z\ÜÚ[™ÊNÈ›ÈÚ[™Ù\ÈÙ\™HØ]™Yˆ‹ˆÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ›Û\Ë›Y[[ÜžHBˆØ[™Y]Kš\Ñ[\HØ[™Y]HOHYÙ[Y[[ÜžT›Û\[\]HÈš[ˆØ[™Y]Bˆ˜Yœ›Û\ÈH›Û\ÂˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ØZ]\›Z[˜[›[™Jˆ›Û\Ë›Y[[ÜžHOHš[ˆÈ•HY[[ÜžH›Û\Ø\È™\ÝÜ™YÈHZ[Z[ˆY˜][ˆ‚ˆˆ•HY[[ÜžH›Û\Ø\ÈØ]™YÈ
+ÛÛ™šYÝ\˜][Û”]
+KˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆB‚ˆØ\ÙH™[YØ][Ûˆ‹ÛÜšÙ\ˆŽ‚ˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ˜\ˆ›Û\ÈH˜Yœ›Û\ÈÏÈÛÛ™šYÝ\™Y›Û\Ê
+Bˆ]\ÐœšYYˆHXÝ[ÛˆOH™[YØ][Ûˆ‚ˆ]Z[[ˆBˆ\ÐœšYYˆÈYÙ[[YØ][Û”›Û\[\]HˆYÙ[[YØ][Û”›Û\ÛÜšÙ\’[œÝXÝ[ÛœÂˆ]™]š[Ý\ÈH
+\ÐœšYYˆÈ›Û\Ë™[YØ][Ûˆˆ›Û\ËÛÜšõï»¶‰žËkºwµçP˜\ÙUT“ÎˆÔÝš[™ÎˆT“Kˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]Yš[š][ÛˆBˆÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[QOHYˆÈÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Yš[š][ÛˆˆÛÛ™šYÝ\˜][ÛË˜YÙ[Ë™š\œÝ
+Ú\™NˆÈ	šYOHYJBˆÝX\™]Yš[š][Ûˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆYÙ[	×
+Y
+IËˆ\ÙHØYÙ[ËˆŠBˆ™]\›‚ˆBˆ]˜\ÙUT“Bˆ›ÝšY\˜\ÙUT“ÖÙYš[š][Û‹œ›ÝšY\‹œ˜]Õ˜[YWBˆÏÈÛÛ™šYÝ\˜][ÛËœ›ÝšY\œË™š\œÝÈ	šYOHYš[š][Û‹œ›ÝšY\‹œ˜]Õ˜[YHOË˜˜\ÙUT“ˆ]Ü›Ý\ÈHYš[š][Û‹ÛÛÜ›Ý\˜[Y\ËœÛÜY
+
+Bˆ]ÝX˜YÙ[ÈHYš[š][Û‹œÝX˜YÙ[˜[Y\ËœÛÜY
+
+Bˆ]\šÙYHYš[š][Û‹š\Ñ[˜X›YÈˆˆˆˆÙ\ØX›YH‚ˆ]ØZ]\›Z[˜[›[™JYÙ[ˆ
+Yš[š][Û‹šY
+H
+
+Yš[š][Û‹™\Ü^S˜[YJJW
+\šÙY
+HŠBˆYˆYYš[š][Û‹™\ØÜš\[Û‹š\Ñ[\HÂˆ]ØZ]\›Z[˜[›[™J‘\ØÜš\[ÛŽˆ
+Yš[š][Û‹™\ØÜš\[ÛŠHŠBˆBˆ]ØZ]\›Z[˜[›[™J”›ÝšY\Žˆ
+Yš[š][Û‹œ›ÝšY\ŠHŠBˆ]ØZ]\›Z[˜[›[™J˜\ÙHT“ˆ
+˜\ÙUT“Ë˜XœÛÛ]TÝš[™ÈÏÈ‹HŠHŠBˆ]ØZ]\›Z[˜[›[™J“[Ù[ˆ
+Yš[š][Û‹›[Ù[š\Ñ[\HÈ‹HˆˆYš[š][Û‹›[Ù[
+HŠBˆ]ØZ]\›Z[˜[›[™Jˆ•ÛÛÜ›Ý\Îˆ
+Ü›Ý\Ëš\Ñ[\HÈ‹HˆˆÜ›Ý\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJH
+
+Yš[š][Û‹ÛÛ˜[Y\Ë˜ÛÝ[
+HÛÛÊH‚ˆ
+Bˆ]ØZ]\›Z[˜[›[™J”ÝX˜YÙ[Îˆ
+ÝX˜YÙ[Ëš\Ñ[\HÈ‹HˆˆÝX˜YÙ[Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJHŠBˆ]ØZ]\›Z[˜[›[™Jˆ‘[YØ][ÛŽˆ
+Yš[š][Û‹ÛÛ[YØ][Û‹œ˜]Õ˜[YJH0­È[Z]È
+Yš[š][Û‹›[Z]Ë›X^[Ù[\›œÊH\›œË
+Yš[š][Û‹›[Z]Ë›X^ÛÛØ[ÊHÛÛË
+Yš[š][Û‹›[Z]Ë›X^ÝX˜YÙ[ÊHÝX˜YÙ[È‚ˆ
+Bˆ]ØZ]\›Z[˜[›[™J•ÛÛØ[[™Îˆ
+Yš[š][Û‹ÛÛØ[[™ÔÝ˜]YÞKœ˜]Õ˜[YJHŠBˆ]ØZ]\›Z[˜[›[™J”Þ\Ý[H›Û\ˆ
+Yš[š][Û‹œÞ\Ý[T›Û\ÏÈš[›[™HŠHŠBˆ]ØZ]\›Z[˜[›[™Jˆ’[œÝXÝ[ÛœÎˆ
+Yš[š][Û‹š[œÝXÝ[ÛœËš\Ñ[\HÈ‹HˆˆYš[š][Û‹š[œÝXÝ[ÛœÊHŠBˆB‚ˆ\ØØ\™X›T™\Ý[ˆš]˜]HÝ]XÈ[˜È\œÚ\ÝYÙ[›Ùš[JˆÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ[[YNˆYÙ[[[YKˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈOˆ›ÛÛÂˆ]ØZ]\œÚ\ÝYÙ[Yš[š][ÛŠˆÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Yš[š][Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ[[YNˆ[[YKˆ\›Z[˜[ˆ\›Z[˜[
+BˆB‚ˆËËÈÜš]\ÈÛ™HYš[š][ÛˆÈHÛÛ™šYÝ\˜][Ûˆ[™H]™H[[YK[Û™ÂˆËËÈÚ]]™\žHYÙ[Ú\š[™È]È˜[YY›Û\ˆ[œÝÙ\œÈ˜[ÙK]š[™ÈØZYˆËËÈÚKÚ[ˆ›Ý[™ÈÛÝ[™HØ]™Y‚ˆ\ØØ\™X›T™\Ý[ˆš]˜]HÝ]XÈ[˜È\œÚ\ÝYÙ[Yš[š][ÛŠˆÈYš[š][ÛŽˆYÙ[Yš[š][Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ[[YNˆYÙ[[[YKˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈOˆ›ÛÛÂˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›ˆ˜[ÙBˆBˆ]Ú[™ÙYH˜Y\Ù\YÙ[
+Yš[š][ÛŠBˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆ›ÜˆYÙ[[ˆ˜Y˜YÙ[ÈÚ\™HÚ[™ÙY˜ÛÛZ[œÊYÙ[šY
+HÂˆžH]ØZ][[YKœ™YÚ\Ý\ŠYÙ[ˆYÙ[™\XÚ[™Ñ^\Ý[™ÎˆYJBˆBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ™]\›ˆYBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›ˆ˜[ÙBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È\RÙ^Q[š\›Û›Y[˜[YJ›Üˆ›ÝšY\’QˆÝš[™ÊHOˆÝš[™ÈÂˆYˆ›ÝšY\’Q›ÝÙ\˜Ø\ÙY
+
+HOH›Ü[˜ZHˆÈ™]\›ˆ“ÔSRWÐTWÒÑVHˆBˆ]Ý[HH›ÝšY\’Q\\˜Ø\ÙY
+
+K›X\ÈÚ\˜XÝ\ˆ[‚ˆÚ\˜XÝ\‹š\Ó]\ˆÚ\˜XÝ\‹š\Ó[X™\ˆÈÚ\˜XÝ\ˆˆ—È‚ˆBˆ™]\›ˆÝš[™ÊÝ[JH
+È—ÐTWÒÑVH‚ˆB‚ˆš]˜]HÝ]XÈ[˜È[™UÛÛÐÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]šY[ÈH\™Ý[Y[œÜ]
+X^Ü]ÎˆËÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+Bˆ]XÝ[ÛˆHšY[Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+HÏÈ›\Ý‚ˆ]Ü›Ý\ÎˆÕÛÛÜ›Ý\Yš[š][Û—BˆÈÂˆÜ›Ý\ÈHžH]ØZ]ÛÛÜ›Ý\Ø][ÙÊˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆB‚ˆYˆXÝ[ÛˆOH›\ÝˆšY[Ëš\Ñ[\HÂˆYˆÙ\ÜÚ[Û‹œ›Ùš[K\ÙUÛÛ›ÞHÂˆ]ØZ]\›Z[˜[›[™Jˆ•ÛÛ›ÞH
+ÛÛ›ÞTÙ][™ÊÙ\ÜÚ[Û‹œ›Ùš[JJNˆ[Ù[ÈÙYH
+Ù\ÜÚ[Û‹œ›Ùš[Kœ›ÞQ^ÜÙYÛÛÏËš\Ñ[\HOHYHÈ›Û›HˆˆHÛÛ[[ÛˆÛÛÈ\ÈŠH\Ý]ÛÛÈ[™Ø[]ÛÛˆ‚ˆ
+BˆBˆ›ÜˆÜ›Ý\[ˆÜ›Ý\ÈÂˆ][˜X›YH\ÕÛÛÜ›Ý\[˜X›Y
+Ü›Ý\›Ùš[NˆÙ\ÜÚ[Û‹œ›Ùš[JHÈŠˆˆˆˆ‚ˆ]ØZ]\›Z[˜[›[™Jˆ—
+[˜X›Y
+H
+Ü›Ý\šY
+H8 %
+Ü›Ý\™\Ü^S˜[YJH×
+Ü›Ý\ÛÛ˜[Y\Ë˜ÛÝ[
+HÛÛ
+Ü›Ý\ÛÛ˜[Y\Ë˜ÛÝ[OHHÈˆˆˆœÈŠWH‚ˆ
+BˆBˆ]ØZ]\›Z[˜[›[™Jˆ•\ÙHÝÛÛÈÚÝÈÔ“ÕTÈÙYHÚ]HÜ›Ý\\È›Ü‹XXÚÛÛÚ]]È\˜[Y]\œË[™]ÈÙ][™ÜËˆ‚ˆ
+Bˆ™]\›‚ˆB‚ˆÝX\™šY[Ë˜ÛÝ[H‹]Ü›Ý\H™\ÛÛ™UÛÛÜ›Ý\
+šY[ÖÌWK[ŽˆÜ›Ý\ÊH[ÙHÂˆ]ØZ]\›Z[˜[›[™JÛÛ[
+Bˆ™]\›‚ˆBˆÝÚ]ÚXÝ[ÛˆÂˆØ\ÙH™[˜X›H‹›ÛˆŽ‚ˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛÜ›Ý\˜[Y\Ëš[œÙ\
+Ü›Ý\šY
+BˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛ˜[Y\Ë™›Ü›U[š[ÛŠÜ›Ý\ÛÛ˜[Y\ÊBˆYˆ]ØZ]\œÚ\ÝYÙ[›Ùš[JˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ[[YNˆ[[YKˆ\›Z[˜[ˆ\›Z[˜[
+BˆÂˆ]ØZ]\›Z[˜[›[™Jˆ‘[˜X›YÛÛÜ›Ý\	×
+Ü›Ý\šY
+IÈ›ÜˆYÙ[
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+KˆŠBˆBˆØ\ÙH™\ØX›H‹›Ù™ˆŽ‚ˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛÜ›Ý\˜[Y\Ëœ™[[Ý™JÜ›Ý\šY
+BˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛ˜[Y\ËœÝX˜XÝ
+Ü›Ý\ÛÛ˜[Y\ÊBˆYˆ]ØZ]\œÚ\ÝYÙ[›Ùš[JˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ[[YNˆ[[YKˆ\›Z[˜[ˆ\›Z[˜[
+BˆÂˆ]ØZ]\›Z[˜[›[™Jˆ‘\ØX›YÛÛÜ›Ý\	×
+Ü›Ý\šY
+IÈ›ÜˆYÙ[
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+KˆŠBˆBˆØ\ÙHœÚÝÈŽ‚ˆ]ÛÝ[HÜ›Ý\ÛÛ˜[Y\Ë˜ÛÝ[ˆ][˜X›YH\ÕÛÛÜ›Ý\[˜X›Y
+Ü›Ý\›Ùš[NˆÙ\ÜÚ[Û‹œ›Ùš[JBˆËÈ˜[Y\È[ˆH›ÛÞX[ˆÙˆXY[™ÜË˜Z]ÈY[ÝË\˜[Y]\ˆ˜[Y\ÂˆËÈÜ™Y[ˆÚ]Z\ˆ\H[KÛÈH^YHØ[ˆ[\œ›ÛHÛÛÈÛÛ[™ˆËÈH\ØÜš\[ÛœÈ™XY\È›ÜÙH[ˆ™]ÙY[‹‚ˆ]ÛÛÜœÈH]ØZ]\›Z[˜[œZ[ÓÝ]]ˆ[˜ÈZ[
+È^ˆÝš[™ËÈÛÙNˆÝš[™ÏÊHOˆÝš[™ÈÂˆÝX\™ÛÛÜœË]ÛÙH[ÙHÈ™]\›ˆ^Bˆ™]\›ˆ—^ÌPŸV×
+ÛÙJ[W
+^
+W^ÌPŸVÌH‚ˆBˆ]ØZ]\›Z[˜[›[™JˆZ[
+Ü›Ý\™\Ü^S˜[YKŒNÌÍˆŠH
+Èˆˆ
+ÈZ[
+Š
+Ü›Ý\˜Ø][ÙÒQ
+JH‹ŒˆŠBˆ
+ÈŽˆ
+ÛÝ[
+HÛÛ
+ÛÝ[OHHÈˆˆˆœÈŠK‚ˆ
+ÈZ[
+[˜X›YÈ™[˜X›Yˆˆ™\ØX›Y‹[˜X›YÈŒÌˆˆˆŒÌHŠBˆ
+Èˆ›ÜˆYÙ[
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+HŠBˆËÈHYÙ[˜[Z[H\ÈÞ[\Ú^™Y\ˆ[ˆ˜]\ˆ[ˆ™YÚ\Ý\™YÛÂˆËÈ]È[ÛÛY\Èœ›ÛHHYš[š][ÛœÈH[Ù[ÛÝ[ÙYK‚ˆ˜\ˆÛÛÈH]ØZ][[YK˜]˜Z[X›UÛÛÊ
+BˆYˆÜ›Ý\šYOHYÙ[[[YK˜YÙ[ÛÛÜ›Ý\šYÂˆÛÛÈ
+ÏHYÙ[›ØÙ\ÜÕÛÛË™Yš[š][ÛœÊˆÙ™™\š[™Îˆ×K[YØ][™ÎˆYK[‘š\œÝˆÛÛ™šYÝ\˜][ÛË\ÙKœ[ˆÏÈYJBˆBˆ][[™\ÈHÛÛÜ›Ý\[›[™\Ê›ÜŽˆÜ›Ý\ÛÛÎˆÛÛÊHÈ^Ý[H[‚ˆÝÚ]ÚÝ[HÂˆØ\ÙH™Ü›Ý\ˆ™]\›ˆZ[
+^ŒÍˆŠBˆØ\ÙHÛÛˆ™]\›ˆZ[
+^ŒNÌÍˆŠBˆØ\ÙH˜Z]ˆ™]\›ˆZ[
+^ŒÌÈŠBˆØ\ÙH™\ØÜš\[Û‹œ\˜[Y]\‘]Z[ˆ™]\›ˆ^ˆØ\ÙHœ\˜[Y]\Žˆ™]\›ˆZ[
+^ŒÌˆŠBˆØ\ÙHœ\˜[Y]\•\K››ÝNˆ™]\›ˆZ[
+^ŒˆŠBˆØ\ÙH›Z\ÜÚ[™Îˆ™]\›ˆZ[
+^ŒÌHŠBˆBˆBˆ›Üˆ[™H[ˆ[[™\ÈÂˆ]ØZ]\›Z[˜[›[™J[™JBˆBˆÝX\™YÜ›Ý\›Ü[ÛœËš\Ñ[\H[ÙHÈ™]\›ˆBˆ]Ü[ÛœÈHÛÛ™šYÝ\™YÜ[ÛœÊ›ÜŽˆÜ›Ý\ÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛŠBˆ]ØZ]\›Z[˜[›[™JˆŠBˆ]ØZ]\›Z[˜[›[™JˆZ[
+”Ù][™ÜÈ‹ŒNÌÍˆŠBˆ
+ÈZ[
+‹Ú[™ÙYÚ]ÝÛÛÈÙ]
+Ü›Ý\šY
+HÔSÓˆSQNˆ‹ŒˆŠJBˆ›ÜˆÜ[Ûˆ[ˆÜ›Ý\›Ü[ÛœÈÂˆ]˜[YHHÜ[ÛœÖÛÜ[Û‹šYHÏÈÜ[Û‹™Y˜][˜[YBˆ˜\ˆ[™HBˆˆˆ
+ÈZ[
+Ü[Û‹šYŒÌˆŠH
+ÈˆH‚ˆ
+ÈZ[
+\Ü^YYÜ[ÛŠ˜[YKÚ[™ˆÜ[Û‹šÚ[™
+KŒHŠBˆ
+Èˆˆ
+ÈZ[
+—
+Ü[Û‹›X™[
+Kˆ‹ŒˆŠBˆYˆ][HÜ[Û‹š[Ëš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKZ[š\Ñ[\HÂˆ[™H
+ÏHˆˆ
+ÈZ[
+[ŒˆŠBˆBˆ]ØZ]\›Z[˜[›[™J[™JBˆBˆØ\ÙHœÙ]‹˜ÛÛ™šYÈŽ‚ˆÝX\™šY[Ë˜ÛÝ[OHˆ]Ü[ÛˆHÜ›Ý\›Ü[ÛœË™š\œÝ
+Ú\™NˆÈ	šYOHšY[ÖÌ—HJKˆ]˜[YHH\œÙUÛÛÜ[ÛŠšY[ÖÌ×KYš[š][ÛŽˆÜ[ÛŠBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÝÛÛÈÙ]Ô“ÕTÔSÓˆSQHŠBˆ™]\›‚ˆBˆ]ØZ]™XÛÛ™šYÝ\™UÛÛÜ›Ý\
+ˆÜ›Ý\ˆÜ[ÛŽˆÜ[Û‹šYˆ˜[YNˆ˜[YKˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH[œÙ]Ž‚ˆÝX\™šY[Ë˜ÛÝ[OHËˆÜ›Ý\›Ü[ÛœË˜ÛÛZ[œÊÚ\™NˆÈ	šYOHšY[ÖÌ—HJBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÝÛÛÈ[œÙ]Ô“ÕTÔSÓˆŠBˆ™]\›‚ˆBˆ]ØZ]™XÛÛ™šYÝ\™UÛÛÜ›Ý\
+ˆÜ›Ý\ˆÜ[ÛŽˆšY[ÖÌ—Kˆ˜[YNˆš[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+BˆY˜][‚ˆ]ØZ]\›Z[˜[›[™JÛÛ[
+BˆBˆB‚ˆËÈPT’ÎˆY™›Ü‚ˆËËÈÜÙ]Y™›ÜÚÝÜÈH™X\ÛÛš[™È]™[[™ÝZY[˜ÙHÙˆHÝ\œ™[ˆËËÈYÙ[ÈÜÙ]Y™›ÜU‘SÕVXÙ]È[H[™ÜÙ]Y™›Ü]]ØÛX\œÂˆËËÈ[KˆH]™[ˆËËÈ™XXÚ\ÈH›ÝšY\ˆ\ÈHšY[]ÈTH˜[Z[HZÙ\È[™Ú]BˆËËÈÝZY[˜ÙKHÞ\Ý[H›Û\È›Ý\œÚ\ÝÛˆHYÙ[ZÙHÜÙ]Ù\Ë‚ˆš]˜]HÝ]XÈ[˜È[™QY™›ÜÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]šY[ÈH\™Ý[Y[œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+BˆÝX\™]š\œÝHšY[Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™JY™›Ü\ØÜš\[ÛŠÙ\ÜÚ[Û‹œ›Ùš[K›Ü[ÛœÊJBˆ™]\›‚ˆBˆ]ÝZY[˜ÙHHšY[Ë˜ÛÝ[ˆHÈšY[ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHˆˆ‚ˆYˆÈ˜]]È‹˜]]ÛX]XÈ‹™Y˜][‹˜ÛX\ˆ—K˜ÛÛZ[œÊš\œÝ
+HÂˆÙ\ÜÚ[Û‹œ›Ùš[K›Ü[ÛœËœ™X\ÛÛš[™ÑY™›ÜHš[ˆÙ\ÜÚ[Û‹œ›Ùš[K›Ü[ÛœËœ™X\ÛÛš[™ÑÝZY[˜ÙHHš[ˆH[ÙHYˆ]Y™›ÜH™X\ÛÛš[™ÑY™›Ü
+˜[YNˆš\œÝ
+HÂˆÙ\ÜÚ[Û‹œ›Ùš[K›Ü[ÛœËœ™X\ÛÛš[™ÑY™›ÜHY™›Üœ˜]Õ˜[YBˆÙ\ÜÚ[Û‹œ›Ùš[K›Ü[ÛœËœ™X\ÛÛš[™ÑÝZY[˜ÙHHÝZY[˜ÙKš\Ñ[\HÈš[ˆÝZY[˜ÙBˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™JY™›Ü[
+Bˆ™]\›‚ˆBˆÙ\ÜÚ[Û‹ÝXÚ
+
+Bˆ]Ý[[X\žHHY™›Ü\ØÜš\[ÛŠÙ\ÜÚ[Û‹œ›Ùš[K›Ü[ÛœÊBˆ][™Ú[HÛÛ™šYÝ\˜][ÛËœ›ÝšY\œË™š\œÝÈ	šYOHÙ\ÜÚ[Û‹œ›Ùš[Kœ›ÝšY\‹œ˜]Õ˜[YHBˆ]Y™›ÜHÙ\ÜÚ[Û‹œ›Ùš[K›Ü[ÛœËœ™X\ÛÛš[™ÑY™›Ü™›]X\
+™X\ÛÛš[™ÑY™›Üš[š]
+˜[YNŠJBˆÏÈ˜]]ÛX]XÂˆYˆ]›ÝHHY™›Ü›[Z]][ÛŠˆ[Ù[ˆÙ\ÜÚ[Û‹œ›Ùš[K›[Ù[ˆ›ÝšY\ŽˆÙ\ÜÚ[Û‹œ›Ùš[Kœ›ÝšY\‹œ˜]Õ˜[YKˆ˜\ÙUT“ˆ[™Ú[Ë˜˜\ÙUT“Ë˜XœÛÛ]TÝš[™ÈÏÈˆŠBˆÂˆ]ØZ]\›Z[˜[›[™J›ÝJBˆBˆÝX\™ÛÛ™šYÝ\˜][ÛˆOHš[ÛÛ™šYÝ\˜][Û”]OHš[[ÙHÂˆ]ØZ]\›Z[˜[›[™J”Ù]
+Ý[[X\žJH›Üˆ\ÈÚ]ˆŠBˆ™]\›‚ˆBˆYˆ]ØZ]\œÚ\ÝYÙ[›Ùš[JˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ[[YNˆ[[YKˆ\›Z[˜[ˆ\›Z[˜[
+BˆÂˆ]ØZ]\›Z[˜[›[™J”Ù]
+Ý[[X\žJH›ÜˆYÙ[	×
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+IËˆŠBˆBˆB‚ˆËËÈY™›ÜHYÚ8 %ÚXÚÈ]™\žHYÙHØ\ÙK˜ÜˆY™›ÜHÙ™˜‚ˆš]˜]HÝ]XÈ[˜ÈY™›Ü\ØÜš\[ÛŠÈÜ[ÛœÎˆÙ[™\˜][Û“Ü[ÛœÊHOˆÝš[™ÈÂˆ]]™[HÜ[ÛœËœ™X\ÛÛš[™ÑY™›ÜËš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHÏÈˆ‚ˆ]ÝZY[˜ÙHHÜ[ÛœËœ™X\ÛÛš[™ÑÝZY[˜ÙOËš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHÏÈˆ‚ˆ˜\ˆ^H™Y™›ÜH
+]™[š\Ñ[\HÈ˜]]Èˆˆ]™[
+H‚ˆYˆYÝZY[˜ÙKš\Ñ[\HÈ^
+ÏHˆ8 %
+ÝZY[˜ÙJHˆBˆ™]\›ˆ^ˆB‚ˆËÈPT’ÎˆÚÚ[Â‚ˆËËÈ™YÚ\Ý\œÈHÚÚ[×Ê˜ÛÛ›Üˆ]™\žHÚÚ[HÝ]HØ[ˆÙYKˆØ[YˆËËÈ]Ý\\™Y›Ü™HYÙ[È\™Hš[\™YYØZ[œÝHÛ›ÝÛˆÛÛ˜[Y\Ë‚ˆš]˜]HÝ]XÈ[˜È™YÚ\Ý\”ÚÚ[ÛÛÊˆ[ˆ[[YNˆYÙ[[[YKˆÝ]NˆÚÚ[Ý]Bˆ
+H\Þ[˜È›ÝÜÈÂˆ›ÜˆÛÛ[ˆXZTÚÚ[ÛÛË›XZÙUÛÛÊØ][ÙÎˆÈÝ]K˜Ø][ÙÈJHÂˆžH]ØZ][[YKœ™YÚ\Ý\ŠÛÛˆÛÛ™\XÚ[™Ñ^\Ý[™ÎˆYJBˆBˆB‚ˆËËÈœš[™ÜÈH[[YIÜÈÚÚ[ÛÛÈ[ˆ[™HÚ]H›Û\œÈÛˆ\ÚÎˆ™]ÂˆËËÈÚÚ[È\™H™YÚ\Ý\™YY]YÛ™\È™KY\ØÜšX™Y™[[Ý™YÛ™\È›ÜY‚ˆ\ØØ\™X›T™\Ý[ˆš]˜]HÝ]XÈ[˜ÈÞ[˜Ú›Ûš^™TÚÚ[ÛÛÊˆ[[YNˆYÙ[[[YKˆÝ]NˆÚÚ[Ý]Bˆ
+H\Þ[˜ÈOˆ
+Ø][ÙÎˆYÙ[ÚÚ[Ø][ÙËYYˆÔÝš[™×K™[[Ý™YˆÔÝš[™×JHÂˆ]Ø][ÙÈHÝ]K˜Ø][ÙÂˆ]Ø[YHØ][ÙË›[Ù[[›ØØX›Bˆ]Ø[Y˜[Y\ÈHÙ]
+Ø[Y›X\
+ÛÛ˜[YJJBˆ]™YÚ\Ý\™YHÙ]
+ˆ]ØZ][[YK˜]˜Z[X›UÛÛÊ
+K›X\
+›˜[YJK™š[\ŠXZTÚÚ[ÛÛËš\ÔÚÚ[ÛÛ
+JBˆ˜\ˆ™[[Ý™YˆÔÝš[™×HH×Bˆ›Üˆ˜[YH[ˆ™YÚ\Ý\™YœÝX˜XÝ[™ÊØ[Y˜[Y\ÊKœÛÜY
+
+HÂˆ]ØZ][[YK[œ™YÚ\Ý\ŠÛÛ˜[YYˆ˜[YJBˆ™[[Ý™Y˜\[™
+˜[YJBˆBˆ˜\ˆYYˆÔÝš[™×HH×Bˆ›ÜˆÚÚ[[ˆØ[YÂˆ]ÛÛHXZTÚÚ[ÛÛË›XZÙUÛÛ
+›ÜŽˆÚÚ[
+HÈÝ]K˜Ø][ÙÈBˆÝX\™
+žOÈ]ØZ][[YKœ™YÚ\Ý\ŠÛÛˆÛÛ™\XÚ[™Ñ^\Ý[™ÎˆYJJHOHš[[ÙHÂˆÛÛ[YBˆBˆYˆ\™YÚ\Ý\™Y˜ÛÛZ[œÊÚÚ[ÛÛ˜[YJHÈYY˜\[™
+ÚÚ[›˜[YJHBˆBˆ™]\›ˆ
+Ø][ÙËYY™[[Ý™Y
+BˆB‚ˆš]˜]HÝ]XÈ[˜È\ÔÚÚ[[˜X›Y
+ÈÚÚ[ˆYÙ[ÚÚ[›Ùš[NˆÙ\ÜÚ[Û”›Ùš[JHOˆ›ÛÛÂˆ›Ùš[KÛÛ˜[Y\Ë˜ÛÛZ[œÊÚÚ[ÛÛ˜[YJBˆ›Ùš[KÛÛÜ›Ý\˜[Y\Ë˜ÛÛZ[œÊXZTÚÚ[ÛÛË™Ü›Ý\Q
+BˆB‚ˆËËÈH˜[YH[™^˜H^ÙˆHÜÚÚ[È›Û\SQHÕVX[™NÈš[›Ü‚ˆËËÈ[žHÝ\ˆÜÚÚ[ÈXÝ[Û‹‚ˆš]˜]HÝ]XÈ[˜ÈÚÚ[›Û\™\]Y\Ý
+È\™Ý[Y[ˆÝš[™ÊBˆOˆ
+˜[YNˆÝš[™Ë\™Ý[Y[ÎˆÝš[™ÊOÂˆÂˆ]YXÙ\ÈH\™Ý[Y[œÜ]
+X^Ü]Îˆ‹Ú\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+BˆÝX\™]XÝ[ÛˆHYXÙ\Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+KÈœ›Û\‹œÙ[™‹\ÙH—K˜ÛÛZ[œÊXÝ[ÛŠBˆ[ÙHÈ™]\›ˆš[Bˆ]˜[YHHYXÙ\Ë˜ÛÝ[ˆHÈYXÙ\ÖÌWHˆˆ‚ˆ]\™Ý[Y[ÈBˆYXÙ\Ë˜ÛÝ[ˆˆÈYXÙ\ÖÌ—Kš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHˆˆ‚ˆ™]\›ˆ
+˜[YK\™Ý[Y[ÊBˆB‚ˆš]˜]HÝ]XÈ[˜È™\ÛÛ™TÚÚ[
+ˆÈÙ[XÝÜŽˆÝš[™Ëˆ[ˆØ][ÙÎˆYÙ[ÚÚ[Ø][ÙËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈOˆYÙ[ÚÚ[ÈÂˆÝX\™\Ù[XÝÜ‹š\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÚÚ[ÈÚÝß[˜X›_\ØX›_›Û\SQH
+ÜÚÚ[È\ÝÈ[JHŠBˆ™]\›ˆš[ˆBˆÝX\™]ÚÚ[HØ][ÙËœÚÚ[
+˜[YYˆÙ[XÝÜŠH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆÚÚ[	×
+Ù[XÝÜŠIËˆÜÚÚ[È\ÝÈ[KˆŠBˆ™]\›ˆš[ˆBˆ™]\›ˆÚÚ[ˆB‚ˆš]˜]HÝ]XÈ[˜È[™TÚÚ[ÐÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆÚÚ[ÎˆÚÚ[Ý]KˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]šY[ÈH\™Ý[Y[œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+Bˆ]XÝ[ÛˆHšY[Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+HÏÈ›\Ý‚ˆ]™\ÝHšY[Ë˜ÛÝ[ˆHÈšY[ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHˆˆ‚ˆ]Þ[˜ÙYH]ØZ]Þ[˜Ú›Ûš^™TÚÚ[ÛÛÊ[[YNˆ[[YKÝ]NˆÚÚ[ÊBˆ]Ø][ÙÈHÞ[˜ÙY˜Ø][ÙÂˆ]YÙ[QHÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q‚ˆÝÚ]ÚXÝ[ÛˆÂˆØ\ÙHˆ‹›\Ý‹›ÈŽ‚ˆÝX\™XØ][ÙËš\Ñ[\H[ÙHÂˆ]XÙ\ÈHÚÚ[Ë™\™XÝÜšY\Ë›X\ÈX˜œ™]šX]Y]
+	œ]ÚYˆŒ
+HBˆ]ØZ]\›Z[˜[›[™Jˆ“›ÈÚÚ[ËˆHÚÚ[\ÈH›Û\ˆÚ]HÒÒS›Y[™\ˆ
+XÙ\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆˆÜˆŠJNÈÚ[ÚÚ[È^Z[œËˆ‚ˆ
+Bˆ™]\›‚ˆBˆ›ÜˆÚÚ[[ˆØ][ÙËœÚÚ[ÈÂˆ]X\šÈBˆÚÚ[š\Ó[Ù[[›ØØX›H	‰ˆ\ÔÚÚ[[˜X›Y
+ÚÚ[›Ùš[NˆÙ\ÜÚ[Û‹œ›Ùš[JHÈŠˆˆˆˆ‚ˆ˜\ˆ›ÝHHÚÚ[œ›ÛÝT“œ]OHÚÚ[Ë\Ù\‘\™XÝÜžKœ]È\Ù\ˆˆˆœ›Ú™XÝ‚ˆYˆ\ÚÚ[š\Ó[Ù[[›ØØX›HÈ›ÝH
+ÏH‹›Û\Û›HˆBˆ]ØZ]\›Z[˜[›[™J—
+X\šÊH
+ÚÚ[›˜[YJH8 %
+ÚÚ[™\ØÜš\[ÛŠH×
+›ÝJWHŠBˆBˆ]ØZ]\›Z[˜[›[™JˆŠˆX\šÜÈHÚÚ[ÈYÙ[
+YÙ[Q
+HX^HØ[ˆÜÚÚ[È[˜X›HSQHÙ™™\œÈÛ™NÈÜÚÚ[È›Û\SQHÕVHÙ[™ÈÛ™H›ÝËˆ‚ˆ
+B‚ˆØ\ÙHœÚÝÈ‹˜Ø]Ž‚ˆÝX\™]ÚÚ[H]ØZ]™\ÛÛ™TÚÚ[
+™\Ý[ŽˆØ][ÙË\›Z[˜[ˆ\›Z[˜[
+H[ÙHÈ™]\›ˆBˆ]Ý]HBˆ\ÚÚ[š\Ó[Ù[[›ØØX›BˆÈ››ÝÙ™™\™YÈH[Ù[‚ˆˆ\ÔÚÚ[[˜X›Y
+ÚÚ[›Ùš[NˆÙ\ÜÚ[Û‹œ›Ùš[JBˆÈ™[˜X›Y›Üˆ
+YÙ[Q
+Hˆˆ™\ØX›Y›Üˆ
+YÙ[Q
+H‚ˆ]ØZ]\›Z[˜[›[™J—
+ÚÚ[›˜[YJNˆ
+ÚÚ[™\ØÜš\[ÛŠHŠBˆ]ØZ]\›Z[˜[›[™J‘š[Nˆ
+ÚÚ[™š[UT“œ]
+HŠBˆ]ØZ]\›Z[˜[›[™J•ÛÛˆ
+ÚÚ[ÛÛ˜[YJH
+
+Ý]JJHŠBˆ]ØZ]\›Z[˜[›[™JˆŠBˆ]ØZ]\›Z[˜[›[™JÚÚ[˜›ÙJB‚ˆØ\ÙH™[˜X›H‹›Ûˆ‹™\ØX›H‹›Ù™ˆŽ‚ˆ][˜X›[™ÈHXÝ[ÛˆOH™[˜X›HˆXÝ[ÛˆOH›Ûˆ‚ˆYˆ™\Ý›ÝÙ\˜Ø\ÙY
+
+HOH˜[ˆÂˆ]˜[Y\ÈHØ][ÙË›[Ù[[›ØØX›K›X\
+ÛÛ˜[YJBˆYˆ[˜X›[™ÈÂˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛÜ›Ý\˜[Y\Ëš[œÙ\
+XZTÚÚ[ÛÛË™Ü›Ý\Q
+BˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛ˜[Y\Ë™›Ü›U[š[ÛŠ˜[Y\ÊBˆH[ÙHÂˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛÜ›Ý\˜[Y\Ëœ™[[Ý™JXZTÚÚ[ÛÛË™Ü›Ý\Q
+BˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛ˜[Y\ÈHÙ\ÜÚ[Û‹œ›Ùš[KÛÛ˜[Y\Ë™š[\ˆÂˆSXZTÚÚ[ÛÛËš\ÔÚÚ[ÛÛ
+	
+BˆBˆBˆÝX\™ˆ]ØZ]\œÚ\ÝYÙ[›Ùš[JˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”][[YNˆ[[YK\›Z[˜[ˆ\›Z[˜[
+Bˆ[ÙHÈ™]\›ˆBˆ]ØZ]\›Z[˜[›[™Jˆ[˜X›[™ÂˆÈ‘[˜X›Y[
+˜[Y\Ë˜ÛÝ[
+HÚÚ[
+˜[Y\Ë˜ÛÝ[OHHÈˆˆˆœÈŠH›ÜˆYÙ[
+YÙ[Q
+NÈÚÚ[ÈYY]\ˆ\™HÙ™™\™YÛËˆ‚ˆˆ‘\ØX›Y]™\žHÚÚ[›ÜˆYÙ[
+YÙ[Q
+NÈÜÚÚ[È›Û\SQHÝ[Ù[™ÈÛ™KˆŠBˆ™]\›‚ˆBˆÝX\™]ÚÚ[H]ØZ]™\ÛÛ™TÚÚ[
+™\Ý[ŽˆØ][ÙË\›Z[˜[ˆ\›Z[˜[
+H[ÙHÈ™]\›ˆBˆÝX\™ÚÚ[š\Ó[Ù[[›ØØX›H[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ”ÚÚ[	×
+ÚÚ[›˜[YJIÈØ^\È\ØX›K[[Ù[Z[›ØØ][Û‹ÛÈH[Ù[™]™\ˆØ[È]ÈÜÚÚ[È›Û\
+ÚÚ[›˜[YJHÙ[™È]ˆ‚ˆ
+Bˆ™]\›‚ˆBˆYˆ[˜X›[™ÈÂˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛ˜[Y\Ëš[œÙ\
+ÚÚ[ÛÛ˜[YJBˆH[ÙHÂˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛ˜[Y\Ëœ™[[Ý™JÚÚ[ÛÛ˜[YJBˆËÈHÜ›Ý\YX[œÈ™]™\žHÚÚ[™\Ù[[™]\™HŽÈÛ™H›ÜYˆËÈÝ]Ùˆ]\ÈÈ™H\ÝYžH˜[YHœ›ÛH›ÝÈÛ‹‚ˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛÜ›Ý\˜[Y\Ëœ™[[Ý™JXZTÚÚ[ÛÛË™Ü›Ý\Q
+BˆBˆÝX\™ˆ]ØZ]\œÚ\ÝYÙ[›Ùš[JˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”][[YNˆ[[YK\›Z[˜[ˆ\›Z[˜[
+Bˆ[ÙHÈ™]\›ˆBˆ]ØZ]\›Z[˜[›[™Jˆ[˜X›[™ÂˆÈ‘[˜X›YÚÚ[	×
+ÚÚ[›˜[YJIÈ›ÜˆYÙ[
+YÙ[Q
+NˆH[Ù[X^HØ[
+ÚÚ[ÛÛ˜[YJKˆ‚ˆˆ‘\ØX›YÚÚ[	×
+ÚÚ[›˜[YJIÈ›ÜˆYÙ[
+YÙ[Q
+NÈÜÚÚ[È›Û\
+ÚÚ[›˜[YJHÝ[Ù[™È]ˆ‚ˆ
+B‚ˆØ\ÙHœ›Û\‹œÙ[™‹\ÙHŽ‚ˆ]ØZ]\›Z[˜[›[™Jˆ•\ÙHÜÚÚ[È›Û\SQHÕVH]HÚ]›Û\ÈÜÚÚ[ÈÚÝÈSQHš[ÈÚ]]Ù[™Ëˆ‚ˆ
+B‚ˆØ\ÙHœ]‹œ]È‹™\œÈ‹™\ˆŽ‚ˆ›Üˆ\™XÝÜžH[ˆÚÚ[Ë™\™XÝÜšY\ÈÂˆ˜\ˆ\Ñ\™XÝÜžNˆØšÐ›ÛÛH˜[ÙBˆ]^\ÝÈBˆš[SX[˜YÙ\‹™Y˜][™š[Q^\ÝÊ]]ˆ\™XÝÜžKœ]\Ñ\™XÝÜžNˆ	š\Ñ\™XÝÜžJBˆ	‰ˆ\Ñ\™XÝÜžK˜›ÛÛ˜[YBˆ]ÛÝ[HYÙ[ÚÚ[Ø][ÙË›ØY
+\™XÝÜžNˆ\™XÝÜžJK˜ÛÝ[ˆ]ØZ]\›Z[˜[›[™Jˆ—
+\™XÝÜžKœ]
+H
+^\ÝÈÈ—
+ÛÝ[
+HÚÚ[
+ÛÝ[OHHÈˆˆˆœÈŠHˆˆŠZ\ÜÚ[™ÊHŠHŠBˆB‚ˆØ\ÙHœ™[ØY‹œÞ[˜È‹œ™\ØØ[ˆŽ‚ˆ˜\ˆ\ÎˆÔÝš[™×HH×BˆYˆ\Þ[˜ÙY˜YYš\Ñ[\HÈ\Ë˜\[™
+˜YY
+Þ[˜ÙY˜YYš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJHŠHBˆYˆ\Þ[˜ÙYœ™[[Ý™Yš\Ñ[\HÂˆ\Ë˜\[™
+œ™[[Ý™Y
+Þ[˜ÙYœ™[[Ý™Yš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJHŠBˆBˆ]ØZ]\›Z[˜[›[™Jˆ—
+Ø][ÙËœÚÚ[Ë˜ÛÝ[
+HÚÚ[
+Ø][ÙËœÚÚ[Ë˜ÛÝ[OHHÈˆˆˆœÈŠH‚ˆ
+È
+\Ëš\Ñ[\HÈ‹[˜Ú[™ÙYˆˆˆŽˆˆ
+È\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆŽÈŠH
+È‹ˆŠJB‚ˆY˜][‚ˆ]ØZ]\›Z[˜[›[™JÚÚ[Ò[
+BˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÛÛÜ›Ý\Ø][ÙÊˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛÂˆ
+H\Þ[˜È›ÝÜÈOˆÕÛÛÜ›Ý\Yš[š][Û—HÂˆ]ÛÛÈH]ØZ][[YK˜]˜Z[X›UÛÛÊ
+Bˆ˜\ˆÜ›Ý\ÈHYÙ[[[YK˜Z[[•ÛÛÜ›Ý\Ê›ÜŽˆÛÛÊBˆ›ÜˆÛÝ\˜ÙH[ˆÛÛ™šYÝ\˜][ÛËÛÛÛÝ\˜Ù\Ë™š[\Š™[˜X›Y
+HÏÈ×HÂˆÜ›Ý\Ë˜\[™
+ˆÛÛ[ÓÙŽˆžH]ØZ]YÚ[œËÛÛÜ›Ý\ÊˆÚ[™ˆÛÝ\˜ÙKšÚ[™ˆÛÛ^ˆÛÝ\˜ÙK˜ÛÛ^
+[š\›Û›Y[ˆ›ØÙ\ÜÒ[™›Ëœ›ØÙ\ÜÒ[™›Ë™[š\›Û›Y[
+JJBˆBˆ™]\›ˆÛÛÜ›Ý\Yš[š][Û‹˜Ø][ÙÊÛ›ÝÛŽˆÜ›Ý\ËÛÛÎˆÛÛÊBˆB‚ˆš]˜]HÝ]XÈ[˜È™\ÛÛ™UÛÛÜ›Ý\
+ˆÈÙ[XÝÜŽˆÝš[™Ëˆ[ˆÜ›Ý\ÎˆÕÛÛÜ›Ý\Yš[š][Û—Bˆ
+HOˆÛÛÜ›Ý\Yš[š][ÛÈÂˆ]X]Ú\ÈHÜ›Ý\Ë™š[\ˆÂˆ	šY˜Ø\ÙR[œÙ[œÚ]]™PÛÛ\\™JÙ[XÝÜŠHOH›Ü™\™YØ[YBˆ	˜Ø][ÙÒQ˜Ø\ÙR[œÙ[œÚ]]™PÛÛ\\™JÙ[XÝÜŠHOH›Ü™\™YØ[YBˆBˆ™]\›ˆX]Ú\Ë˜ÛÝ[OHHÈX]Ú\ÖÌHˆš[ˆB‚ˆš]˜]HÝ]XÈ[˜È\ÕÛÛÜ›Ý\[˜X›Y
+ˆÈÜ›Ý\ˆÛÛÜ›Ý\Yš[š][Û‹ˆ›Ùš[NˆÙ\ÜÚ[Û”›Ùš[Bˆ
+HOˆ›ÛÛÂˆ›Ùš[KÛÛÜ›Ý\˜[Y\Ë˜ÛÛZ[œÊÜ›Ý\šY
+HÜ›Ý\ÛÛ˜[Y\Ëš\ÔÝXœÙ]
+ÙŽˆ›Ùš[KÛÛ˜[Y\ÊBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÛÛ™šYÝ\™YÜ[ÛœÊˆ›ÜˆÜ›Ý\ˆÛÛÜ›Ý\Yš[š][Û‹ˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛÂˆ
+HOˆÔÝš[™Îˆ”ÓÓ•˜[YWHÂˆ]ÛÝ\˜ÙHHÛÛ™šYÝ\˜][ÛËÛÛÛÝ\˜Ù\Ë™š\œÝÈ	šYOHÜ›Ý\œÛÝ\˜ÙRQBˆ™]\›ˆXÝ[Û˜\žJˆ[š\]YRÙ^\ÕÚ]˜[Y\ÎˆÜ›Ý\›Ü[ÛœË˜ÛÛ\XÝX\ÈÜ[Ûˆ[‚ˆÛÝ\˜ÙOË›Ü[ÛœÖÛÜ[Û‹šYK›X\È
+Ü[Û‹šY	
+HBˆÏÈÜ[Û‹™Y˜][˜[YK›X\È
+Ü[Û‹šY	
+HBˆJBˆB‚ˆš]˜]HÝ]XÈ[˜È\Ü^YYÜ[ÛŠˆÈ˜[YNˆ”ÓÓ•˜[YOËˆÚ[™ˆÛÛÜ›Ý\Ü[Û’Ú[™ˆ
+HOˆÝš[™ÈÂˆÝX\™]˜[YH[ÙHÈ™]\›ˆ‹HˆBˆYˆÚ[™OHœÙXÜ™]È™]\›ˆ˜[YKœÝš[™Õ˜[YOËš\Ñ[\HOH˜[ÙHÈŠÛÛ™šYÝ\™Y
+Hˆˆ‹HˆBˆYˆ]Ýš[™ÈH˜[YKœÝš[™Õ˜[YHÈ™]\›ˆÝš[™ÈBˆYˆ][YÙ\ˆH˜[YKš[˜[YHÈ™]\›ˆÝš[™Ê[YÙ\ŠHBˆYˆ][X™\ˆH˜[YK›[X™\•˜[YHÈ™]\›ˆÝš[™Ê[X™\ŠHBˆYˆ]›ÛÛX[ˆH˜[YK˜›ÛÛ˜[YHÈ™]\›ˆÝš[™Ê›ÛÛX[ŠHBˆ™]\›ˆ˜[YK˜ÛÛ\XÝ”ÓÓ”Ýš[™ÂˆB‚ˆš]˜]HÝ]XÈ[˜È\œÙUÛÛÜ[ÛŠˆÈ˜]Õ˜[YNˆÝš[™ËˆYš[š][ÛŽˆÛÛÜ›Ý\Ü[Û‘Yš[š][Û‚ˆ
+HOˆ”ÓÓ•˜[YOÈÂˆÝÚ]ÚYš[š][Û‹šÚ[™ÂˆØ\ÙH^œÙXÜ™]‚ˆ™]\›ˆœÝš[™Ê˜]Õ˜[YJBˆØ\ÙH˜›ÛÛX[Ž‚ˆ™]\›ˆ›ÛÛX[”Ù][™Ê˜]Õ˜[YJK›X\
+”ÓÓ•˜[YK˜›ÛÛ
+BˆØ\ÙH›[X™\Ž‚ˆ™]\›ˆÝX›J˜]Õ˜[YJK›X\
+”ÓÓ•˜[YK›[X™\ŠBˆØ\ÙH˜ÚÚXÙN‚ˆÝX\™Yš[š][Û‹˜ÚÚXÙ\Ë˜ÛÛZ[œÊ˜]Õ˜[YJH[ÙHÈ™]\›ˆš[Bˆ™]\›ˆœÝš[™Ê˜]Õ˜[YJBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È™XÛÛ™šYÝ\™UÛÛÜ›Ý\
+ˆÈÜ›Ý\ˆÛÛÜ›Ý\Yš[š][Û‹ˆÜ[ÛŽˆÝš[™Ëˆ˜[YNˆ”ÓÓ•˜[YOËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”]ˆ]ÛÝ\˜ÙR[™^H˜YÛÛÛÝ\˜Ù\Ë™š\œÝ[™^
+Ú\™NˆÈ	šYOHÜ›Ý\œÛÝ\˜ÙRQJBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\È[[YK[Û›HÜ›Ý\\È›È\œÚ\Ý[Ù][™ÜËˆŠBˆ™]\›‚ˆBˆYˆ]˜[YHÂˆ˜YÛÛÛÝ\˜Ù\ÖÜÛÝ\˜ÙR[™^K›Ü[ÛœÖÛÜ[Û—HH˜[YBˆH[ÙHÂˆ˜YÛÛÛÝ\˜Ù\ÖÜÛÝ\˜ÙR[™^K›Ü[ÛœËœ™[[Ý™U˜[YJ›Ü’Ù^NˆÜ[ÛŠBˆBˆ]ÛÝ\˜ÙHH˜YÛÛÛÝ\˜Ù\ÖÜÛÝ\˜ÙR[™^BˆÈÂˆ]ÛÛ^HÛÝ\˜ÙK˜ÛÛ^
+[š\›Û›Y[ˆ›ØÙ\ÜÒ[™›Ëœ›ØÙ\ÜÒ[™›Ë™[š\›Û›Y[
+Bˆ]ÛÛÈHžH]ØZ]YÚ[œË›XZÙUÛÛÊÚ[™ˆÛÝ\˜ÙKšÚ[™ÛÛ^ˆÛÛ^
+Bˆ]Ü›Ý\ÈHžH]ØZ]YÚ[œËÛÛÜ›Ý\ÊÚ[™ˆÛÝ\˜ÙKšÚ[™ÛÛ^ˆÛÛ^
+Bˆ]™\XÙ[Y[HÜ›Ý\Ë™š\œÝ
+Ú\™NˆÈ	šYOHÜ›Ý\šYJBˆ›Üˆ[™^[ˆ˜Y˜YÙ[Ëš[™XÙ\ÂˆÚ\™H˜Y˜YÙ[ÖÚ[™^KÛÛÜ›Ý\˜[Y\Ë˜ÛÛZ[œÊÜ›Ý\šY
+BˆÜ›Ý\ÛÛ˜[Y\Ëš\ÔÝXœÙ]
+ÙŽˆ˜Y˜YÙ[ÖÚ[™^KÛÛ˜[Y\ÊBˆÂˆ˜Y˜YÙ[ÖÚ[™^KÛÛÜ›Ý\˜[Y\Ëš[œÙ\
+Ü›Ý\šY
+Bˆ˜Y˜YÙ[ÖÚ[™^KÛÛ˜[Y\ËœÝX˜XÝ
+Ü›Ý\ÛÛ˜[Y\ÊBˆYˆ]™\XÙ[Y[Âˆ˜Y˜YÙ[ÖÚ[™^KÛÛ˜[Y\Ë™›Ü›U[š[ÛŠ™\XÙ[Y[ÛÛ˜[Y\ÊBˆBˆBˆYˆ\ÕÛÛÜ›Ý\[˜X›Y
+Ü›Ý\›Ùš[NˆÙ\ÜÚ[Û‹œ›Ùš[JKˆ]™\XÙ[Y[ˆÂˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛÜ›Ý\˜[Y\Ëš[œÙ\
+Ü›Ý\šY
+BˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛ˜[Y\ËœÝX˜XÝ
+Ü›Ý\ÛÛ˜[Y\ÊBˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛ˜[Y\Ë™›Ü›U[š[ÛŠ™\XÙ[Y[ÛÛ˜[Y\ÊBˆBˆ]Yš[š][ÛˆHÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Yš[š][Û‚ˆYˆ][™^H˜Y˜YÙ[Ë™š\œÝ[™^
+Ú\™NˆÈ	šYOHYš[š][Û‹šYJHÂˆ˜Y˜YÙ[ÖÚ[™^HHYš[š][Û‚ˆH[ÙHÂˆ˜Y˜YÙ[Ë˜\[™
+Yš[š][ÛŠBˆBˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆ›ÜˆÛÛ[ˆÛÛÈÂˆžH]ØZ][[YKœ™YÚ\Ý\ŠÛÛˆÛÛ™\XÚ[™Ñ^\Ý[™ÎˆYJBˆBˆ›ÜˆYÙ[[ˆ˜Y˜YÙ[ÈÂˆžH]ØZ][[YKœ™YÚ\Ý\ŠYÙ[ˆYÙ[™\XÚ[™Ñ^\Ý[™ÎˆYJBˆBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ØZ]\›Z[˜[›[™J”Ø]™Y
+Ü›Ý\šY
+K—
+Ü[ÛŠKˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È[™TÙ]ÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆ\›Ý˜[[™\Žˆ\›Z[˜[\›Ý˜[[™\‹ˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]\ÈH\™Ý[Y[œ™\XÚ[™ÓØØÝ\œ™[˜Ù\ÊÙŽˆH‹Ú]ˆˆŠBˆœÜ]
+Ú\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJBˆ›X\
+Ýš[™Ëš[š]
+BˆÝX\™\\Ëš\Ñ[\H[ÙHÂˆ][˜X›YH]ØZ]\›Ý˜[[™\‹š\ÖSÓÑ[˜X›Y
+
+Bˆ]ØZ]\›Z[˜[›[™Jž[ÛÈH
+[˜X›YÈ›Ûˆˆˆ›Ù™ˆŠHŠBˆ]ØZ]\Ý[Z]Ù][™ÜÊÙ\ÜÚ[Û‹œ›Ùš[K›[Z]Ë\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]\Ý™XÛÝ™\žTÙ][™ÜÊÙ\ÜÚ[Û‹œ›Ùš[K\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]\ÝÛÛÙ][™ÜÊÙ\ÜÚ[Û‹œ›Ùš[K\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]\›Z[˜[›[™J™[YØ][ÛˆH
+Ù\ÜÚ[Û‹œ›Ùš[KÛÛ[YØ][Û‹œ˜]Õ˜[YJHŠBˆ]ØZ]\›Z[˜[›[™JY™›Ü\ØÜš\[ÛŠÙ\ÜÚ[Û‹œ›Ùš[K›Ü[ÛœÊJBˆ]ØZ]\ÝRTÙ][™ÜÊÛÛ™šYÝ\˜][ÛËZHÏÈš[š]
+
+K\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]\Ý\ÙTÙ][™ÜÊÛÛ™šYÝ\˜][ÛË\ÙHÏÈš[š]
+
+K\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆ]Ù^HH\ÖÌK›ÝÙ\˜Ø\ÙY
+
+Bˆ]\Ü^YYÙ^HHÙ^HOHZKÛÛ™\Ý[[™\ÈˆÈZKÛÛ™\Ý[[™\ÈˆˆÙ^BˆYˆÙ^HOH™Y™›ÜˆÂˆ]ØZ][™QY™›ÜÛÛ[X[™
+ˆ\Ë™›Üš\œÝ
+
+Kš›Ú[™Y
+Ù\\˜]ÜŽˆˆŠKˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆÙ^HOHZHˆÙ^HOHZKˆˆÂˆ]ØZ]\ÝRTÙ][™ÜÊÛÛ™šYÝ\˜][ÛËZHÏÈš[š]
+
+K\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆÙ^HOH\ÙHˆÙ^HOH\ÙKˆˆÂˆ]ØZ]\Ý\ÙTÙ][™ÜÊÛÛ™šYÝ\˜][ÛË\ÙHÏÈš[š]
+
+K\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆÙ^HOH\ÙK˜YÙ[ÛYˆÂˆ]ØZ]Ù]YÙ[ÓX\šÙÝÛŠˆ\Îˆ\Ëˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆÙ^HOH\ÙKœ[ˆˆÂˆ]ØZ]Ù][›š[™Êˆ\Îˆ\Ëˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆÙ^HOH›[Z]ÈˆÙ^HOH›[Z]ËˆˆÂˆ]ØZ]\Ý[Z]Ù][™ÜÊÙ\ÜÚ[Û‹œ›Ùš[K›[Z]Ë\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆ][Z]Ù^HH[Z]Ù][™ÒÙ^\ÖÚÙ^WHÂˆ]ØZ]Ù][Z]
+ˆ[Z]Ù^Kˆ\Îˆ\ËˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆ]™XÛÝ™\žRÙ^HH™XÛÝ™\žTÙ][™ÒÙ^\ÖÚÙ^WHÂˆ]ØZ]Ù]™XÛÝ™\žTÙ][™Êˆ™XÛÝ™\žRÙ^Kˆ\Îˆ\ËˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆ[YØ][Û”Ù][™ÒÙ^\Ë˜ÛÛZ[œÊÙ^JHÂˆ]ØZ]Ù]ÛÛ[YØ][ÛŠˆ\Îˆ\ËˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆÙ^HOHÛÛˆÙ^HOHÛÛˆˆÙ^HOHÛÛÈˆÙ^HOHÛÛËˆˆÂˆ]ØZ]\ÝÛÛÙ][™ÜÊÙ\ÜÚ[Û‹œ›Ùš[K\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆÛÛØ[[™ÔÝ˜]YÞRÙ^\Ë˜ÛÛZ[œÊÙ^JHÂˆ]ØZ]Ù]ÛÛØ[[™ÔÝ˜]YÞJˆ\Îˆ\ËˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆÛÛ›ÞRÙ^\Ë˜ÛÛZ[œÊÙ^JHÂˆ]ØZ]Ù]ÛÛ›ÞJˆ\Îˆ\ËˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆÛÛ^[ÙRÙ^\Ë˜ÛÛZ[œÊÙ^JHÂˆ]ØZ]Ù]ÛÛ^[ÙJˆ\Îˆ\ËˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆBˆYˆÙ^HOHž[ÛÈˆÂˆ]ØZ]Ù]SÓÊˆ\Îˆ\Ëˆ\›Ý˜[[™\Žˆ\›Ý˜[[™\‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ™]\›‚ˆB‚ˆ]ÛÛÜ’Ù^\ÈHÂˆZK˜™Û[™H‹ZK™™ØÛÛÜˆ‹ZK˜™ØÛÛÜˆ‹ZK™™Ü›Û\‹ZK˜™Ü›Û\‹ˆZK™™ÝÛÛ™\Ý[‹ˆBˆ]›ÛÛX[’Ù^\ÈHÈZK˜›Û‹ZK›X\šÙÝÛˆ—Bˆ]ÛÝ[Ù^\ÈHÈZKÛÛ™\Ý[[™\È—Bˆ]]™[Ù^\ÈHÈZKœÝX˜YÙ[È‹ZK[šÚ[™È—Bˆ]^Ù^\ÈHÈZK]H‹ZK™Y]Üˆ—BˆÝX\™ˆÛÛÜ’Ù^\Ë˜ÛÛZ[œÊÙ^JH›ÛÛX[’Ù^\Ë˜ÛÛZ[œÊÙ^JHÛÝ[Ù^\Ë˜ÛÛZ[œÊÙ^JBˆ]™[Ù^\Ë˜ÛÛZ[œÊÙ^JH^Ù^\Ë˜ÛÛZ[œÊÙ^JBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ•[šÛ›ÝÛˆÙ][™È	×
+\ÖÌJIËˆ]˜Z[X›HÙ][™ÜÎˆY™›Ü[ÛË[YØ][Û‹ÛÛ˜Ø[[™ËÛÛœ›ÞK[Z]Ë›X^ÛÛØ[Ë[Z]Ë›X^[Ù[\›œË[Z]Ë›X^ÝX˜YÙ[Ë[Z]Ë›X^ÝX˜YÙ[\[Z]Ë›X^Ý[ÚÙ[œË[Z]Ë›X^ÙXÛÛ™Ë™]žK˜][\Ë™]žK™[^KÝ˜ÛÛ\XÝÝœÝ˜]YÞKZK]KZK™Y]Ü‹ZK˜™Û[™KZK™™ØÛÛÜ‹ZK˜™ØÛÛÜ‹ZK™™Ü›Û\ZK˜™Ü›Û\ZK™™ÝÛÛ™\Ý[ZK˜›ÛZK›X\šÙÝÛ‹ZKÛÛ™\Ý[[™\ËZKœÝX˜YÙ[Ë\ÙK˜YÙ[ÛY\ÙKœ[ˆ‚ˆ
+Bˆ™]\›‚ˆBˆ˜\ˆZHHÛÛ™šYÝ\˜][ÛËZHÏÈš[š]
+
+BˆÝX\™\Ë˜ÛÝ[ˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™J—
+\Ü^YYÙ^JHH
+ZTÙ][™ÊÙ^K[ŽˆZJJHŠBˆ™]\›‚ˆBˆÝX\™\Ë˜ÛÝ[OHˆ^Ù^\Ë˜ÛÛZ[œÊÙ^JH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ]
+Ù^JHSQHŠBˆ™]\›‚ˆBˆYˆ^Ù^\Ë˜ÛÛZ[œÊÙ^JHÂˆ]^H\Ë™›Üš\œÝ
+
+Kš›Ú[™Y
+Ù\\˜]ÜŽˆˆŠBˆËÈ››Û™Hˆ[\Y\ÈHÙ][™ÎˆH]HÛÙ\È]Ø^K[™HY]Üˆ˜[ÂˆËÈ˜XÚÈÈ	QUÔˆYØZ[‹‚ˆ]˜[YHHÈ››Û™H‹›Ù™ˆ—K˜ÛÛZ[œÊ^›ÝÙ\˜Ø\ÙY
+
+JHÈˆˆˆ^ˆYˆÙ^HOHZK™Y]ÜˆˆÂˆZK™Y]ÜˆH˜[YBˆH[ÙHÂˆZK]HH˜[YBˆBˆH[ÙHYˆÛÝ[Ù^\Ë˜ÛÛZ[œÊÙ^JHÂˆ]˜[YNˆ[ˆYˆ\ÖÌWK›ÝÙ\˜Ø\ÙY
+
+HOH˜[ˆÂˆ˜[YHHLBˆH[ÙHYˆ]ÛÝ[H[
+\ÖÌWJKÛÝ[HÂˆ˜[YHHÛÝ[ˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ]ZKÛÛ™\Ý[[™\È[ˆŠBˆ™]\›‚ˆBˆZKÛÛ™\Ý[[™\ÈH˜[YBˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™UÛÛ™\Ý[[™\Ê˜[YJBˆH[ÙHYˆÙ^HOHZK[šÚ[™ÈˆÂˆÝX\™][ÙHH[šÚ[™Ñ\Ü^J˜]Õ˜[YNˆ\ÖÌWK›ÝÙ\˜Ø\ÙY
+
+JH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ]ZK[šÚ[™ÈÝ]\ß[™_™Y_š]™_[ˆŠBˆ™]\›‚ˆBˆZK[šÚ[™ÈH[ÙBˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™U[šÚ[™Ê[ÙJBˆH[ÙHYˆ]™[Ù^\Ë˜ÛÛZ[œÊÙ^JHÂˆÝX\™]]™[HÝX˜YÙ[Ý]]]™[
+˜]Õ˜[YNˆ\ÖÌWK›ÝÙ\˜Ø\ÙY
+
+JH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ•\ØYÙNˆÜÙ]ZKœÝX˜YÙ[È
+ÝX˜YÙ[Ý]]]™[˜[Ø\Ù\Ë›X\
+œ˜]Õ˜[YJKš›Ú[™Y
+Ù\\˜]ÜŽˆŸŠJOˆ‚ˆ
+Bˆ™]\›‚ˆBˆZKœÝX˜YÙ[Ý]]H]™[ˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™TÝX˜YÙ[Ý]]
+]™[
+BˆH[ÙHYˆ›ÛÛX[’Ù^\Ë˜ÛÛZ[œÊÙ^JHÂˆÝX\™][˜X›YH›ÛÛX[”Ù][™Ê\ÖÌWJH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ]
+Ù^JHÛŸÙ™ˆŠBˆ™]\›‚ˆBˆYˆÙ^HOHZK˜›ÛˆÂˆZK˜›ÛH[˜X›YˆH[ÙHÂˆZK›X\šÙÝÛˆH[˜X›Yˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™SX\šÙÝÛŠˆX\šÙÝÛ”™[™\™\Šˆ[˜X›Yˆ[˜X›Y›Ü˜ÙYˆ˜[ÙK[š\›Û›Y[ˆ›ØÙ\ÜÒ[™›Ëœ›ØÙ\ÜÒ[™›Ë™[š\›Û›Y[
+JBˆBˆH[ÙHÂˆÝX\™]ÛÛÜˆH\›Z[˜[[™QY]Ü‹››Ü›X[^™YÛÛÜŠ\ÖÌWJH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ•[šÛ›ÝÛˆÛÛÜˆ	×
+\ÖÌWJIËˆ\ÙHH˜[YYS”ÒHÛÛÜ‹™ØŽ”‘Ð‹Üˆ›Û™KˆŠBˆ™]\›‚ˆBˆÝÚ]ÚÙ^HÂˆØ\ÙHZK˜™Û[™HŽˆZK˜˜XÚÙÜ›Ý[™[™HHÛÛÜ‚ˆØ\ÙHZK™™ØÛÛÜˆŽˆZK™›Ü™YÜ›Ý[™HÛÛÜ‚ˆØ\ÙHZK˜™ØÛÛÜˆŽˆZK˜˜XÚÙÜ›Ý[™HÛÛÜ‚ˆØ\ÙHZK™™Ü›Û\ŽˆZKœ›Û\›Ü™YÜ›Ý[™HÛÛÜ‚ˆØ\ÙHZK˜™Ü›Û\ŽˆZKœ›Û\˜XÚÙÜ›Ý[™HÛÛÜ‚ˆØ\ÙHZK™™ÝÛÛ™\Ý[Ž‚ˆZKÛÛ™\Ý[›Ü™YÜ›Ý[™HÛÛÜ‚ˆ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™UÛÛ™\Ý[ÛÛÜŠÛÛÜŠBˆY˜][ˆœ™XZÂˆBˆBˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ˜YZHHZBˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜YˆYˆÙ^HOHZK]HˆÈ]ØZ]\›Z[˜[˜ÛÛ™šYÝ\™U\›Z[˜[]JZK]JHBˆYˆÙ^HOHZK™Y]ÜˆˆÈÛÛ™šYÝ\™QY]ÜŠZK™Y]ÜŠHBˆ]ØZ]\›Z[˜[›[™J”Ù]
+\Ü^YYÙ^JHH
+ZTÙ][™ÊÙ^K[ŽˆZJJKˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆËËÈÝÙ\˜Ø\ÙYÜÙ]Ù^\ÈX\YÈZ\ˆØ[›ÛšXØ[Ü[[™Ë‚ˆš]˜]HÝ]XÈ][Z]Ù][™ÒÙ^\ÈHÂˆ›[Z]Ë›X^ÛÛØ[ÈŽˆ›[Z]Ë›X^ÛÛØ[È‹ˆ›[Z]Ë›X^[Ù[\›œÈŽˆ›[Z]Ë›X^[Ù[\›œÈ‹ˆ›[Z]Ë›X^ÝX˜YÙ[ÈŽˆ›[Z]Ë›X^ÝX˜YÙ[È‹ˆ›[Z]Ë›X^ÝX˜YÙ[\Žˆ›[Z]Ë›X^ÝX˜YÙ[\‹ˆ›[Z]Ë›X^Ý[ÚÙ[œÈŽˆ›[Z]Ë›X^Ý[ÚÙ[œÈ‹ˆ›[Z]Ë›X^ÚÙ[œÈŽˆ›[Z]Ë›X^Ý[ÚÙ[œÈ‹ˆ›[Z]Ë›X^ÙXÛÛ™ÈŽˆ›[Z]Ë›X^ÙXÛÛ™È‹ˆ›[Z]Ë›X^[YHŽˆ›[Z]Ë›X^ÙXÛÛ™È‹ˆB‚ˆËËÈÝÙ\˜Ø\ÙYÜÙ]Ù^\È›Üˆ™]žH[™ÛÛ^XÛÛ\XÝ[ÛˆÛXÚY\Ë‚ˆš]˜]HÝ]XÈ]™XÛÝ™\žTÙ][™ÒÙ^\ÈHÂˆœ™]žK˜][\ÈŽˆœ™]žK˜][\È‹ˆœ™]žK˜ÛÝ[Žˆœ™]žK˜][\È‹ˆœ™]šY\ÈŽˆœ™]žK˜][\È‹ˆœ™]žK™[^HŽˆœ™]žK™[^H‹ˆœ™]žK™[^\ÙXÛÛ™ÈŽˆœ™]žK™[^H‹ˆ˜Ý˜ÛÛ\XÝŽˆ˜Ý˜ÛÛ\XÝ‹ˆB‚ˆš]˜]HÝ]XÈ][YØ][Û”Ù][™ÒÙ^\ÎˆÙ]Ýš[™ÏˆHÂˆ™[YØ][Ûˆ‹ÛÛË™[YØ][Ûˆ‹ÛÛ[YØ][Ûˆ‹œÝX˜YÙ[È‹ˆB‚ˆš]˜]HÝ]XÈ]ÛÛØ[[™ÔÝ˜]YÞRÙ^\ÎˆÙ]Ýš[™ÏˆHÂˆÛÛ˜Ø[[™È‹ÛÛË˜Ø[[™È‹ÛÛØ[[™È‹ÛÛØ[[™ÜÝ˜]YÞH‹ˆB‚ˆš]˜]HÝ]XÈ]ÛÛ›ÞRÙ^\ÎˆÙ]Ýš[™ÏˆHÂˆÛÛœ›ÞH‹ÛÛËœ›ÞH‹ÛÛ›ÞH‹\Ù]ÛÛ›ÞH‹ˆB‚ˆš]˜]HÝ]XÈ]ÛÛ^[ÙRÙ^\ÎˆÙ]Ýš[™ÏˆHÈ˜ÝœÝ˜]YÞH—B‚ˆš]˜]HÝ]XÈ[˜È\ÝÛÛÙ][™ÜÊÈ›Ùš[NˆÙ\ÜÚ[Û”›Ùš[K\›Z[˜[ˆ\›Z[˜[Üš]\ŠH\Þ[˜ÈÂˆ]ØZ]\›Z[˜[›[™JÛÛ˜Ø[[™ÈH
+›Ùš[KÛÛØ[[™ÔÝ˜]YÞKœ˜]Õ˜[YJHŠBˆ]ØZ]\›Z[˜[›[™JÛÛœ›ÞHH
+ÛÛ›ÞTÙ][™Ê›Ùš[JJHŠBˆB‚ˆËËÈÜÙ][ÛÈÛÛŸÙ™—Xˆ\›Z]È]™\žHÛÛØ[Ú]Ý]\ÚÚ[™ËˆHÚÚXÙBˆËËÈ\ÈØ]™YÚ]H\›Ý˜[[\ËÛÈ]\Y\ÈÈ]\ˆ[œÈÛË‚ˆš]˜]HÝ]XÈ[˜ÈÙ]SÓÊˆ\ÎˆÔÝš[™×Kˆ\›Ý˜[[™\Žˆ\›Z[˜[\›Ý˜[[™\‹ˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™\Ë˜ÛÝ[ˆH[ÙHÂˆ][˜X›YH]ØZ]\›Ý˜[[™\‹š\ÖSÓÑ[˜X›Y
+
+Bˆ]ØZ]\›Z[˜[›[™Jž[ÛÈH
+[˜X›YÈ›Ûˆˆˆ›Ù™ˆŠHŠBˆ™]\›‚ˆBˆÝX\™\Ë˜ÛÝ[OH‹][˜X›YH›ÛÛX[”Ù][™Ê\ÖÌWJH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ][ÛÈÛŸÙ™ˆŠBˆ™]\›‚ˆBˆ]ØZ]\›Ý˜[[™\‹œÙ]SÓÑ[˜X›Y
+[˜X›Y
+Bˆ]Y™™XÝBˆ[˜X›YˆÈ–SÓÈ[ÙH[˜X›YÈ[ÛÛØ[È\™H\›Z]Y‚ˆˆ–SÓÈ[ÙH\ØX›YÈÛÛ™šYÝ\™Y\›Ý˜[[\È™\ÝÜ™Y‚ˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J—
+Y™™XÝ
+H›Üˆ\ÈÙ\ÜÚ[ÛŽÈ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™KˆŠBˆ™]\›‚ˆBˆ˜Y˜\›Ý˜[Ëž[ÛÈH[˜X›YˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ØZ]\›Z[˜[›[™J—
+Y™™XÝ
+K[™Ø]™Y›Üˆ]\ˆ[œËˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™Jˆ—
+Y™™XÝ
+H›Üˆ\ÈÙ\ÜÚ[ÛŽÈÛÝ[›ÝØ]™HHÛÛ™šYÝ\˜][ÛŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ˆÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆËËÈÜÙ]ÛÛœ›ÞHÛÛŸÙ™—XˆÚÝÜÈÜˆÚ[™Ù\ÈÚ]\ˆ[Ù[ÈÙYHÛ›HBˆËËÈÚ\™Y\Ý]ÛÛÈ[™Ø[]ÛÛZ\ˆ[œÝXYÙˆHYÙ[	ÜÈÛÛË‚ˆš]˜]HÝ]XÈ[˜ÈÙ]ÛÛ›ÞJˆ\ÎˆÔÝš[™×KˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™\Ë˜ÛÝ[ˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™JÛÛœ›ÞHH
+ÛÛ›ÞTÙ][™ÊÙ\ÜÚ[Û‹œ›Ùš[JJHŠBˆ™]\›‚ˆBˆËÈÛˆ
+ÜˆXœšY
+HÙY\ÈHÛÛ[[ÛˆÛÛÈ˜]]™H[™›ÞY\ÈH™\ÝÂˆËÈ[Y\È]™\žHÛÛ™Z[™\Ý]ÛÛÈ[™Ø[]ÛÛ‚ˆ]˜[YNˆÝš[™ÂˆÝÚ]Ú\Ë˜ÛÝ[OHˆÈ\ÖÌWK›ÝÙ\˜Ø\ÙY
+
+HˆˆˆÂˆØ\ÙH˜[Ž‚ˆÙ\ÜÚ[Û‹œ›Ùš[K\ÙUÛÛ›ÞHHYBˆÙ\ÜÚ[Û‹œ›Ùš[Kœ›ÞQ^ÜÙYÛÛÈH×Bˆ˜[YHH˜[‚ˆØ\ÙHšXœšYŽ‚ˆÙ\ÜÚ[Û‹œ›Ùš[K\ÙUÛÛ›ÞHHYBˆÙ\ÜÚ[Û‹œ›Ùš[Kœ›ÞQ^ÜÙYÛÛÈHš[ˆ˜[YHH›Ûˆ‚ˆØ\ÙH]ÛÜ™‚ˆÝX\™][˜X›YH›ÛÛX[”Ù][™ÊÛÜ™
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ]ÛÛœ›ÞHÛŸ[Ù™ˆŠBˆ™]\›‚ˆBˆÙ\ÜÚ[Û‹œ›Ùš[K\ÙUÛÛ›ÞHH[˜X›YˆYˆ[˜X›YÈÙ\ÜÚ[Û‹œ›Ùš[Kœ›ÞQ^ÜÙYÛÛÈHš[Bˆ˜[YHH[˜X›YÈ›Ûˆˆˆ›Ù™ˆ‚ˆBˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÝX\™ÛÛ™šYÝ\˜][ÛˆOHš[ÛÛ™šYÝ\˜][Û”]OHš[[ÙHÂˆ]ØZ]\›Z[˜[›[™J”Ù]ÛÛœ›ÞHH
+˜[YJH›Üˆ\ÈÚ]ˆŠBˆ™]\›‚ˆBˆYˆ]ØZ]\œÚ\ÝYÙ[›Ùš[JˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ[[YNˆ[[YKˆ\›Z[˜[ˆ\›Z[˜[
+BˆÂˆ]ØZ]\›Z[˜[›[™J”Ù]ÛÛœ›ÞHH
+˜[YJH›ÜˆYÙ[	×
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+IËˆŠBˆBˆB‚ˆËËÈÜÙ]ÝœÝ˜]YÞHØXÚ_Ú^™O˜ˆØXÚH™]™\ˆÚ[™Ù\ÈHÙ[Y\ÜØYÙKÚ^™BˆËËÈ™\XÙ\ÈÛÛœÝ[YYš[H›ÙY\ÈÚ]™Y™\™[˜Ù\È™Y›Ü™HXXÚ[Ù[Ø[‚ˆš]˜]HÝ]XÈ[˜ÈÙ]ÛÛ^[ÙJˆ\ÎˆÔÝš[™×KˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™\Ë˜ÛÝ[ˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™J˜ÝœÝ˜]YÞHH
+Ù\ÜÚ[Û‹œ›Ùš[K˜ÛÛ^œ˜]Õ˜[YJHŠBˆ™]\›‚ˆBˆÝX\™\Ë˜ÛÝ[OH‹][ÙHHYÙ[ÛÛ^[ÙJ˜]Õ˜[YNˆ\ÖÌWK›ÝÙ\˜Ø\ÙY
+
+JH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ]ÝœÝ˜]YÞHØXÚ_Ú^™OˆŠBˆ™]\›‚ˆBˆÙ\ÜÚ[Û‹œ›Ùš[K˜ÛÛ^H[ÙBˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÝX\™ÛÛ™šYÝ\˜][ÛˆOHš[ÛÛ™šYÝ\˜][Û”]OHš[[ÙHÂˆ]ØZ]\›Z[˜[›[™J”Ù]ÝœÝ˜]YÞHH
+[ÙKœ˜]Õ˜[YJH›Üˆ\ÈÚ]ˆŠBˆ™]\›‚ˆBˆYˆ]ØZ]\œÚ\ÝYÙ[›Ùš[JˆÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆÛÛ™šYÝ\˜][Û”]ˆÛÛ™šYÝ\˜][Û”]ˆ[[YNˆ[[YKˆ\›Z[˜[ˆ\›Z[˜[
+BˆÂˆ]ØZ]\›Z[˜[›[™Jˆ”Ù]ÝœÝ˜]YÞHH
+[ÙKœ˜]Õ˜[YJH›ÜˆYÙ[	×
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+IËˆŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÙ]ÛÛØ[[™ÔÝ˜]YÞJˆ\ÎˆÔÝš[™×KˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™\Ë˜ÛÝ[ˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™JÛÛ˜Ø[[™ÈH
+Ù\ÜÚ[Û‹œ›Ùš[KÛÛØ[[™ÔÝ˜]YÞKœ˜]Õ˜[YJHŠBˆ™]\›‚ˆBˆ]˜]Õ˜[YHH\ÖÌWK›ÝÙ\˜Ø\ÙY
+
+Bˆ]Ý˜]YÞHBˆ˜]Õ˜[YHOH˜]]ÈˆÈÛÛØ[[™ÔÝ˜]YÞK˜]]ÛX]XÈˆÛÛØ[[™ÔÝ˜]YÞJ˜]Õ˜[YNˆ˜]Õ˜[YJBˆÝX\™\Ë˜ÛÝ[OH‹]Ý˜]YÞH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ•\ØYÙNˆÜÙ]ÛÛ˜Ø[[™È]]ÛX]Xß˜]]™_^[œÛÛˆŠBˆ™]\›‚ˆBˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛØ[[™ÔÝ˜]YÞHHÝ˜]YÞBˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”]ˆ][™^H˜Y˜YÙ[Ë™š\œÝ[™^
+Ú\™NˆÈ	šYOHÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[QJBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J”Ù]ÛÛ˜Ø[[™ÈH
+Ý˜]YÞKœ˜]Õ˜[YJH›Üˆ\ÈÚ]ˆŠBˆ™]\›‚ˆBˆ˜Y˜YÙ[ÖÚ[™^KÛÛØ[[™ÔÝ˜]YÞHHÝ˜]YÞBˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆžH]ØZ][[YKœ™YÚ\Ý\ŠYÙ[ˆÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Yš[š][Û‹™\XÚ[™Ñ^\Ý[™ÎˆYJBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ØZ]\›Z[˜[›[™Jˆ”Ù]ÛÛ˜Ø[[™ÈH
+Ý˜]YÞKœ˜]Õ˜[YJH›ÜˆYÙ[	×
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+IËˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™Jˆ”Ù]ÛÛ˜Ø[[™ÈH
+Ý˜]YÞKœ˜]Õ˜[YJH›Üˆ\ÈÚ]ÈÛÝ[›ÝØ]™HHÛÛ™šYÝ\˜][ÛŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ˆÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆš]˜]HÝ]XÈ][Z]Ù][™ÓÜ™\ˆHÂˆ›[Z]Ë›X^ÛÛØ[È‹›[Z]Ë›X^[Ù[\›œÈ‹›[Z]Ë›X^ÝX˜YÙ[È‹ˆ›[Z]Ë›X^ÝX˜YÙ[\‹›[Z]Ë›X^Ý[ÚÙ[œÈ‹›[Z]Ë›X^ÙXÛÛ™È‹ˆB‚ˆš]˜]HÝ]XÈ[˜È\Ý[Z]Ù][™ÜÊÈ[Z]ÎˆYÙ[[“[Z]Ë\›Z[˜[ˆ\›Z[˜[Üš]\ŠH\Þ[˜ÈÂˆ›ÜˆÙ^H[ˆ[Z]Ù][™ÓÜ™\ˆÂˆ]ØZ]\›Z[˜[›[™J—
+Ù^JHH
+[Z]˜[YJÙ^K[Žˆ[Z]ÊJHŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È[Z]˜[YJÈÙ^NˆÝš[™Ë[ˆ[Z]ÎˆYÙ[[“[Z]ÊHOˆÝš[™ÈÂˆÝÚ]ÚÙ^HÂˆØ\ÙH›[Z]Ë›X^ÛÛØ[ÈŽˆÝš[™Ê[Z]Ë›X^ÛÛØ[ÊBˆØ\ÙH›[Z]Ë›X^ÝX˜YÙ[ÈŽˆÝš[™Ê[Z]Ë›X^ÝX˜YÙ[ÊBˆØ\ÙH›[Z]Ë›X^ÝX˜YÙ[\ŽˆÝš[™Ê[Z]Ë›X^ÝX˜YÙ[\
+BˆØ\ÙH›[Z]Ë›X^Ý[ÚÙ[œÈŽˆ[Z]Ë›X^Ý[ÚÙ[œË›X\
+Ýš[™Ëš[š]
+HÏÈ›Ù™ˆ‚ˆØ\ÙH›[Z]Ë›X^ÙXÛÛ™ÈŽ‚ˆ[Z]Ë›X^ÙXÛÛ™Ë›X\È[Ù[\ØYÙQ›Ü›X]™\˜][ÛŠÝX›J	
+JHHÏÈ›Ù™ˆ‚ˆY˜][ˆÝš[™Ê[Z]Ë›X^[Ù[\›œÊBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È\Ý™XÛÝ™\žTÙ][™ÜÊÈ›Ùš[NˆÙ\ÜÚ[Û”›Ùš[K\›Z[˜[ˆ\›Z[˜[Üš]\ŠBˆ\Þ[˜ÂˆÂˆ]ØZ]\›Z[˜[›[™Jœ™]žK˜][\ÈH
+›Ùš[Kœ™]žK˜][\ÊHŠBˆ]ØZ]\›Z[˜[›[™Jœ™]žK™[^HH
+\˜][Û”Ù][™Ê›Ùš[Kœ™]žK™[^TÙXÛÛ™ÊJHŠBˆ]ØZ]\›Z[˜[›[™J˜Ý˜ÛÛ\XÝH
+]]ØÛÛ\XÝÙ][™Ê›Ùš[K˜]]ØÛÛ\XÝ
+JHŠBˆ]ØZ]\›Z[˜[›[™J˜ÝœÝ˜]YÞHH
+›Ùš[K˜ÛÛ^œ˜]Õ˜[YJHŠBˆB‚ˆš]˜]HÝ]XÈ[˜È\˜][Û”Ù][™ÊÈÙXÛÛ™ÎˆÝX›JHOˆÝš[™ÈÂˆÙXÛÛ™ÈOHÙXÛÛ™Ëœ›Ý[™Y
+
+HÈ—
+[
+ÙXÛÛ™ÊJ\Èˆˆ—
+ÙXÛÛ™Ê\È‚ˆB‚ˆËËÈÙ™˜Û˜
+HÛÛ[[ÛˆÛÛÈ˜]]™KH™\Ý›ÞYY
+HÜˆ[‚ˆš]˜]HÝ]XÈ[˜ÈÛÛ›ÞTÙ][™ÊÈ›Ùš[NˆÙ\ÜÚ[Û”›Ùš[JHOˆÝš[™ÈÂˆÝX\™›Ùš[K\ÙUÛÛ›ÞH[ÙHÈ™]\›ˆ›Ù™ˆˆBˆ™]\›ˆ›Ùš[Kœ›ÞQ^ÜÙYÛÛÏËš\Ñ[\HOHYHÈ˜[ˆˆ›Ûˆ‚ˆB‚ˆš]˜]HÝ]XÈ[˜È]]ØÛÛ\XÝÙ][™ÊÈ]]ØÛÛ\XÝˆYÙ[]]ØÛÛ\XÝ
+HOˆÝš[™ÈÂˆ]]ØÛÛ\XÝš\Ñ[˜X›YÈ—
+]]ØÛÛ\XÝÚÙ[œÊHÚÙ[œÈˆˆ›Ù™ˆ‚ˆB‚ˆËËÈLLØLXZZÌXˆH\˜][Ûˆ[ˆÙXÛÛ™ËÜˆš[‚ˆÝ]XÈ[˜È\œÙQ\˜][Û”ÙXÛÛ™ÊÈ˜]ÎˆÝš[™ÊHOˆ[ÈÂˆ]^H˜]Ëš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\ÊK›ÝÙ\˜Ø\ÙY
+
+BˆYˆ]Z[ˆH[
+^
+HÈ™]\›ˆZ[ˆˆÈZ[ˆˆš[Bˆ˜\ˆÝ[Hˆ˜\ˆYÚ]ÈHˆ‚ˆ˜\ˆ[š]ÈHˆ›ÜˆÚ\˜XÝ\ˆ[ˆ^ÂˆYˆÚ\˜XÝ\‹š\Ó[X™\ˆÂˆYÚ]Ë˜\[™
+Ú\˜XÝ\ŠBˆÛÛ[YBˆBˆÝX\™]˜[YHH[
+YÚ]ÊH[ÙHÈ™]\›ˆš[BˆÝÚ]ÚÚ\˜XÝ\ˆÂˆØ\ÙHšŽˆÝ[
+ÏH˜[YH
+ˆÍŒˆØ\ÙH›HŽˆÝ[
+ÏH˜[YH
+ˆŒˆØ\ÙHœÈŽˆÝ[
+ÏH˜[YBˆY˜][ˆ™]\›ˆš[ˆBˆYÚ]ÈHˆ‚ˆ[š]È
+ÏHBˆBˆÝX\™[š]ÈˆYÚ]Ëš\Ñ[\KÝ[ˆ[ÙHÈ™]\›ˆš[Bˆ™]\›ˆÝ[ˆB‚ˆËËÈLŒLŒØK[XˆHÚÙ[ˆÛÝ[Üˆš[‚ˆÝ]XÈ[˜È\œÙUÚÙ[ÛÝ[
+È˜]ÎˆÝš[™ÊHOˆ[ÈÂˆ˜\ˆ^H˜]Ëš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\ÊK›ÝÙ\˜Ø\ÙY
+
+Bˆ^œ™[[Ý™P[È	OH—Èˆ	OH‹ˆBˆYˆ]Z[ˆH[
+^
+HÈ™]\›ˆZ[ˆHÈZ[ˆˆš[Bˆ]][\Y\ŽˆÝX›BˆYˆ^š\ÔÝY™š^
+šÈŠHÂˆ][\Y\ˆHWÌˆH[ÙHYˆ^š\ÔÝY™š^
+›HŠHÂˆ][\Y\ˆHWÌÌˆH[ÙHÂˆ™]\›ˆš[ˆBˆÝX\™]˜[YHHÝX›J^™›Ü\Ý
+
+JK˜[YHH[ÙHÈ™]\›ˆš[Bˆ™]\›ˆ[
+
+˜[YH
+ˆ][\Y\ŠKœ›Ý[™Y
+
+JBˆB‚ˆËËÈ]ÈHÝ\œ™[YÙ[[™ÛÛÛÜšÈÈHÚ[Üˆ›Ýˆ\›š[™ÂˆËËÈ[YØ][ÛˆÛˆÚ]›ÈÝX˜YÙ[YÙ]ÛÝ[Ú[[HÈ›Ý[™ËÛÈ]ˆËËÈ˜Z\Ù\ÈHYÙ]ÛË‚ˆš]˜]HÝ]XÈ[˜ÈÙ]ÛÛ[YØ][ÛŠˆ\ÎˆÔÝš[™×KˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™\Ë˜ÛÝ[ˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™J™[YØ][ÛˆH
+Ù\ÜÚ[Û‹œ›Ùš[KÛÛ[YØ][Û‹œ˜]Õ˜[YJHŠBˆ™]\›‚ˆBˆ]˜]ÈH\ÖÌWK›ÝÙ\˜Ø\ÙY
+
+Bˆ][ÙNˆYÙ[ÛÛ[YØ][ÛÈBˆÝÚ]Ú˜]ÈÂˆØ\ÙH›Ù™ˆ‹››Û™H‹œÙ[ˆ‹š[›[™HŽˆš[›[™BˆØ\ÙH›Ûˆ‹˜Ú[‹œÝX˜YÙ[‹œÝX˜YÙ[ÈŽˆœÝX˜YÙ[ˆY˜][ˆš[ˆBˆÝX\™\Ë˜ÛÝ[OH‹][ÙH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ][YØ][ÛˆÙ™ŸÝX˜YÙ[ˆŠBˆ™]\›‚ˆBˆÙ\ÜÚ[Û‹œ›Ùš[KÛÛ[YØ][ÛˆH[ÙBˆ˜\ˆ˜Z\ÙYH˜[ÙBˆYˆ[ÙHOHœÝX˜YÙ[Ù\ÜÚ[Û‹œ›Ùš[K›[Z]Ë›X^ÝX˜YÙ[ÈHÂˆÙ\ÜÚ[Û‹œ›Ùš[K›[Z]Ë›X^ÝX˜YÙ[ÈHBˆ˜Z\ÙYHYBˆBˆÙ\ÜÚ[Û‹ÝXÚ
+
+Bˆ˜\ˆ›Ý\ÈHÂˆ[ÙHOHœÝX˜YÙ[ˆÈ•\ÈYÙ[ÙY\È]ÈÛÛÈ[™Ø[ˆ[ÛÈ[™ÛÜšÈÈHÚ[]\È[NÈÛ›HHÚ[	ÜÈ[œÝÙ\ˆ[™È\™Kˆ‚ˆˆ•\ÈYÙ[[œÈ]™\žHÛÛØ[]Ù[‹ˆ‚ˆBˆYˆ˜Z\ÙYÈ›Ý\Ë˜\[™
+”˜Z\ÙY[Z]Ë›X^ÝX˜YÙ[ÈÈKˆŠHBˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”]ˆ][™^H˜Y˜YÙ[Ë™š\œÝ[™^
+Ú\™NˆÈ	šYOHÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[QJBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ
+È”Ù][YØ][ÛˆH
+[ÙKœ˜]Õ˜[YJH›Üˆ\ÈÚ]ˆ—H
+È›Ý\ÊKš›Ú[™Y
+Ù\\˜]ÜŽˆˆŠJBˆ™]\›‚ˆBˆ˜Y˜YÙ[ÖÚ[™^KÛÛ[YØ][ÛˆH[ÙBˆ˜Y˜YÙ[ÖÚ[™^K›[Z]ÈHÙ\ÜÚ[Û‹œ›Ùš[K›[Z]ÂˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆžH]ØZ][[YKœ™YÚ\Ý\ŠYÙ[ˆÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Yš[š][Û‹™\XÚ[™Ñ^\Ý[™ÎˆYJBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ØZ]\›Z[˜[›[™Jˆ
+È”Ù][YØ][ÛˆH
+[ÙKœ˜]Õ˜[YJH›ÜˆYÙ[	×
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+IËˆ—H
+È›Ý\ÊBˆš›Ú[™Y
+Ù\\˜]ÜŽˆˆŠJBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™Jˆ”Ù][YØ][ÛˆH
+[ÙKœ˜]Õ˜[YJH›Üˆ\ÈÚ]ÈÛÝ[›ÝØ]™HHÛÛ™šYÝ\˜][ÛŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ˆÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆËËÈÚ[™Ù\ÈÛ™H[ˆ[Z]›ÜˆHÝ\œ™[Ú][™Ú[ˆHÚ]\Ù\ÈBˆËËÈÛÛ™šYÝ\™YYÙ[\œÚ\ÝÈ][È]YÙ[	ÜÈYš[š][Û‹ˆHÚÙ[‚ˆËËÈ[™[YHØ\ÈZÙHÙ™˜È[YHZÙ\ÈLX[™Z\ÈÙ[\ÈÙXÛÛ™Ë‚ˆš]˜]HÝ]XÈ[˜ÈÙ][Z]
+ˆÈÙ^NˆÝš[™Ëˆ\ÎˆÔÝš[™×KˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ˜\ˆ[Z]ÈHÙ\ÜÚ[Û‹œ›Ùš[K›[Z]ÂˆÝX\™\Ë˜ÛÝ[ˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™J—
+Ù^JHH
+[Z]˜[YJÙ^K[Žˆ[Z]ÊJHŠBˆ™]\›‚ˆBˆ]˜]ÈH\Ë˜ÛÝ[OHˆÈ\ÖÌWK›ÝÙ\˜Ø\ÙY
+
+Hˆˆ‚ˆ]ÛX\™YHÈ›Ù™ˆ‹››Û™H‹[›[Z]Y‹Œ—K˜ÛÛZ[œÊ˜]ÊBˆÝÚ]ÚÙ^HÂˆØ\ÙH›[Z]Ë›X^ÙXÛÛ™ÈŽ‚ˆYˆÛX\™YÂˆ[Z]Ë›X^ÙXÛÛ™ÈHš[ˆH[ÙHYˆ]ÙXÛÛ™ÈH\œÙQ\˜][Û”ÙXÛÛ™Ê˜]ÊHÂˆ[Z]Ë›X^ÙXÛÛ™ÈHÙXÛÛ™ÂˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ•\ØYÙNˆÜÙ][Z]Ë›X^ÙXÛÛ™ÈÙ™ŸŸ›_šˆ
+Ø[XÛØÚÈ[YH\ˆ[ŠHŠBˆ™]\›‚ˆBˆØ\ÙH›[Z]Ë›X^Ý[ÚÙ[œÈŽ‚ˆYˆÛX\™YÂˆ[Z]Ë›X^Ý[ÚÙ[œÈHš[ˆH[ÙHYˆ]ÚÙ[œÈH\œÙUÚÙ[ÛÝ[
+˜]ÊKÚÙ[œÈˆÂˆ[Z]Ë›X^Ý[ÚÙ[œÈHÚÙ[œÂˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ][Z]Ë›X^Ý[ÚÙ[œÈÙ™ŸŸšÏˆ
+ÚÙ[œÈ\ˆ[ŠHŠBˆ™]\›‚ˆBˆY˜][‚ˆÝX\™]˜[YHH[
+˜]ÊK˜[YHH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ]
+Ù^JHˆ
+H›Û‹[™YØ]]™H[YÙ\ŠHŠBˆ™]\›‚ˆBˆÝÚ]ÚÙ^HÂˆØ\ÙH›[Z]Ë›X^ÛÛØ[ÈŽˆ[Z]Ë›X^ÛÛØ[ÈH˜[YBˆØ\ÙH›[Z]Ë›X^ÝX˜YÙ[ÈŽˆ[Z]Ë›X^ÝX˜YÙ[ÈH˜[YBˆØ\ÙH›[Z]Ë›X^ÝX˜YÙ[\Žˆ[Z]Ë›X^ÝX˜YÙ[\H˜[YBˆY˜][ˆ[Z]Ë›X^[Ù[\›œÈHX^
+K˜[YJBˆBˆBˆÙ\ÜÚ[Û‹œ›Ùš[K›[Z]ÈH[Z]ÂˆÙ\ÜÚ[Û‹ÝXÚ
+
+Bˆ]\YYH[Z]˜[YJÙ^K[Žˆ[Z]ÊBˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”]ˆ][™^H˜Y˜YÙ[Ë™š\œÝ[™^
+Ú\™NˆÈ	šYOHÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[QJBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J”Ù]
+Ù^JHH
+\YY
+H›Üˆ\ÈÚ]ˆŠBˆ™]\›‚ˆBˆ˜Y˜YÙ[ÖÚ[™^K›[Z]ÈH[Z]ÂˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ØZ]\›Z[˜[›[™J”Ù]
+Ù^JHH
+\YY
+H›ÜˆYÙ[	×
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+IËˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™Jˆ”Ù]
+Ù^JHH
+\YY
+H›Üˆ\ÈÚ]ÈÛÝ[›ÝØ]™HHÛÛ™šYÝ\˜][ÛŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ˆÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆËËÈ™]žK˜][\Ø™]žK™[^X[™Ý˜ÛÛ\XÝˆÚ]H[ˆÙ\ÈÚ[‚ˆËËÈH[Ù[Ø[˜Z[Ë[™Ú[ˆ]Ý[[X\š^™\È]ÈÝÛˆÛÛ™\œØ][Û‹ˆØ]™YˆËËÈÛˆHÚ]	ÜÈYÙ[ZÙHH[Z]Ë‚ˆš]˜]HÝ]XÈ[˜ÈÙ]™XÛÝ™\žTÙ][™ÊˆÈÙ^NˆÝš[™Ëˆ\ÎˆÔÝš[™×KˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ˜\ˆ™]žHHÙ\ÜÚ[Û‹œ›Ùš[Kœ™]žBˆ˜\ˆ]]ØÛÛ\XÝHÙ\ÜÚ[Û‹œ›Ùš[K˜]]ØÛÛ\XÝˆ[˜ÈÝ\œ™[
+
+HOˆÝš[™ÈÂˆÝÚ]ÚÙ^HÂˆØ\ÙHœ™]žK˜][\ÈŽˆÝš[™Ê™]žK˜][\ÊBˆØ\ÙHœ™]žK™[^HŽˆ\˜][Û”Ù][™Ê™]žK™[^TÙXÛÛ™ÊBˆY˜][ˆ]]ØÛÛ\XÝÙ][™Ê]]ØÛÛ\XÝ
+BˆBˆBˆÝX\™\Ë˜ÛÝ[ˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™J—
+Ù^JHH
+Ý\œ™[
+
+JHŠBˆ™]\›‚ˆBˆ]˜]ÈH\Ë˜ÛÝ[OHˆÈ\ÖÌWK›ÝÙ\˜Ø\ÙY
+
+Hˆˆ‚ˆÝÚ]ÚÙ^HÂˆØ\ÙHœ™]žK˜][\ÈŽ‚ˆÝX\™]˜[YHH[
+˜]ÊK˜[YHH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ]™]žK˜][\Èˆ
+˜Z[ÈÛˆHš\œÝ\œ›ÜŠHŠBˆ™]\›‚ˆBˆ™]žK˜][\ÈH˜[YBˆØ\ÙHœ™]žK™[^HŽ‚ˆYˆ]ÙXÛÛ™ÈHÝX›J˜]ÊKÙXÛÛ™ÈHÂˆ™]žK™[^TÙXÛÛ™ÈHÙXÛÛ™ÂˆH[ÙHYˆ]ÙXÛÛ™ÈH\œÙQ\˜][Û”ÙXÛÛ™Ê˜]ÊHÂˆ™]žK™[^TÙXÛÛ™ÈHÝX›JÙXÛÛ™ÊBˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ]™]žK™[^HÑPÓÓ‘È
+HØZ]™Y›Ü™HXXÚ™]žJHŠBˆ™]\›‚ˆBˆY˜][‚ˆYˆÈ›Ù™ˆ‹››Û™H‹Œ—K˜ÛÛZ[œÊ˜]ÊHÂˆ]]ØÛÛ\XÝÚÙ[œÈHˆH[ÙHYˆ]ÚÙ[œÈH\œÙUÚÙ[ÛÝ[
+˜]ÊKÚÙ[œÈˆÂˆ]]ØÛÛ\XÝÚÙ[œÈHÚÙ[œÂˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ•\ØYÙNˆÜÙ]Ý˜ÛÛ\XÝÙ™ŸŸšÏˆ
+Ý[[X\š^™HHÚ]Û˜ÙH]ÛÈX›Ý]ˆÚÙ[œÊHŠBˆ™]\›‚ˆBˆBˆÙ\ÜÚ[Û‹œ›Ùš[Kœ™]žHH™]žBˆÙ\ÜÚ[Û‹œ›Ùš[K˜]]ØÛÛ\XÝH]]ØÛÛ\XÝˆÙ\ÜÚ[Û‹ÝXÚ
+
+Bˆ˜\ˆ›Ý\ÎˆÔÝš[™×HH×BˆYˆÙ^HOH˜Ý˜ÛÛ\XÝ‹]]ØÛÛ\XÝš\Ñ[˜X›YÂˆ›Ý\Ë˜\[™
+ˆ“Û\ˆ^Ú[™Ù\È\™HÝ[[X\š^™Y™Y›Ü™HH[Ù[\›ˆÛ˜ÙHHÛÛ™\œØ][Ûˆ\È\Ý[X]Y]
+]]ØÛÛ\XÝÚÙ[œÊHÚÙ[œÎÈH™]Ù\Ý^Ú[™ÙH\ÈÙ\™\˜˜][Kˆ‚ˆ
+BˆBˆ]\YYHÝ\œ™[
+
+BˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”]ˆ][™^H˜Y˜YÙ[Ë™š\œÝ[™^
+Ú\™NˆÈ	šYOHÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[QJBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ
+È”Ù]
+Ù^JHH
+\YY
+H›Üˆ\ÈÚ]ˆ—H
+È›Ý\ÊKš›Ú[™Y
+Ù\\˜]ÜŽˆˆŠJBˆ™]\›‚ˆBˆ˜Y˜YÙ[ÖÚ[™^Kœ™]žHH™]žBˆ˜Y˜YÙ[ÖÚ[™^K˜]]ØÛÛ\XÝH]]ØÛÛ\XÝˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜Yˆ]ØZ]\›Z[˜[›[™Jˆ
+È”Ù]
+Ù^JHH
+\YY
+H›ÜˆYÙ[	×
+Ù\ÜÚ[Û‹œ›Ùš[K˜YÙ[Q
+IËˆ—H
+È›Ý\ÊBˆš›Ú[™Y
+Ù\\˜]ÜŽˆˆŠJBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™Jˆ”Ù]
+Ù^JHH
+\YY
+H›Üˆ\ÈÚ]ÈÛÝ[›ÝØ]™HHÛÛ™šYÝ\˜][ÛŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ˆÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È\Ý\ÙTÙ][™ÜÊÈ\ÙNˆÛÛ™šYÝ\™Y\ÙK\›Z[˜[ˆ\›Z[˜[Üš]\ŠH\Þ[˜ÈÂˆ]ØZ]\›Z[˜[›[™J\ÙK˜YÙ[ÛYH
+\ÙK˜YÙ[ÛYÈ›Ûˆˆˆ›Ù™ˆŠHŠBˆ]ØZ]\›Z[˜[›[™J\ÙKœ[ˆH
+\ÙKœ[ˆÈ›Ûˆˆˆ›Ù™ˆŠHŠBˆB‚ˆËËÈÜÙ]\ÙKœ[ˆÛÛŸÙ™—XˆÚÝÜÈÜˆÚ[™Ù\ÈÚ]\ˆ[ˆYÙ[]Ø[‚ˆËËÈÝ\Ú[™[ˆ\È\ÚÙYÈÜ[ˆH][K\Ý\™\]Y\ÝÚ]H[ˆ™Y›Ü™BˆËËÈ]Èš\œÝYÙ[ÜÝ\‚ˆš]˜]HÝ]XÈ[˜ÈÙ][›š[™Êˆ\ÎˆÔÝš[™×Kˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ][˜X›YHÛÛ™šYÝ\˜][ÛË\ÙKœ[ˆÏÈYBˆÝX\™\Ë˜ÛÝ[ˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™J\ÙKœ[ˆH
+[˜X›YÈ›Ûˆˆˆ›Ù™ˆŠHŠBˆ™]\›‚ˆBˆÝX\™\Ë˜ÛÝ[OH‹]Ø[YH›ÛÛX[”Ù][™Ê\ÖÌWJH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ]\ÙKœ[ˆÛŸÙ™ˆŠBˆ™]\›‚ˆBˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ˜Y\ÙKœ[ˆHØ[YˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜YˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ]ØZ][[YK˜ÛÛ™šYÝ\™T[›š[™ÊØ[Y
+Bˆ]ØZ]\›Z[˜[›[™Jˆ”Ù]\ÙKœ[ˆH
+Ø[YÈ›Ûˆˆˆ›Ù™ˆŠKˆ‚ˆ
+È
+Ø[YˆÈ[ˆYÙ[Ú]Ú[™[ˆÜ[œÈH™\]Y\ÝÙˆÙ]™\˜[Ý\ÈÚ]H[X™\™Y[‹ˆ‚ˆˆYÙ[È[YØ]HÚ]Ý][›š[™Èš\œÝˆŠJBˆB‚ˆËËÈÜÙ]\ÙK˜YÙ[ÛYÛÛŸÙ™—XˆÚÝÜÈÜˆÚ[™Ù\ÈÚ]\ˆHÛÜšÚ[™ÂˆËËÈ™YIÜÈQÑS•Ë›Yš[\ÈÛÈ[È]™\žH[‰ÜÈÞ\Ý[H›Û\[™Ø^\ÈÚXÚˆËËÈš[\È]YX[œÈœ›ÛH\™K‚ˆš]˜]HÝ]XÈ[˜ÈÙ]YÙ[ÓX\šÙÝÛŠˆ\ÎˆÔÝš[™×Kˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆÛÛ™šYÝ\˜][Û”]ˆÝš[™ÏËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]\™XÝÜžHHT“
+ˆš[UT“Ú]]ˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]\Ñ\™XÝÜžNˆYJBˆ]ØØ]YHYÙ[[œÝXÝ[ÛœÑš[K›ØØ]Jœ›ÛNˆ\™XÝÜžJBˆ][˜X›YHÛÛ™šYÝ\˜][ÛË\ÙK˜YÙ[ÛYÏÈ˜[ÙBˆÝX\™\Ë˜ÛÝ[ˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ\ÙK˜YÙ[ÛYH
+[˜X›YÈ›Ûˆˆˆ›Ù™ˆŠH0­È
+YÙ[ÓX\šÙÝÛ”Ý[[X\žJØØ]Y\™XÝÜžNˆ\™XÝÜžJJH‚ˆ
+Bˆ™]\›‚ˆBˆÝX\™\Ë˜ÛÝ[OH‹]Ø[YH›ÛÛX[”Ù][™Ê\ÖÌWJH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÙ]\ÙK˜YÙ[ÛYÛŸÙ™ˆŠBˆ™]\›‚ˆBˆÝX\™˜\ˆ˜YHÛÛ™šYÝ\˜][Û‹]ÛÛ™šYÝ\˜][Û”][ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™Kˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ˜Y\ÙK˜YÙ[ÛYHØ[YˆÈÂˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆÛÛ™šYÝ\˜][Û”]
+JBˆÛÛ™šYÝ\˜][ÛˆH˜YˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ]ØZ][[YK˜ÛÛ™šYÝ\™T›Ú™XÝ[œÝXÝ[ÛœÊˆØ[YÈYÙ[[œÝXÝ[ÛœÑš[Kœ›Û\ÙXÝ[ÛŠš[\ÎˆØØ]Y
+Hˆš[
+Bˆ]ØZ]\›Z[˜[›[™Jˆ”Ù]\ÙK˜YÙ[ÛYH
+Ø[YÈ›Ûˆˆˆ›Ù™ˆŠKˆ
+YÙ[ÓX\šÙÝÛ”Ý[[X\žJØØ]Y\™XÝÜžNˆ\™XÝÜžJJH‚ˆ
+BˆB‚ˆËËÈÚXÚQÑS•Ë›Yš[\È\Hœ›ÛH\™XÝÜžX\ÈÛ™H[™KXXÚ]ˆËËÈ™[]]™HÈ]ˆQÑS•Ë›Y‹‹ÐQÑS•Ë›Y[™ÛÈÛˆ\H™YK‚ˆš]˜]HÝ]XÈ[˜ÈYÙ[ÓX\šÙÝÛ”Ý[[X\žJÈš[\ÎˆÕT“K\™XÝÜžNˆT“
+HOˆÝš[™ÈÂˆÝX\™Yš[\Ëš\Ñ[\H[ÙHÂˆ™]\›ˆ“›ÈQÑS•Ë›Yœ›ÛH
+\™XÝÜžKœ]
+H\ÈH™\ÜÚ]ÜžH›ÛÝˆ‚ˆBˆ]˜\ÙHH\™XÝÜžKœÝ[™\™^™Yš[UT“œ]ÛÛ\Û™[Âˆ]˜[Y\ÈHš[\Ë›X\Èš[HOˆÝš[™È[‚ˆ]\™Ù]Hš[KœÝ[™\™^™Yš[UT“œ]ÛÛ\Û™[Âˆ]Ú\™YHš\
+˜\ÙK\™Ù]
+Kœ™Yš^È	OH	HK˜ÛÝ[ˆ]\ÈH\œ˜^J™\X][™Îˆ‹‹ˆ‹ÛÝ[ˆ˜\ÙK˜ÛÝ[HÚ\™Y
+Bˆ™]\›ˆ
+\È
+È\™Ù]™›Üš\œÝ
+Ú\™Y
+JKš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ÈŠBˆBˆ™]\›ˆQÑS•Ë›Yœ›ÛH\™H\ÈH™\ÜÚ]ÜžH›ÛÝˆ
+˜[Y\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJKˆ‚ˆB‚ˆËËÈHQÑS•Ë›Y›ØÚÈ›ÜˆHÛÜšÚ[™È\™XÝÜžKÚ[ˆ\ÙK˜YÙ[ÛY\ÈÛ‹‚ˆš]˜]HÝ]XÈ[˜È›Ú™XÝ[œÝXÝ[ÛœÔÙXÝ[ÛŠÈÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛÊHOˆÝš[™ÏÈÂˆÝX\™ÛÛ™šYÝ\˜][ÛË\ÙK˜YÙ[ÛYOHYH[ÙHÈ™]\›ˆš[Bˆ™]\›ˆYÙ[[œÝXÝ[ÛœÑš[Kœ›Û\ÙXÝ[ÛŠˆœ›ÛNˆT“
+š[UT“Ú]]ˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]\Ñ\™XÝÜžNˆYJJBˆB‚ˆš]˜]HÝ]XÈ[˜È\ÝRTÙ][™ÜÊÈZNˆÛÛ™šYÝ\™Y\›Z[˜[RK\›Z[˜[ˆ\›Z[˜[Üš]\ŠH\Þ[˜ÈÂˆ›ÜˆÙ^H[ˆÂˆZK]H‹ZK™Y]Üˆ‹ZK˜™Û[™H‹ZK™™ØÛÛÜˆ‹ZK˜™ØÛÛÜˆ‹ZK™™Ü›Û\‹ˆZK˜™Ü›Û\‹ZK˜›Û‹ˆZK™™ÝÛÛ™\Ý[‹ZK›X\šÙÝÛˆ‹ZKÛÛ™\Ý[[™\È‹ZKœÝX˜YÙ[È‹ZK[šÚ[™È‹ˆHÂˆ]ØZ]\›Z[˜[›[™J—
+Ù^JHH
+ZTÙ][™ÊÙ^K[ŽˆZJJHŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈZTÙ][™ÊÈÙ^NˆÝš[™Ë[ˆZNˆÛÛ™šYÝ\™Y\›Z[˜[RJHOˆÝš[™ÈÂˆ]˜[YNˆÝš[™ÂˆÝÚ]ÚÙ^K›ÝÙ\˜Ø\ÙY
+
+HÂˆØ\ÙHZK]HŽˆ˜[YHHš\ÚX›URU]JZK]JBˆËÈ[œÙ]\ÈÛÜÚÝÚ[™È\ÈÚ]]™\ÛÛ™\ÈËÚ[˜ÙH]\ÈHY]Ü‚ˆËÈ]XÝX[HÜ[œË‚ˆØ\ÙHZK™Y]ÜˆŽ‚ˆ™]\›ˆZK™Y]Ü‹š\Ñ[\HÈ—
+™\ÛÛ™YY]ÜŠ
+JH
+œ›ÛHH[š\›Û›Y[
+HˆˆZK™Y]Ü‚ˆØ\ÙHZK˜™Û[™HŽˆ˜[YHHZK˜˜XÚÙÜ›Ý[™[™BˆØ\ÙHZK™™ØÛÛÜˆŽˆ˜[YHHZK™›Ü™YÜ›Ý[™ˆØ\ÙHZK˜™ØÛÛÜˆŽˆ˜[YHHZK˜˜XÚÙÜ›Ý[™ˆØ\ÙHZK™™Ü›Û\Žˆ˜[YHHZKœ›Û\›Ü™YÜ›Ý[™ˆØ\ÙHZK˜™Ü›Û\Žˆ˜[YHHZKœ›Û\˜XÚÙÜ›Ý[™ˆØ\ÙHZK™™ÝÛÛ™\Ý[Žˆ˜[YHHZKÛÛ™\Ý[›Ü™YÜ›Ý[™ˆØ\ÙHZK˜›ÛŽˆ™]\›ˆZK˜›ÛÈ›Ûˆˆˆ›Ù™ˆ‚ˆØ\ÙHZK›X\šÙÝÛˆŽˆ™]\›ˆZK›X\šÙÝÛˆÈ›Ûˆˆˆ›Ù™ˆ‚ˆØ\ÙHZKÛÛ™\Ý[[™\ÈŽˆ™]\›ˆZKÛÛ™\Ý[[™\ÈÈ˜[ˆˆÝš[™ÊZKÛÛ™\Ý[[™\ÊBˆØ\ÙHZK[šÚ[™ÈŽˆ™]\›ˆZK[šÚ[™Ëœ˜]Õ˜[YBˆØ\ÙHZKœÝX˜YÙ[ÈŽˆ™]\›ˆZKœÝX˜YÙ[Ý]]œ˜]Õ˜[YBˆY˜][ˆ™]\›ˆ‹H‚ˆBˆ™]\›ˆ˜[YKš\Ñ[\HÈ››Û™Hˆˆ˜[YBˆB‚ˆš]˜]HÝ]XÈ[˜È›ÛÛX[”Ù][™ÊÈ˜[YNˆÝš[™ÊHOˆ›ÛÛÈÂˆÝÚ]Ú˜[YK›ÝÙ\˜Ø\ÙY
+
+HÂˆØ\ÙHŒH‹YH‹žY\È‹›ÛˆŽˆYBˆØ\ÙHŒ‹™˜[ÙH‹››È‹›Ù™ˆŽˆ˜[ÙBˆY˜][ˆš[ˆBˆB‚ˆËËÈÙ^Ü“Ô“PUÔUXÜš]\È\ÈÚ]\ÈHØÝ[Y[ÜˆÜš]\ÈBˆËËÈÜX›H\˜Ú]™HÛÛZ[š[™ÈHXÝ]™HÛÛ™šYÝ\˜][Û‹š\ÚX›HÚÚ[ËˆËËÈ[™Ý\œ™[Ú]ˆXZPÛÜ™HÝÛœÈH\˜Ú]™H›Ü›X]\ÙYžH›ÝÜÝË‚ˆš]˜]HÝ]XÈ[˜È[™Q^ÜÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆ›ØÙ\ÜÎˆYÙ[QËˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛËˆÚÚ[ÎˆYÙ[ÚÚ[Ø][ÙËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]šY[ÈH\™Ý[Y[œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+BˆÝX\™]š\œÝHšY[Ë™š\œÝ[ÙHÂˆ]ØZ]\›Z[˜[›[™J^Ü[
+Bˆ™]\›‚ˆBˆ˜\ˆÚ]HÙ\ÜÚ[Û‹˜Ú]ˆËÈHYÙ[ÈÙˆ\ÈÚ]	ÜÈ[œÈ\È^HÝ[™ˆÚ]H›ØÙ\ÜÈX›BˆËÈÛÈ›ÝË]™HÜˆš[š\ÚYÝ™\ˆÚ]Ø\ÈØ]™YÚ]HÚ]‚ˆYˆÚ]š\ÐÛÛ™\œØ][Û‹]›ØÙ\ÜÈÂˆÚ]œÝX˜YÙ[ÈHYÙ[›ØÙ\ÜÔ™XÛÜ™›Y\™Ú[™ÊˆØ]™YˆÚ]œÝX˜YÙ[ËÝ\œ™[ˆ]ØZ][[YKœÝ\\š\ÛÜ‹œ™XÛÜ™Ê[™\Žˆ›ØÙ\ÜÊJBˆBˆYˆÈ˜\˜Ú]™H‹œXÚÈ‹œÜX›H—K˜ÛÛZ[œÊš\œÝ›ÝÙ\˜Ø\ÙY
+
+JHÂˆÈÂˆ]\˜Ú]™HHXZP\˜Ú]™JˆÙ[™\˜]ÜŽˆœXZH‹ˆÙ][™ÜÎˆÛÛ™šYÝ\˜][Û‹›X\ÈXZP\˜Ú]™TÙ][™ÜÊÛÛ™šYÝ\˜][ÛŽˆ	
+HKˆÚ]ÎˆÚ]š\ÐÛÛ™\œØ][ÛˆÈØÚ]Hˆš[ˆÚÚ[ÎˆžHÚÚ[ËœÚÚ[Ë›X\ÈžHXZP\˜Ú]™TÚÚ[
+ÚÚ[ˆ	
+HJBˆ]š[[˜[YHBˆÚ]š\ÐÛÛ™\œØ][Û‚ˆÈ\˜Ú]™Qš[[˜[YJ›ÜŽˆÚ]
+Hˆ“XZKP\˜Ú]™K—
+XZP\˜Ú]™K™š[Q^[œÚ[ÛŠH‚ˆ]\™Ù]H^Ü\™Ù]
+ˆšY[Ë˜ÛÝ[ˆHÈšY[ÖÌWHˆš[Y˜][š[[˜[YNˆš[[˜[YJBˆ]]HHžH\˜Ú]™K™[˜ÛÙY
+
+BˆžH]KÜš]JÎˆ\™Ù]Ü[ÛœÎˆ˜]ÛZXÊBˆ]ØZ]\›Z[˜[›[™Jˆ‘^ÜYXZH\˜Ú]™H
+
+YÙ[›ØÙ\ÜÒ[™›Ë˜ÛÛ\XÝÛÝ[
+]K˜ÛÝ[
+JHž]\ÊHÈ
+\™Ù]œ]
+H‚ˆ
+BˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™Jˆ™\œ›ÜŽˆÛÝ[›Ý^Üˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆ™]\›‚ˆBˆÝX\™]›Ü›X]HÚ]^Ü›Ü›X]
+\™Ý[Y[ˆš\œÝ
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J^Ü[
+Bˆ™]\›‚ˆBˆÝX\™Ú]š\ÐÛÛ™\œØ][Ûˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J“›Ý[™ÈÈ^ÜY]ˆ\ÈÚ]\È›ÈY\ÜØYÙ\ËˆŠBˆ™]\›‚ˆBˆ˜\ˆXYÎˆÚ]^ÜXYÏÂˆYˆ›Ü›X]OH™XYÈÂˆ]›Ùš[HHÙ\ÜÚ[Û‹œ›Ùš[Bˆ]ÛÛÈH]ØZ][[YK˜]˜Z[X›UÛÛÊ
+K™š[\ˆÈ›Ùš[KÛÛ˜[Y\Ë˜ÛÛZ[œÊ	›˜[YJHBˆ]›ÝšY\ˆH]ØZ][[YK˜]˜Z[X›T›ÝšY\œÊ
+K™š\œÝÈ	šYOH›Ùš[Kœ›ÝšY\ˆBˆXYÈHÚ]^ÜXYÊˆ›ÝšY\Žˆ›Ùš[Kœ›ÝšY\‹œ˜]Õ˜[YKˆ›ÝšY\‘\Ü^S˜[YNˆ›ÝšY\Ë™\Ü^S˜[YKˆÛÛYš[š][ÛœÎˆÛÛËˆÙ][™ÜÎˆÂˆÛÜšÚ[™Ñ\™XÝÜžHŽˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]ˆÛÛØ[[™ÔÝ˜]YÞHŽˆ›Ùš[KÛÛØ[[™ÔÝ˜]YÞKœ˜]Õ˜[YKˆÛÛ[YØ][ÛˆŽˆ›Ùš[KÛÛ[YØ][Û‹œ˜]Õ˜[YKˆ\ÙUÛÛ›ÞHŽˆ›Ùš[K\ÙUÛÛ›ÞHÈYHˆˆ™˜[ÙH‹ˆœ›ÞQ^ÜÙYÛÛÈŽˆ›Ùš[Kœ›ÞQ^ÜÙYÛÛË›X\È	œÛÜY
+
+Kš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠHBˆÏÈ™Y˜][‹ˆœÝX˜YÙ[˜[Y\ÈŽˆ›Ùš[KœÝX˜YÙ[˜[Y\ËœÛÜY
+
+Kš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠKˆ›[Z]Ë›X^ÛÛØ[ÈŽˆÝš[™Ê›Ùš[K›[Z]Ë›X^ÛÛØ[ÊKˆ›[Z]Ë›X^[Ù[\›œÈŽˆÝš[™Ê›Ùš[K›[Z]Ë›X^[Ù[\›œÊKˆ›[Z]Ë›X^ÝX˜YÙ[ÈŽˆÝš[™Ê›Ùš[K›[Z]Ë›X^ÝX˜YÙ[ÊKˆ›[Z]Ë›X^ÝX˜YÙ[\ŽˆÝš[™Ê›Ùš[K›[Z]Ë›X^ÝX˜YÙ[\
+Kˆ›[Z]Ë›X^Ý[ÚÙ[œÈŽˆ[Z]˜[YJ›[Z]Ë›X^Ý[ÚÙ[œÈ‹[Žˆ›Ùš[K›[Z]ÊKˆ›[Z]Ë›X^ÙXÛÛ™ÈŽˆ[Z]˜[YJ›[Z]Ë›X^ÙXÛÛ™È‹[Žˆ›Ùš[K›[Z]ÊKˆœ™]žK˜][\ÈŽˆÝš[™Ê›Ùš[Kœ™]žK˜][\ÊKˆœ™]žK™[^HŽˆ\˜][Û”Ù][™Ê›Ùš[Kœ™]žK™[^TÙXÛÛ™ÊKˆ˜Ý˜ÛÛ\XÝŽˆ]]ØÛÛ\XÝÙ][™Ê›Ùš[K˜]]ØÛÛ\XÝ
+Kˆ˜ÝœÝ˜]YÞHŽˆ›Ùš[K˜ÛÛ^œ˜]Õ˜[YKˆKˆÝX˜YÙ[ÎˆÚ]œÝX˜YÙ[ÊBˆBˆ]\™Ù]H^Ü\™Ù]
+ˆšY[Ë˜ÛÝ[ˆHÈšY[ÖÌWHˆš[ˆY˜][š[[˜[YNˆÚ]^Ü™š[[˜[YJ›ÜŽˆÚ]›Ü›X]ˆ›Ü›X]
+JBˆÈÂˆ]]HHžHÚ]^Ü™]J›ÜŽˆÚ]›Ü›X]ˆ›Ü›X]Ù[™\˜]ÜŽˆœXZH‹XYÎˆXYÊBˆžH]KÜš]JÎˆ\™Ù]Ü[ÛœÎˆ˜]ÛZXÊBˆ]ØZ]\›Z[˜[›[™Jˆ‘^ÜY
+›Ü›X]™\Ü^S˜[YJH
+
+YÙ[›ØÙ\ÜÒ[™›Ë˜ÛÛ\XÝÛÝ[
+]K˜ÛÝ[
+JHž]\ÊHÈ
+\™Ù]œ]
+H‚ˆ
+BˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™Jˆ™\œ›ÜŽˆÛÝ[›Ý^Üˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È^Ü\™Ù]
+È]ˆÝš[™ÏËY˜][š[[˜[YNˆÝš[™ÊHOˆT“Âˆ]Ý\œ™[HT“
+š[UT“Ú]]ˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]\Ñ\™XÝÜžNˆYJBˆÝX\™]][ÙHÈ™]\›ˆÝ\œ™[˜\[™[™Ô]ÛÛ\Û™[
+Y˜][š[[˜[YJHBˆ]˜]ÈH]š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆ]^[™YH”ÔÝš[™ÊÝš[™Îˆ˜]ÊK™^[™[™Õ[R[”]ˆ˜\ˆ\™Ù]HT“
+š[UT“Ú]]ˆ^[™Y™[]]™UÎˆÝ\œ™[
+KœÝ[™\™^™Yš[UT“ˆ˜\ˆ\Ñ\™XÝÜžNˆØšÐ›ÛÛH˜[ÙBˆ]^\ÝÈHš[SX[˜YÙ\‹™Y˜][™š[Q^\ÝÊ]]ˆ\™Ù]œ]\Ñ\™XÝÜžNˆ	š\Ñ\™XÝÜžJBˆYˆ˜]Ëš\ÔÝY™š^
+‹ÈŠH
+^\ÝÈ	‰ˆ\Ñ\™XÝÜžK˜›ÛÛ˜[YJHÂˆžOÈš[SX[˜YÙ\‹™Y˜][˜Ü™X]Q\™XÝÜžJ]ˆ\™Ù]Ú][\›YYX]Q\™XÝÜšY\ÎˆYJBˆ\™Ù]˜\[™]ÛÛ\Û™[
+Y˜][š[[˜[YJBˆBˆ™]\›ˆ\™Ù]ˆB‚ˆš]˜]HÝ]XÈ[˜È\˜Ú]™Qš[[˜[YJ›ÜˆÚ]ˆYÙ[Ú]
+HOˆÝš[™ÈÂˆ]œÛÛˆHÚ]^Ü™š[[˜[YJ›ÜŽˆÚ]›Ü›X]ˆšœÛÛŠBˆ™]\›ˆÝš[™ÊœÛÛ‹™›Ü\Ý
+‹šœÛÛˆ‹˜ÛÝ[
+JH
+È‹ˆˆ
+ÈXZP\˜Ú]™K™š[Q^[œÚ[Û‚ˆB‚ˆËËÈ[\ÜÈHXZH\˜Ú]™H
+Ý[™[Û™HÜˆ[X™YY[ˆHØÚÙ]XZH˜XÚÝ\
+K‚ˆËËÈÛ\ˆXZH”ÓÓˆÚ]^ÜÈ™[XZ[ˆ˜[Y[œ]È\ÈHÛÛ™[šY[˜ÙK‚ˆš]˜]HÝ]XÈ[˜È[™R[\ÜÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆÛÜšÜÜXÙNˆ[›Ý]YÙ[Ú]ÛÜšÜÜXÙKˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆØ][ÙÜÎˆ[›Ý]ÓPÔÙ\™\Ø][Ù×Kˆš\ÝX[ˆš\ÝX[œšYÙKˆÙ[XÝ[\ÜYÚ]ˆ›ÛÛˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™X\™Ý[Y[š\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J[\Ü[
+Bˆ™]\›‚ˆBˆ]^[™YH”ÔÝš[™ÊÝš[™Îˆ\™Ý[Y[
+K™^[™[™Õ[R[”]ˆ]Ý\œ™[HT“
+š[UT“Ú]]ˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]\Ñ\™XÝÜžNˆYJBˆ]\›HT“
+š[UT“Ú]]ˆ^[™Y™[]]™UÎˆÝ\œ™[
+KœÝ[™\™^™Yš[UT“ˆÈÂˆ]\˜Ú]™HHžH[\Ü\˜Ú]™Jœ›ÛNˆ]JÛÛ[ÓÙŽˆ\›
+JBˆ]Ý[[X\žHHžH]ØZ]\R[\ÜY\˜Ú]™Jˆ\˜Ú]™KˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆÛÜšÜÜXÙNˆ	ÛÜšÜÜXÙKˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆØ][ÙÜÎˆ	˜Ø][ÙÜËˆš\ÝX[ˆš\ÝX[ˆÙ[XÝ[\ÜYÚ]ˆÙ[XÝ[\ÜYÚ]ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ]ØZ]\›Z[˜[›[™J’[\ÜY
+Ý[[X\žKš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJHœ›ÛH
+\›œ]
+KˆŠBˆYˆ\Ù[XÝ[\ÜYÚ]\˜Ú]™K˜Ú]ÏËš\Ñ[\HOH˜[ÙHÂˆ]ØZ]\›Z[˜[›[™J•HÝ\œ™[\›ˆÙ\]ÈÚ]ÈØÚ]\ÝÚÝÜÈH[\ÜYÚ]ËˆŠBˆBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™Jˆ™\œ›ÜŽˆÛÝ[›Ý[\Üˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È[\Ü\˜Ú]™Jœ›ÛH]Nˆ]JH›ÝÜÈOˆXZP\˜Ú]™HÂˆÈÂˆ™]\›ˆžHXZP\˜Ú]™K™XÛÙJœ›ÛNˆ]JBˆHØ]Ú]\˜Ú]™Q\œ›ÜˆÂˆ]XÛÙ\ˆHXZR”ÓÓÛÙ[™Ë™Y˜][›XZÙQXÛÙ\Š
+BˆÝX\™][™[ÜHHžOÈXÛÙ\‹™XÛÙJÚ]^Ü[™[ÜKœÙ[‹œ›ÛNˆ]JKˆ[™[ÜK™›Ü›X]OHÚ]^Ü[™[ÜK™›Ü›X]ˆ[™[ÜK™\œÚ[ÛˆOHBˆ[ÙHÈ›ÝÈ\˜Ú]™Q\œ›ÜˆBˆ™]\›ˆXZP\˜Ú]™JˆÙ[™\˜]ÜŽˆ[™[ÜK™Ù[™\˜]Ü‹^ÜY]ˆ[™[ÜK™^ÜY]Ú]ÎˆÙ[™[ÜK˜Ú]JBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È\R[\ÜY\˜Ú]™JˆÈ\˜Ú]™NˆXZP\˜Ú]™KˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆÛÜšÜÜXÙNˆ[›Ý]YÙ[Ú]ÛÜšÜÜXÙKˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆØ][ÙÜÎˆ[›Ý]ÓPÔÙ\™\Ø][Ù×Kˆš\ÝX[ˆš\ÝX[œšYÙKˆÙ[XÝ[\ÜYÚ]ˆ›ÛÛˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜È›ÝÜÈOˆÔÝš[™×HÂˆ˜\ˆÝ[[X\žNˆÔÝš[™×HH×Bˆ˜\ˆ[\ÜYÛÛ™šYÝ\˜][ÛˆHÛÛ™šYÝ\˜][Û‚ˆYˆ]Ù][™ÜÈH\˜Ú]™KœÙ][™ÜÈÂˆÝX\™]]Hš\ÝX[˜ÛÛ™šYÝ\˜][Û”][ÙHÂˆ›ÝÈ\˜Ú]™R[\Ü\œ›Ü‹˜ÛÛ™šYÝ\˜][Û•[˜]˜Z[X›BˆBˆ˜\ˆ˜YHÛÛ™šYÝ\˜][ÛˆÏÈXZPÛÛ™šYÝ\˜][ÛŠ
+Bˆ]Y\™ÙYHžH˜Y›Y\™ÙP\˜Ú]™TÙ][™ÜÊÙ][™ÜÊBˆžH˜YœØ]™JÎˆT“
+š[UT“Ú]]ˆ]
+JBˆ[\ÜYÛÛ™šYÝ\˜][ÛˆH˜YˆÛÛ™šYÝ\˜][ÛˆH˜YˆÝ[[X\žK˜\[™
+ÛÛ[ÓÙŽˆ\˜Ú]™TÙ][™ÜÔÝ[[X\žJY\™ÙY
+JBˆB‚ˆYˆ]ÚÚ[ÈH\˜Ú]™KœÚÚ[ÈÂˆ›ÜˆÚÚ[[ˆÚÚ[ÈÈžHÚÚ[š[œÝ[
+[Žˆš\ÝX[œÚÚ[Ë\Ù\‘\™XÝÜžJHBˆÈH]ØZ]Þ[˜Ú›Ûš^™TÚÚ[ÛÛÊ[[YNˆ[[YKÝ]Nˆš\ÝX[œÚÚ[ÊBˆÝ[[X\žK˜\[™
+—
+ÚÚ[Ë˜ÛÝ[
+HÚÚ[
+ÚÚ[Ë˜ÛÝ[OHHÈˆˆˆœÈŠHŠBˆB‚ˆYˆ]Ù][™ÜÈH\˜Ú]™KœÙ][™ÜË]˜YH[\ÜYÛÛ™šYÝ\˜][ÛˆÂˆ]ØZ]™[ØY[\ÜYÙ][™ÜÊˆÙ][™ÜËˆÛÛ™šYÝ\˜][ÛŽˆ˜YˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆØ][ÙÜÎˆ	˜Ø][ÙÜËˆ›ÝšY\˜\ÙUT“Îˆš\ÝX[œ›ÝšY\˜\ÙUT“Ëˆ\›Z[˜[ˆ\›Z[˜[
+BˆB‚ˆYˆ]Ú]ÈH\˜Ú]™K˜Ú]ÈÂˆ˜\ˆ^\Ý[™ÒQÈHÙ]
+ÛÜšÜÜXÙK˜Ú]Ë›X\
+šY
+JBˆ˜\ˆš\œÝ[\ÜYˆYÙ[Ú]Âˆ›Üˆ˜\ˆÚ][ˆÚ]ÈÂˆYˆ^\Ý[™ÒQË˜ÛÛZ[œÊÚ]šY
+HÂˆÚ]šYHURQ
+
+BˆÚ]œÙ\ÜÚ[Û’QHÚ]Ù\ÜÚ[Û‹›™]ÒQ
+
+BˆBˆÚ[HY^\Ý[™ÒQËš[œÙ\
+Ú]šY
+Kš[œÙ\YÈÚ]šYHURQ
+
+HBˆÛÜšÜÜXÙK\Ù\
+Ú]
+BˆYˆš\œÝ[\ÜYOHš[Èš\œÝ[\ÜYHÚ]BˆBˆYˆÙ[XÝ[\ÜYÚ]]š\œÝ[\ÜYÂˆÛÜšÜÜXÙKœÙ[XÝÚ]
+Yˆš\œÝ[\ÜYšY
+BˆÙ\ÜÚ[ÛˆH‘TÙ\ÜÚ[ÛŠÚ]ˆš\œÝ[\ÜY
+BˆBˆÝ[[X\žK˜\[™
+—
+Ú]Ë˜ÛÝ[
+HÚ]
+Ú]Ë˜ÛÝ[OHHÈˆˆˆœÈŠHŠBˆBˆ™]\›ˆÝ[[X\žKš\Ñ[\HÈÈ››Ý[™È—HˆÝ[[X\žBˆB‚ˆš]˜]HÝ]XÈ[˜È\˜Ú]™TÙ][™ÜÔÝ[[X\žJÈÝ[[X\žNˆXZP\˜Ú]™SY\™ÙTÝ[[X\žJHOˆÔÝš[™×HÂˆÂˆ
+Ý[[X\žKœ›ÝšY\œËœ›ÝšY\ˆŠKˆ
+Ý[[X\žKœ›Û\Ëœ›Û\ŠKˆ
+Ý[[X\žK›XÜÙ\™\œË“PÔÙ\™\ˆŠKˆ
+Ý[[X\žK˜YÙ[Ë˜YÙ[ŠKˆK˜ÛÛ\XÝX\È][H[‚ˆ]
+ÛÝ[˜[YJHH][Bˆ™]\›ˆÛÝ[OHÈš[ˆ—
+ÛÝ[
+H
+˜[YJW
+ÛÝ[OHHÈˆˆˆœÈŠH‚ˆBˆB‚ˆš]˜]HÝ]XÈ[˜È™[ØY[\ÜYÙ][™ÜÊˆÈ[\ÜYˆXZP\˜Ú]™TÙ][™ÜËˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][Û‹ˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆØ][ÙÜÎˆ[›Ý]ÓPÔÙ\™\Ø][Ù×Kˆ›ÝšY\˜\ÙUT“Îˆ›ÝšY\˜\ÙUT“ÝÜ™Kˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ][š\›Û›Y[H›ØÙ\ÜÒ[™›Ëœ›ØÙ\ÜÒ[™›Ë™[š\›Û›Y[ˆ›Üˆ™\]Y\ÝY[ˆ[\ÜYœ›ÝšY\œÈÏÈ×HÂˆÝX\™]›ÝšY\ˆHÛÛ™šYÝ\˜][Û‹œ›ÝšY\œË™š\œÝ
+Ú\™NˆÈ	šYOH™\]Y\ÝYšYJH[ÙHÂˆÛÛ[YBˆBˆÈÂˆžH]ØZ][[YKœ™YÚ\Ý\ŠˆYÚ[œË›XZÙT›ÝšY\Šœ›ÛNˆ›ÝšY\‹[š\›Û›Y[ˆ[š\›Û›Y[
+K™\XÚ[™Ñ^\Ý[™ÎˆYJBˆYˆ]\›H›ÝšY\‹˜˜\ÙUT“È›ÝšY\˜\ÙUT“ËœÙ]
+\››ÜŽˆ›ÝšY\‹šY
+HBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™JˆØ\›š[™Îˆ›ÝšY\ˆ	×
+›ÝšY\‹šY
+IÈØ\ÈØ]™Y]ÛÝ[›Ý™HØYYˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ˆÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆ›Üˆ™\]Y\ÝY[ˆ[\ÜY›XÜÙ\™\œÈÏÈ×HÂˆÝX\™]Ù\™\ˆHÛÛ™šYÝ\˜][Û‹›XÜÙ\™\œË™š\œÝ
+Ú\™NˆÈ	šYOH™\]Y\ÝYšYJH[ÙHÂˆÛÛ[YBˆBˆÈH]ØZ][[YK[œ™YÚ\Ý\“PÔ
+Ù\™\’QˆÙ\™\‹šY
+BˆØ][ÙÜËœ™[[Ý™P[È	œÙ\™\’QOHÙ\™\‹šYBˆÝX\™Ù\™\‹™[˜X›Y[ÙHÈÛÛ[YHBˆÈÂˆ]ÛÝ\˜ÙHHžH]ØZ]YÚ[œË›XZÙSPÔÛÛÛÝ\˜ÙJˆÚ[™ˆÙ\™\‹šÚ[™ÛÛ™šYÝ\˜][ÛŽˆÙ\™\‹[š\›Û›Y[ˆ[š\›Û›Y[
+BˆØ][ÙÜË˜\[™
+žH]ØZ][[YKœ™YÚ\Ý\ŠXÜˆÛÝ\˜ÙJJBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™JˆØ\›š[™ÎˆPÔÙ\™\ˆ	×
+Ù\™\‹šY
+IÈØ\ÈØ]™Y]ÛÝ[›ÝÛÛ›™XÝˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ˆÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆ]ØZ][[YK˜ÛÛ™šYÝ\™Q[YØ][ÛŠˆ›Û\ˆÛÛ™šYÝ\˜][Û‹œ›Û\ÏË™[YØ][Û‹ˆÛÜšÙ\’[œÝXÝ[ÛœÎˆÛÛ™šYÝ\˜][Û‹œ›Û\ÏËÛÜšÙ\ŠBˆ]ØZ][[YK˜ÛÛ™šYÝ\™PÛÛ\XÝ[ÛŠ›Û\ˆÛÛ™šYÝ\˜][Û‹œ›Û\ÏË˜ÛÛ\XÝ
+Bˆ]Û›ÝÛ•ÛÛÈHÙ]
+]ØZ][[YK˜]˜Z[X›UÛÛÊ
+K›X\
+›˜[YJJBˆ›Üˆ™\]Y\ÝY[ˆ[\ÜY˜YÙ[ÈÏÈ×HÂˆÝX\™˜\ˆYÙ[HÛÛ™šYÝ\˜][Û‹˜YÙ[Ë™š\œÝ
+Ú\™NˆÈ	šYOH™\]Y\ÝYšYJH[ÙHÂˆÛÛ[YBˆBˆYÙ[ÛÛ˜[Y\Ë™›Ü›R[\œÙXÝ[ÛŠÛ›ÝÛ•ÛÛÊBˆÈÂˆžH]ØZ][[YKœ™YÚ\Ý\ŠYÙ[ˆYÙ[™\XÚ[™Ñ^\Ý[™ÎˆYJBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™JˆØ\›š[™ÎˆYÙ[	×
+YÙ[šY
+IÈØ\ÈØ]™Y]ÛÝ[›Ý™HØYYˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ˆÎˆœÝ[™\™\œ›ÜŠBˆBˆBˆYˆ]YÙ[HÛÛ™šYÝ\˜][Û‹˜YÙ[Ë™š\œÝ
+Ú\™NˆÈ	šYOHÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[QJHÂˆžOÈ\QYš[š][ÛŠYÙ[Îˆ	œÙ\ÜÚ[ÛŠBˆBˆB‚ˆš]˜]H[[H\˜Ú]™R[\Ü\œ›ÜŽˆØØ[^™Y\œ›ÜˆÂˆØ\ÙHÛÛ™šYÝ\˜][Û•[˜]˜Z[X›B‚ˆ˜\ˆ\œ›Ü‘\ØÜš\[ÛŽˆÝš[™ÏÈÂˆ“›ÈÜš]X›HÛÛ™šYÝ\˜][Ûˆ\ÈXÝ]™NÈÚ]È[™ÚÚ[ÈÙ\™H›Ý[\ÜYˆ‚ˆBˆB‚ˆËËÈÜÝ]ØˆH\ØYÙHYÙ\ˆH[[YHš[ÈY\ˆ]™\žH[Ù[Ø[ˆËËÈš[Y\ÈÛ™HÛÛÜ™Y˜\ˆ\ˆ›ÝšY\Ž›[Ù[›ÜˆHÛÛXš[™Y˜[šÚ[™ËˆËËÈÜYY[YH[ˆ\ÙK[™Y™šXÚY[˜ÞKˆÜÝ]ÈQU’PØÚÝÜÈÛ™H˜[šÚ[™ÎÈÜÝ]ÈÚÝÈT‘ÑUˆËËÈ]™\žH˜XÝ™XÛÜ™YX›Ý]H[Ù[ÜˆH›ÝšY\‹‚ˆš]˜]HÝ]XÈ[˜È[™TÝ]ÐÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÝÜ™Nˆ[Ù[\ØYÙTÝÜ™Kˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]šY[ÈH\™Ý[Y[œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+Bˆ]XÝ[ÛˆHšY[Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+HÏÈˆ‚ˆ]\™Ù]HšY[Ë˜ÛÝ[ˆHÈšY[ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\ÊHˆˆ‚ˆ[˜Èš[™\Ü
+ÈY]šXÜÎˆÓ[Ù[\ØYÙT™\Ü“Y]šX×JH\Þ[˜ÈÂˆ]™\ÜH[Ù[\ØYÙT™\Ü
+]ØZ]ÝÜ™K›YÙ\ŠBˆ]ÛÛÜœÈH]ØZ]\›Z[˜[œZ[ÓÝ]]ˆËÈXY[™ÜÈ[ˆHÞX[ˆÙˆ8§$ÈÛÚØX™[[™˜\ˆ[ˆH›ÝšY\‰ÜÂˆËÈ[]HÛÛÜ‹H[X™\ˆ›ÛH™\Ý[K‚ˆ][™\ÈH™\Ü›[™\ÊÚYˆ\›Z[˜[[™QY]Ü‹\›Z[˜[ÛÛ[[œÊ
+KY]šXÜÎˆY]šXÜÊHÂˆ^Ý[H[‚ˆÝX\™ÛÛÜœÈ[ÙHÈ™]\›ˆ^Bˆ]ÛÙNˆÝš[™ÂˆÝÚ]ÚÝ[HÂˆØ\ÙHšXY[™ÎˆÛÙHHŒNÌÍˆ‚ˆØ\ÙHšXY[™NˆÛÙHHŒÍˆ‚ˆØ\ÙH›X™[
+]ÛÛÜŠK˜˜\Š]ÛÛÜŠN‚ˆÝX\™]ÛÛÜÛÙHH\›Z[˜[[™QY]Ü‹™›Ü™YÜ›Ý[™ÛÛÜÛÙJÛÛÜ‹š^
+H[ÙHÂˆ™]\›ˆ^ˆBˆÛÙHHÛÛÜÛÙBˆØ\ÙH˜[YNˆÛÙHHŒH‚ˆØ\ÙH™]Z[››ÝNˆÛÙHHŒˆ‚ˆBˆ™]\›ˆ—^ÌPŸV×
+ÛÙJ[W
+^
+W^ÌPŸVÌH‚ˆBˆ]ØZ]\›Z[˜[›[™J[™\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ—ˆŠJBˆYˆ]\œ›ÜˆH]ØZ]ÝÜ™K›\Ý\œÚ\Ý[˜ÙQ\œ›ÜˆÂˆ]ØZ]\›Z[˜[›[™JˆØ\›š[™ÎˆÝ]\ÝXÜÈÛÝ[›Ý™HØ]™Yˆ
+\œ›ÜŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆBˆYˆ]Y]šXÈH[Ù[\ØYÙT™\Ü“Y]šXË›˜[YY
+XÝ[ÛŠHÂˆ]ØZ]š[™\Ü
+ÛY]šX×JBˆ™]\›‚ˆBˆÝÚ]ÚXÝ[ÛˆÂˆØ\ÙHˆ‹›\ÝŽ‚ˆ]ØZ]š[™\Ü
+[Ù[\ØYÙT™\Ü“Y]šXË™\Ü^PØ\Ù\ÊBˆØ\ÙHœÚÝÈŽ‚ˆÝX\™]\™Ù]š\Ñ[\H[ÙHÂˆ]ØZ]š[™\Ü
+[Ù[\ØYÙT™\Ü“Y]šXË™\Ü^PØ\Ù\ÊBˆ™]\›‚ˆBˆ]›ÝÜÈH]ØZ]ÝÜ™K›YÙ\‹Ý[ÊX]Ú[™Îˆ\™Ù]
+BˆÝX\™\›ÝÜËš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J›ÔÝ]\ÝXÜÓY\ÜØYÙJ›ÜŽˆ\™Ù]
+JBˆ™]\›‚ˆBˆ]ØZ]\›Z[˜[›[™Jˆ›ÝÜË›X\È›ÝÈ[‚ˆ
+Ü›ÝË]WH
+È›ÝË™]Z[[™\Ë›X\Èˆˆ
+È	JKš›Ú[™Y
+Ù\\˜]ÜŽˆ—ˆŠBˆKš›Ú[™Y
+Ù\\˜]ÜŽˆ—ˆŠJBˆØ\ÙHœ™\Ù]‹˜ÛX\ˆŽ‚ˆ]ØZ]ÝÜ™Kœ™\Ù]
+
+Bˆ]ØZ]\›Z[˜[›[™J•\ØYÙHÝ]\ÝXÜÈ™\Ù]ˆŠBˆØ\ÙHœ›H‹œ™[[Ý™H‹™[]H‹™›Ü™Ù]Ž‚ˆÝX\™]\™Ù]š\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜÝ]È›H“Õ’QT–Î“SÑSHŠBˆ™]\›‚ˆBˆÝÚ]Ú]ØZ]ÝÜ™Kœ™[[Ý™JX]Ú[™Îˆ\™Ù]
+HÂˆØ\ÙHˆ]ØZ]\›Z[˜[›[™J›ÔÝ]\ÝXÜÓY\ÜØYÙJ›ÜŽˆ\™Ù]
+JBˆØ\ÙHNˆ]ØZ]\›Z[˜[›[™J”™[[Ý™YHÝ]\ÝXÜÈÙˆ	×
+\™Ù]
+IËˆŠBˆØ\ÙH]ÛÝ[‚ˆ]ØZ]\›Z[˜[›[™Jˆ”™[[Ý™YHÝ]\ÝXÜÈÙˆ
+ÛÝ[
+H[Ù[ÈÙˆ›ÝšY\ˆ	×
+\™Ù]
+IËˆŠBˆBˆØ\ÙHœ]Ž‚ˆ]ØZ]\›Z[˜[›[™Jˆ]ØZ]ÝÜ™K›ØØ][ÛËœ]ÏÈ”Ý]\ÝXÜÈ\™HÙ\[ˆY[[ÜžH›Üˆ\ÈÙ\ÜÚ[ÛˆÛ›KˆŠBˆØ\ÙHš[Ž‚ˆ]ØZ]\›Z[˜[›[™JÝ]Ò[
+BˆY˜][‚ˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆÜÝ]ÈXÝ[Ûˆ	×
+XÝ[ÛŠIË—ˆˆ
+ÈÝ]Ò[
+BˆBˆB‚ˆš]˜]HÝ]XÈ[˜È›ÔÝ]\ÝXÜÓY\ÜØYÙJ›Üˆ\™Ù]ˆÝš[™ÊHOˆÝš[™ÈÂˆ“›ÈÝ]\ÝXÜÈ›Üˆ	×
+\™Ù]
+IËˆÜÝ]È\ÝÈH›ÝšY\Ž›[Ù[Z\œËˆ‚ˆB‚ˆš]˜]HÝ]XÈ]Ý]Ò[Hˆˆ‚ˆÝ]\ÝXÜÈÛÛ[X[™Î‚ˆÜÝ]È˜[šÈ]™\žH›ÝšY\Ž›[Ù[žHÛÛXš[™Y˜[šÚ[™ËÚÙ[œËÜË[YH[ˆ\ÙK[™Y™šXÚY[˜ÞBˆÜÝ]ÈQU’PÈÛ™H˜[šÚ[™Îˆ˜[šÚ[™ËÜYY[YKÜˆY™šXÚY[˜ÞBˆÜÝ]ÈÚÝÈ“Õ’QT–Î“SÑSH]™\žH˜XÝ™XÛÜ™YX›Ý]Û™H[Ù[ÜˆHÚÛH›ÝšY\‚ˆÜÝ]È›H“Õ’QT–Î“SÑSH›ÜHÝ]\ÝXÜÈÙˆÛ™H[Ù[ÜˆHÚÛH›ÝšY\‚ˆÜÝ]È™\Ù]›Ü™Ù]]™\žHÝ]\ÝXÂˆÜÝ]È]š[Hš[HHÝ]\ÝXÜÈ\™HØ]™Y[‚ˆH[[YH™XÛÜ™ÈÚÙ[œÈ
+œ›ÛHH›ÝšY\‰ÜÈ\ØYÙKÜˆ\Ý[X]Yœ›ÛH^ˆ[™Ý[™X\šÙYŠH[™HØ[XÛØÚÈ[YHÙˆ]™\žH[Ù[Ø[[ˆH‘TˆÛ™K\ÚÝ[œË[™Hš\ÝX[ÛÜšÜÜXÙH[ZÙKˆÜYY\Èš\ÚX›HÝ]]ÚÙ[œÂˆÝ™\ˆHÝ™X[Z[™ÈÚ[™ÝÎÈ[YH[ˆ\ÙHYÈHØZ]›ÜˆHš\œÝÚÙ[ŽÂˆY™šXÚY[˜ÞH\ÈÝ[ÚÙ[œÈÈ
+ÙXÛÛ™È[ˆ\ÙH0åÈ™\]Y\ÝÊK‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]^Ü[Hˆˆ‚ˆ^Ü\ÈÚ]\ÈHØÝ[Y[ÜˆXZÙHHÜX›HXZH\˜Ú]™N‚‚ˆÙ^Ü\˜Ú]™HÔUH›ÝšY\œË›Û\ËPÔËYÙ[Ëš\ÚX›HÚÚ[Ëˆ[™\ÈÚ]
+œØÚÙ]XZKšœÛÛŠBˆÙ^ÜX\šÙÝÛˆÔUHHX\šÙÝÛˆ˜[œØÜš\
+›Y
+BˆÙ^ÜœÛÛˆÔUHHÚ]\ÈÝÜ™Y[ˆH”ÓÓˆ[™[ÜH
+šœÛÛŠBˆÙ^ÜXYÈÔUHH”ÓÓˆ\ÈHÛÛËÙ][™ÜË[™]™\žHÚ[YÙ[	ÜÂˆ˜[œØÜš\œ›ÛH\ÈÚ]	ÜÈ[œÂˆÙ^Ü[ÔUHHÙ[‹XÛÛZ[™YSØÝ[Y[ˆÙ^Ü\XˆÔUH[ˆTPˆ›ÛÚËÛ™HÚ\\ˆ\ˆY\ÜØYÙBˆÙ^ÜØÞÔUHHÛÜ™ØÝ[Y[‚ˆUX^H™HHš[HÜˆH›Û\ŽÈÚ]Ý]]Hš[H\È˜[YYY\ˆBˆÚ]]H[™Üš][ˆÈHÝ\œ™[\™XÝÜžK‚‚ˆ\˜Ú]™\ÈØ[ˆÛÛZ[ˆÜ™Y[X[È[™XYHÝÜ™Y]\˜[H[ˆBˆÛÛ™šYÝ\˜][Û‹ˆ[š\›Û›Y[]˜\šXX›H[™Ù^KYš[H™Y™\™[˜Ù\ÈÝ^H\È™Y™\™[˜Ù\Ë‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ][\Ü[Hˆˆ‚ˆ[\ÜHÜX›HXZH\˜Ú]™H[È\È›Ú™XÝ‚‚ˆÚ[\ÜUY\™ÙH›ÝšY\œË›Û\ËPÔË[™YÙ[ÎÈ[œÝ[ˆÚÚ[È›ÜˆHÝ\œ™[\Ù\ŽÈYÚ]ÈÈ\È›Ú™XÝ‚ˆÝ[™[Û™HœØÚÙ]XZKšœÛÛˆ\˜Ú]™\È[™\˜Ú]™\È[X™YYžHØÚÙ]XZH\™BˆXØÙ\Yˆ^\Ý[™ÈÙ][™ÜÈ\™H™\XÙYÛ›HÚ[ˆZ\ˆÝX›HQÈÜˆ›Û\ˆ˜[Y\ÈX]ÚÈ^\Ý[™ÈÚ]È\™H™]™\ˆÝ™\Üš][‹ˆÛ\ˆXZH”ÓÓˆÚ]^ÜÂˆ\™HXØÙ\YÛË‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]™\R[Hˆˆ‚ˆ[œÝÙ\ˆH\Ý\ÜÚ\Ý[™\HÚ]]][ÝYX›Ý™HH[œÝÙ\Ž‚‚ˆÜ™\H][ÝHH\Ý™\H[™Ü[ˆ	QUÔˆÛˆ]ˆÜ™\HÒQÜ˜\H][ÝH]ÒQÛÛ[[œÈ[œÝXYÙˆHØÜ™Y[ˆÚY‚ˆ]™\žH][ÝY[™H\ÈÜ˜\Y[™™Yš^YÚ]ˆ‹Ú]H›[šÈ[™HYˆ[™\ˆ]›ÜˆH[œÝÙ\‹ˆØ]š[™È[™X]š[™ÈHY]ÜˆÙ[™ÈHÚÛH^ˆ\È[ˆÜ™[˜\žHY\ÜØYÙNÈX]š[™ÈH][ÝH[ÝXÚYÙ[™È›Ý[™Ë‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]ÛÜR[Hˆˆ‚ˆÛÜHÛÛ™\œØ][Ûˆ^ÈHÛ\›Ø\™Üˆ[ÈHš[N‚‚ˆØÛÜHH\Ý\ÜÚ\Ý[™\KÚ]Ý]]È™X\ÛÛš[™ÂˆØÛÜHˆH\ÝˆY\ÜØYÙ\ËÛ\Ýš\œÝX™[YžH›ÛBˆØÛÜHUH\Ý™\KÜš][ˆÈHš[HUˆØÛÜHˆUH\ÝˆY\ÜØYÙ\ËÜš][ˆÈHš[HU‚ˆÛÛØ[ËÛÛ™\Ý[Ë[XYÙ\Ë[™Ý\ˆ]XÚY[È\™HÝ[[X\š^™YÛ‚ˆZ\ˆÝÛˆ[™\ÎÈÞ\Ý[H[œÝXÝ[ÛœÈ\™H™]™\ˆÛÜYYˆUX^HÝ\Ú]ˆˆ[™\È™\ÛÛ™Yœ›ÛHHÝ\œ™[\™XÝÜžNÈ[ˆ^\Ý[™Èš[H\È™\XÙYˆ[™H›Û\ˆ\È™Y\ÙY‚ˆˆˆ‚‚ˆËËÈÜ™\X[œÝÙ\œÈH\Ý\ÜÚ\Ý[Y\ÜØYÙHHØ^HH™\HXÝ[Ûˆ[‚ˆËËÈHSÔÈ\Ù\Îˆ]È^\È][ÝY]H\›Z[˜[ÚY	QUÔ˜Ü[œÈÛ‚ˆËËÈH][ÝHÚ]›ÛÛH[™\›™X][™Ú]HY]ÜˆX]™\È\ÈÙ[\ÈY‚ˆËËÈ]Y™Y[ˆ\Y]H›Û\ˆ[ˆÜ[Û˜[\™Ý[Y[Ý™\œšY\ÈHÚY‚ˆš]˜]HÝ]XÈ[˜ÈÛÛ\ÜÙT™\JˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[Û‹ˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈOˆÝš[™ÏÈÂˆ]š[[YYH\™Ý[Y[š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆËÈX]™HH\›Z[˜[	ÜÈš[˜[ÛÛ[[ˆ[\ÙYÈ]›ÚY[ˆ]]ÛX]XÈÜ˜\‚ˆËÈX\šÙÝÛ”][ÝH™\Ù\™\ÈÛÈ[Ü™HÛÛ[[œÈ›ÜˆHˆX\šÙ\‹X]š[™ÂˆËÈH][ÝY^]Ù[ˆH™\]Y\ÝYØÜ™Y[‹]ÚY[Z[\Ë]™YHÛÛ[[œË‚ˆ˜\ˆÚYHX^
+Ë\›Z[˜[[™QY]Ü‹\›Z[˜[ÛÛ[[œÊ
+HHJBˆYˆ]š[[YYš\Ñ[\HÂˆÝX\™]ÛÛ[[œÈH[
+š[[YY
+KÛÛ[[œÈˆˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ•\ØYÙNˆÜ™\HÕÒQH
+H][ÝHÜ˜\ÈÈHØÜ™Y[ˆÚYžHY˜][
+H‚ˆ
+Bˆ™]\›ˆš[ˆBˆÚYHÛÛ[[œÂˆBˆ]™\NˆÝš[™ÂˆÈÂˆ™\HHžH˜[œØÜš\ÛÜK^
+ˆ›ÜŽˆ›\Ý\ÜÚ\Ý[™\K[ŽˆÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\Âˆ
+K^ˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›ˆš[ˆBˆ]][ÝYHX\šÙÝÛ”][ÝKœ][ÝJ™\K[™UÚYˆÚY
+Bˆ™]\›ˆ]ØZ]ÛÛ\ÜÙSY\ÜØYÙJˆœ›ÛNˆ][ÝY
+È——ˆ‹ˆÝY™š^ˆœ™\K›Y‹ˆ[˜Ú[™ÙYˆ”™\HØ[˜Ù[Yˆ›Ý[™ÈØ\ÈÜš][ˆ[™\ˆH][ÝKˆ‹ˆ\›Z[˜[ˆ\›Z[˜[
+BˆB‚ˆËËÈÙY][œ]Üš]\ÈH™^Y\ÜØYÙH[ˆHY]Üˆ[œÝXYÙˆ]BˆËËÈ›Û\ÚXÚ\ÈH›ÛÛHÜ™\XÚ]™\ÈÚ]Ý]H][ÝHÈ[œÝÙ\‹‚ˆš]˜]HÝ]XÈ[˜ÈÛÛ\ÜÙR[œ]
+\›Z[˜[ˆ\›Z[˜[Üš]\ŠH\Þ[˜ÈOˆÝš[™ÏÈÂˆ]ØZ]ÛÛ\ÜÙSY\ÜØYÙJˆœ›ÛNˆˆ‹ˆÝY™š^ˆš[œ]›Y‹ˆ[˜Ú[™ÙYˆ“›Ý[™ÈÈÙ[™ˆHY]ÜˆYHš[H[\Kˆ‹ˆ\›Z[˜[ˆ\›Z[˜[
+BˆB‚ˆËËÈÜ[œÈHY]ÜˆÛˆH˜YY\ÜØYÙH[™™]\›œÈÚ]]Y›ÜˆBˆËËÈØ[\ˆÈÙ[™\ÈYˆ]Y™Y[ˆ\Y]H›Û\ˆHš[H]ÛÛY\ÂˆËËÈ˜XÚÈ[\KÜˆ^XÝH\È]Ù[[‹Ù[™È›Ý[™Ë‚ˆš]˜]HÝ]XÈ[˜ÈÛÛ\ÜÙSY\ÜØYÙJˆœ›ÛH˜YˆÝš[™ËˆÝY™š^ˆÝš[™Ëˆ[˜Ú[™ÙY›ÝNˆÝš[™Ëˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈOˆÝš[™ÏÈÂˆÝX\™]Y]YH]ØZ]Y][\Ü˜\žU^
+˜YÝY™š^ˆÝY™š^\›Z[˜[ˆ\›Z[˜[
+Bˆ[ÙHÈ™]\›ˆš[Bˆ]Y\ÜØYÙHHY]Yš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™[Y\ÜØYÙKš\Ñ[\KY\ÜØYÙHOH˜Yš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J›ÝJBˆ™]\›ˆš[ˆBˆ™]\›ˆY\ÜØYÙBˆB‚ˆËËÈØÛÜHÓ—HÔUXˆH\Ý™\HÜˆH\ÝˆY\ÜØYÙ\ËÛˆHÞ\Ý[BˆËËÈÛ\›Ø\™Ü‹Ú[ˆU\ÈÚ]™[‹[ˆ]š[K‚ˆš]˜]HÝ]XÈ[˜ÈÛÜUÐÛ\›Ø\™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[Û‹ˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆYˆ\™Ý[Y[š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊK›ÝÙ\˜Ø\ÙY
+
+HOHš[ˆÂˆ]ØZ]\›Z[˜[›[™JÛÜR[
+Bˆ™]\›‚ˆBˆÈÂˆ]ÛÛ[X[™HžH˜[œØÜš\ÛÜK˜ÛÛ[X[™
+\œÚ[™Îˆ\™Ý[Y[
+Bˆ]™\Ý[HžH˜[œØÜš\ÛÜK^
+›ÜŽˆÛÛ[X[™œÙ[XÝ[Û‹[ŽˆÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\ÊBˆ]ÛÝ[H™\Ý[›Y\ÜØYÙ\Ë˜ÛÝ[ˆ]ÝXš™XÝBˆÛÛ[X[™œÙ[XÝ[ÛˆOH›\Ý\ÜÚ\Ý[™\BˆÈH\Ý™\Hˆˆ—
+ÛÝ[
+HY\ÜØYÙW
+ÛÝ[OHHÈˆˆˆœÈŠH‚ˆ]\Ý[˜][ÛŽˆÝš[™ÂˆYˆ]]HÛÛ[X[™œ]Âˆ\Ý[˜][ÛˆHžHÜš]PÛÜYY^
+™\Ý[^Îˆ]
+Kœ]ˆH[ÙHÂˆžHÞ\Ý[PÛ\›Ø\™Üš]J™\Ý[^
+Bˆ\Ý[˜][ÛˆHHÛ\›Ø\™‚ˆBˆ]ØZ]\›Z[˜[›[™JˆÛÜYY
+ÝXš™XÝ
+H
+
+™\Ý[^˜ÛÝ[
+HÚ\˜XÝ\œÊHÈ
+\Ý[˜][ÛŠKˆŠBˆHØ]Ú]\œ›Üˆ\È˜[œØÜš\ÛÜQ\œ›ÜˆÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆYˆØ\ÙHš[˜[YÛÝ[H\œ›ÜˆÈ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÛÜHÓ—HÔUH
+Ú[ÛÜJHŠHBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆËËÈÜš]\ÈØÛÜXÝ]]ÈHš[Nˆ˜^[™ËH™[]]™H]™\ÛÛ™\ÂˆËËÈYØZ[œÝHÛÜšÚ[™È\™XÝÜžK[ˆ^\Ý[™Èš[H\È™\XÙY[™H›Û\‚ˆËËÈ\È™Y\ÙY˜]\ˆ[ˆ[™[[™ÈH˜[YH[œÚYH]ˆ^š[\È[™Ú]BˆËËÈ™]Û[™H]™[ˆÝYÚÛ\›Ø\™^Ù\È›Ý‚ˆš]˜]HÝ]XÈ[˜ÈÜš]PÛÜYY^
+È^ˆÝš[™ËÈ]ˆÝš[™ÊH›ÝÜÈOˆT“Âˆ]Ý\œ™[HT“
+š[UT“Ú]]ˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]\Ñ\™XÝÜžNˆYJBˆ]^[™YH”ÔÝš[™ÊÝš[™Îˆ]
+K™^[™[™Õ[R[”]ˆ]\™Ù]HT“
+š[UT“Ú]]ˆ^[™Y™[]]™UÎˆÝ\œ™[
+KœÝ[™\™^™Yš[UT“ˆ˜\ˆ\Ñ\™XÝÜžNˆØšÐ›ÛÛH˜[ÙBˆ]^\ÝÈHš[SX[˜YÙ\‹™Y˜][™š[Q^\ÝÊ]]ˆ\™Ù]œ]\Ñ\™XÝÜžNˆ	š\Ñ\™XÝÜžJBˆYˆ]š\ÔÝY™š^
+‹ÈŠH
+^\ÝÈ	‰ˆ\Ñ\™XÝÜžK˜›ÛÛ˜[YJHÂˆ›ÝÈÓQ\œ›Ü‹š\Ñ\™XÝÜžJ\™Ù]œ]
+BˆBˆ]\™[H\™Ù]™[][™Ó\Ý]ÛÛ\Û™[
+
+BˆÝX\™š[SX[˜YÙ\‹™Y˜][™š[Q^\ÝÊ]]ˆ\™[œ]\Ñ\™XÝÜžNˆ	š\Ñ\™XÝÜžJKˆ\Ñ\™XÝÜžK˜›ÛÛ˜[YBˆ[ÙHÈ›ÝÈÓQ\œ›Ü‹›Z\ÜÚ[™Ñ›Û\Š\™[œ]
+HBˆ]ÛÛ[ÈH^š\ÔÝY™š^
+—ˆŠHÈ^ˆ^
+È—ˆ‚ˆžHÛÛ[ËÜš]JÎˆ\™Ù]]ÛZXØ[NˆYK[˜ÛÙ[™Îˆ]Ž
+Bˆ™]\›ˆ\™Ù]ˆB‚ˆËËÈØ]XÚUÛÛ™\ÈHØÝ[Y[È^H[Ù[Ø[ˆ™XY[™]Y]Y\È]ˆËËÈ›ÜˆH™^Y\ÜØYÙNÈØ]XÚÛX\˜›ÜÈ]™\ž][™È]Y]YYÛÈ˜\‹‚ˆš]˜]HÝ]XÈ[˜È]XÚØÝ[Y[
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆØÜ”›ÝšY\Žˆ[žHÐÔ”›ÝšY\‹ˆY]ÜŽˆ\›Z[˜[[™QY]ÜËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ˜\ˆš[[YYH\™Ý[Y[š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊBˆÝX\™]š[[YYš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØ]XÚÜÛÝ\˜Ù_X\šÙÝÛŸÛÜWHUØ]XÚÛX\ˆŠBˆ]ØZ]\›Z[˜[›[™Jˆ•ÛÜ™TPˆ[™ˆš[\È™XÛÛYHX\šÙÝÛ‹”ÓÓˆ™XÛÛY\È[ˆÝ][™K\˜š]˜\žH^ÜÛÝ\˜ÙHš[\È]XÚ\È^H\™K[™[XYÙ\È]XÚ]YY][HÚ^™KˆS\ÚÜÈÚ]\ˆÈ]XÚ]ÈÛÝ\˜ÙKÛÛ™\]ÈX\šÙÝÛ‹ÜˆÛÜH][ÈHÛÜšÚ[™È\™XÝÜžKˆ‚ˆ
+Bˆ™]\›‚ˆBˆYˆš[[YY›ÝÙ\˜Ø\ÙY
+
+HOH˜ÛX\ˆˆÂˆ]ÛÝ[HÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[˜ÛÝ[ˆÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[œ™[[Ý™P[
+
+Bˆ]ØZ]\›Z[˜[›[™JˆÛÝ[OHˆÈ“›È[™[™È]XÚY[Ëˆ‚ˆˆ‘›ÜY
+ÛÝ[
+H[™[™È]XÚY[
+ÛÝ[OHHÈˆˆˆœÈŠKˆŠBˆ™]\›‚ˆBˆ˜\ˆ[ÚÚXÙNˆÝš[™ÏÂˆYˆš[[YY™š\œÝOH—ˆˆ	‰ˆš[[YY™š\œÝOH‰ÈˆÂˆ]šY[ÈHš[[YYœÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+BˆYˆšY[Ë˜ÛÝ[OH‹ˆÈœÛÝ\˜ÙH‹›X\šÙÝÛˆ‹˜ÛÜH—K˜ÛÛZ[œÊšY[ÖÌK›ÝÙ\˜Ø\ÙY
+
+JBˆÂˆ[ÚÚXÙHHšY[ÖÌK›ÝÙ\˜Ø\ÙY
+
+Bˆš[[YYHšY[ÖÌWBˆBˆBˆYˆš[[YY˜ÛÝ[H‹]š\œÝHš[[YY™š\œÝš\œÝOH—ˆˆš\œÝOH‰È‹ˆš[[YY›\ÝOHš\œÝˆÂˆš[[YYHÝš[™Êš[[YY™›Üš\œÝ
+
+K™›Ü\Ý
+
+JBˆBˆ]]H”ÔÝš[™ÊÝš[™Îˆš[[YY
+K™^[™[™Õ[R[”]ˆ]\›HT“
+š[UT“Ú]]ˆ]
+BˆÈÂˆ]]HHžHØÝ[Y[]XÚY[[\Ü\‹™]J]ˆ\›
+Bˆ]Ú[™HØÝ[Y[]XÚY[[\Ü\‹šÚ[™
+›ÜŽˆ]Kš[[˜[YNˆ\››\Ý]ÛÛ\Û™[
+BˆYˆÚ[™OHš[XYÙHÂˆÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[˜\[™
+ˆžH]ØZ][XYÙPÛÛ[
+]ˆ][ÙNˆ›YY][KØÜ”›ÝšY\ŽˆØÜ”›ÝšY\ŠJBˆ]ØZ]\›Z[˜[›[™Jˆ’[XYÙH]Y]YY]YY][HÚ^™Nˆ
+\››\Ý]ÛÛ\Û™[
+Kˆ\ÙHÚ[XYÙH›ÜˆÝ\ˆÚ^™\ÈÜˆÐÔ‹ˆ‚ˆ
+Bˆ™]\›‚ˆBˆYˆ[ÚÚXÙHOHš[Ú[™OHš[Âˆ]ØZ]\›Z[˜[›[™Jˆ™\œ›ÜŽˆÛÝ\˜ÙKX\šÙÝÛ‹[™ÛÜHÚÚXÙ\È\HÛ›HÈSš[\Ëˆ‹ˆÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆYˆÚ[™OHš[[ÚÚXÙHOHš[ÂˆÝX\™\Ø]JÕS—Ñ’SS“ÊHOH]Y]Üˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ’S™YYÈHÚÚXÙNˆØ]XÚÛÝ\˜ÙH
+š[[YY
+KØ]XÚX\šÙÝÛˆ
+š[[YY
+KÜˆØ]XÚÛÜH
+š[[YY
+Kˆ‹ˆÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ]ØZ]\›Z[˜[›[™J’[\Ü
+\››\Ý]ÛÛ\Û™[
+H\ÈSÛÝ\˜ÙKX\šÙÝÛ‹ÜˆHÛÜšÚ[™ËY\™XÝÜžHš[OÈŠBˆ][œÝÙ\ˆHY]Ü‹œ™XY[™Jˆ›Û\ˆš[ÜÛÝ\˜ÙKÛX\šÙÝÛ‹ØÛÜKØØ[˜Ù[Oˆ‹ˆÛÛ\][ÛœÎˆÈœÛÝ\˜ÙH‹›X\šÙÝÛˆ‹˜ÛÜH‹˜Ø[˜Ù[—Kˆ™[Y[X™\’[œ]ˆ˜[ÙJOËš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊK›ÝÙ\˜Ø\ÙY
+
+BˆÝX\™YY]Ü‹Ø\Ò[\œ\Y][œÝÙ\‹VÈ˜Ø[˜Ù[‹˜È‹ˆ—K˜ÛÛZ[œÊ[œÝÙ\ŠH[ÙHÂˆ]ØZ]\›Z[˜[›[™J’S[\ÜØ[˜Ù[YˆŠBˆ™]\›‚ˆBˆÝÚ]Ú[œÝÙ\ˆÂˆØ\ÙHœÛÝ\˜ÙH‹œÈ‹ŒHŽˆ[ÚÚXÙHHœÛÝ\˜ÙH‚ˆØ\ÙH›X\šÙÝÛˆ‹›Y‹›H‹ŒˆŽˆ[ÚÚXÙHH›X\šÙÝÛˆ‚ˆØ\ÙH˜ÛÜH‹™š[H‹ŒÈŽˆ[ÚÚXÙHH˜ÛÜH‚ˆY˜][‚ˆ]ØZ]\›Z[˜[›[™J’S[\ÜØ[˜Ù[Yˆ[šÛ›ÝÛˆÚÚXÙH	×
+[œÝÙ\ŠIËˆŠBˆ™]\›‚ˆBˆBˆYˆ[ÚÚXÙHOH˜ÛÜHˆÂˆ]\Ý[˜][ÛˆHžHØÝ[Y[]XÚY[[\Ü\‹˜ÛÜJˆ]Nˆ]Kˆš[[˜[YNˆ\››\Ý]ÛÛ\Û™[ˆ[ÎˆT“
+ˆš[UT“Ú]]ˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]ˆ\Ñ\™XÝÜžNˆYJKˆÛÝ\˜ÙUT“ˆ\›
+Bˆ]ØZ]\›Z[˜[›[™JÛÜYYSÈ
+\Ý[˜][Û‹œ]
+KˆŠBˆ™]\›‚ˆBˆ]]XÚY[HžHØÝ[Y[]XÚY[[\Ü\‹˜]XÚY[
+ˆ]Nˆ]Kˆš[[˜[YNˆ\››\Ý]ÛÛ\Û™[ˆ[[ÙNˆ[ÚÚXÙHOH›X\šÙÝÛˆˆÈ›X\šÙÝÛˆˆœÛÝ\˜ÙJBˆÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[˜\[™
+]XÚY[˜ÛÛ[
+Bˆ˜\ˆY\ÜØYÙHH]XÚY
+]XÚY[›˜[YJH
+
+]XÚY[˜Ú\˜XÝ\ÛÝ[
+HÚ\˜XÝ\œÈ‚ˆYˆ]›ÝHH]XÚY[››ÝHÈY\ÜØYÙH
+ÏH‹
+›ÝJHˆBˆY\ÜØYÙH
+ÏHŠNÈ]\ÈÙ[Ú]H™^Y\ÜØYÙKˆ‚ˆ]ØZ]\›Z[˜[›[™JY\ÜØYÙJBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆÚYˆPRWÒT×Õ’TÕPSˆËËÈ[™ÈH\›Z[˜[ÈHÝÚYRHÛÜšÜÜXÙH[™YÜÈ]È›ØÝ\ÙYˆËËÈÛÛ™\œØ][Û‹™YÚ\Ý˜][ÛœË[™ÛÛ™šYÝ\˜][Ûˆ˜YÚ[ˆ]™]\›œË‚ˆš]˜]HÝ]XÈ[˜È[•š\ÝX[[ÙJˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆØÜ”›ÝšY\Žˆ[žHÐÔ”›ÝšY\‹ˆÛÛ™šYÝ\˜][ÛŽˆ[›Ý]XZPÛÛ™šYÝ\˜][ÛËˆØ][ÙÜÎˆ[›Ý]ÓPÔÙ\™\Ø][Ù×Kˆš\ÝX[ˆš\ÝX[œšYÙKˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÝX\™\Ø]JÕS—Ñ’SS“ÊHOH\Ø]JÕÕUÑ’SS“ÊHOH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•š\ÝX[[ÙH™YYÈ[ˆ[\˜XÝ]™H\›Z[˜[ˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ]ØÜ™Y[ˆH\›Z[˜[ØÜ™Y[‹˜Ý\œ™[ˆØÜ™Y[Ë™XXÝ]˜]J
+BˆY™\ˆÈØÜ™Y[Ëœ™\Ý[YJ
+HBˆ]][˜ÚHš\ÝX[][˜Ú
+ˆ›ØÝ\ÙYÛÛ™\œØ][ÛŽˆÙ\ÜÚ[Û‹š\ÝX[ÙYY
+
+KˆÛ˜\ÚÝˆÙ\ÜÚ[Û‹š\ÝX[Û˜\ÚÝˆÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛˆÏÈXZPÛÛ™šYÝ\˜][ÛŠ›ÝšY\œÎˆš\ÝX[š[\XÚ]›ÝšY\œÊKˆÛÛ™šYÝ\˜][Û”]ˆš\ÝX[˜ÛÛ™šYÝ\˜][Û”]ˆØ][ÙÜÎˆØ][ÙÜËˆ[š\›Û›Y[ˆ›ØÙ\ÜÒ[™›Ëœ›ØÙ\ÜÒ[™›Ë™[š\›Û›Y[ˆÛÛ[X[™[™\ŽˆÈ™\]Y\Ý[‚ˆ]ØZ][•š\ÝX[ÛÛ[X[™
+ˆ™\]Y\Ýˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆØÜ”›ÝšY\ŽˆØÜ”›ÝšY\‹ˆš\ÝX[ˆš\ÝX[
+BˆJBˆ]\›Ý˜[ÈHš\ÝX[\›Ý˜[[™\ˆÂˆ]ØZ]š\ÝX[˜\›Ý˜[[™\‹œÙ]SÓÑ[˜X›Y
+YJBˆBˆ]ØZ]š\ÝX[˜\›Ý˜[[™\‹œÙ][YØ]J\›Ý˜[ÊBˆÈÂˆ]Ý]ÛÛYHHžH]ØZ]š\ÝX[[ÙKœ[Šˆ][˜Úˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆ\›Ý˜[Îˆ\›Ý˜[ÊBˆ]ØZ]š\ÝX[˜\›Ý˜[[™\‹œÙ][YØ]Jš[
+BˆÙ\ÜÚ[Û‹˜YÜ
+Ý]ÛÛYK™›ØÝ\ÙYÛÛ™\œØ][ÛŠBˆÙ\ÜÚ[Û‹š\ÝX[Û˜\ÚÝHÝ]ÛÛYKœÛ˜\ÚÝˆØ][ÙÜÈHÝ]ÛÛYK˜Ø][ÙÜÂˆYˆÝ]ÛÛYK˜ÛÛ™šYÝ\˜][ÛÚ[™ÙYÛÛ™šYÝ\˜][ÛˆOHš[ÂˆÛÛ™šYÝ\˜][ÛˆHÝ]ÛÛYK˜ÛÛ™šYÝ\˜][Û‚ˆBˆ]ØZ]\›Z[˜[›[™JÝ]ÛÛYKœÝ[[X\žJBˆHØ]ÚÂˆ]ØZ]š\ÝX[˜\›Ý˜[[™\‹œÙ][YØ]Jš[
+Bˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆËËÈ[œÈHÛ\ÚÛÛ[X[™\Y[ÈHš\ÝX[[™H^XÝH\ÈH‘TÛÝ[ˆËËÈÛˆHÙ\ÜÚ[ÛˆZ[œ›ÛH][™IÜÈÛÛ™\œØ][Û‹[™™]\›œÈÚ]]ˆËËÈš[YÙÙ]\ˆÚ]HÛÛ™\œØ][Ûˆ]Y™Z[™‚ˆš]˜]HÝ]XÈ[˜È[•š\ÝX[ÛÛ[X[™
+ˆÈ™\]Y\Ýˆš\ÝX[ÛÛ[X[™™\]Y\Ýˆ[[YNˆYÙ[[[YKˆYÚ[œÎˆYÚ[”™YÚ\ÝžKˆØÜ”›ÝšY\Žˆ[žHÐÔ”›ÝšY\‹ˆš\ÝX[ˆš\ÝX[œšYÙBˆ
+H\Þ[˜ÈOˆš\ÝX[ÛÛ[X[™Ý]ÛÛYHÂˆ]ÛÛ[X[™Bˆ™\]Y\Ýš[œ]œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK™š\œÝ›X\
+ˆÝš[™Ëš[š]
+HÏÈ™\]Y\Ýš[œ]ˆÝÚ]ÚÛÛ[X[™ÂˆØ\ÙH‹Ýš\ÝX[Ž‚ˆ™]\›ˆš\ÝX[ÛÛ[X[™Ý]ÛÛYJˆÝ]]ˆ[™XYH[ˆš\ÝX[[ÙKˆÙ^]ÜˆÝ›
+ÐÈ™]\›œÈÈH‘Tˆ‹ˆÛÛ™\œØ][ÛŽˆ™\]Y\Ý˜ÛÛ™\œØ][ÛŠBˆØ\ÙH‹Ù^]‹‹Ü]Z]Ž‚ˆ™]\›ˆš\ÝX[ÛÛ[X[™Ý]ÛÛYJˆÝ]]ˆ“X]š[™Èš\ÝX[[ÙKˆ‹ˆÛÛ™\œØ][ÛŽˆ™\]Y\Ý˜ÛÛ™\œØ][Û‹ˆX]™\Õš\ÝX[[ÙNˆYJBˆY˜][‚ˆœ™XZÂˆB‚ˆ˜\ˆÙ\ÜÚ[ÛˆH‘TÙ\ÜÚ[ÛŠˆ›Ùš[NˆÙ\ÜÚ[Û”›Ùš[JYš[š][ÛŽˆ™\]Y\Ý˜ÛÛ™\œØ][Û‹œ›Ùš[JKˆ[™[™ÐÛÛ[ˆ™\]Y\Ý˜ÛÛ™\œØ][Û‹œ[™[™ÐÛÛ[
+BˆÙ\ÜÚ[Û‹š\ÝÜžKœ™\XÙP[
+Ú]ˆ™\]Y\Ý˜ÛÛ™\œØ][Û‹›Y\ÜØYÙ\ÊBˆ˜\ˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛÈH™\]Y\Ý˜ÛÛ™šYÝ\˜][Û‚ˆ˜\ˆØ][ÙÜÈH™\]Y\Ý˜Ø][ÙÜÂˆ]\›Z[˜[H\›Z[˜[Üš]\ŠØ\\™\ÓÝ]]ˆYJBˆÈH]ØZ][™PÛÛ[X[™
+ˆ™\]Y\Ýš[œ]ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆYÚ[œÎˆYÚ[œËˆØÜ”›ÝšY\ŽˆØÜ”›ÝšY\‹ˆÛÛ™šYÝ\˜][ÛŽˆ	˜ÛÛ™šYÝ\˜][Û‹ˆØ][ÙÜÎˆ	˜Ø][ÙÜËˆš\ÝX[ˆš\ÝX[ˆ\›Z[˜[ˆ\›Z[˜[
+Bˆ˜\ˆÝ]]H]ØZ]\›Z[˜[™˜Z[Ø\\™Y
+
+BˆYˆ™\]Y\Ýš[œ]š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHOH‹Ú[ˆÂˆÝ]]
+ÏBˆ—’[ˆš\ÝX[[ÙKÙ^]™]\›œÈÈH‘T[™HÝ]]X›Ý™HÛÜÙ\ÈÚ]\ØËˆ‚ˆBˆYˆÝ]]š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKš\Ñ[\HÈÝ]]H‘Û™KˆˆBˆ˜\ˆÛÛ™\œØ][ÛˆH™\]Y\Ý˜ÛÛ™\œØ][Û‚ˆÛÛ™\œØ][Û‹œ›Ùš[HHÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Yš[š][Û‚ˆÛÛ™\œØ][Û‹›Y\ÜØYÙ\ÈHÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\ÂˆÛÛ™\œØ][Û‹œ[™[™ÐÛÛ[HÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[ˆ™]\›ˆš\ÝX[ÛÛ[X[™Ý]ÛÛYJÝ]]ˆÝ]]ÛÛ™\œØ][ÛŽˆÛÛ™\œØ][ÛŠBˆBˆÙ[™Y‚‚ˆš]˜]HÝ]XÈ[˜È[™UÛÜšÜÜXÙPÚ]ÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆÛÜšÜÜXÙNˆ[›Ý]YÙ[Ú]ÛÜšÜÜXÙKˆ[[YNˆYÙ[[[YKˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛËˆÚ]›ØÙ\ÜÎˆYÙ[QÈHš[ˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]\ÈH\™Ý[Y[œÜ]
+X^Ü]Îˆ‹Ú\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+BˆÝX\™]XÝ[ÛˆH\Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+KXXÝ[Û‹š\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™JÚ][
+Bˆ™]\›‚ˆBˆ]™\ÝHÝš[™Ê\™Ý[Y[™›Üš\œÝ
+XÝ[Û‹˜ÛÝ[
+JKš[[Z[™ÐÚ\˜XÝ\œÊˆ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊB‚ˆÝÚ]ÚXÝ[ÛˆÂˆØ\ÙH›\Ý‹˜Ú]È‹›ÈŽ‚ˆÝX\™]ØÛÜHHÚ]\ÝØÛÜJ™\Ý
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÚ]\ÝØXÝ]™_\˜Ú]™Y[HŠBˆ™]\›‚ˆBˆ]ØZ]\›Z[˜[›[™JÚ]\Ý[™ÊÛÜšÜÜXÙKØÛÜNˆØÛÜKÙ[XÝYQˆÙ\ÜÚ[Û‹šY
+JBˆØ\ÙH›™]ÈŽ‚ˆ˜\ˆ›Ùš[HHÙ\ÜÚ[Û‹œ›Ùš[Bˆ˜\ˆ]HH™\Ýˆ˜\ˆ^XÚ]YÙ[H˜[ÙBˆYˆ]Kš\Ô™Yš^
+‹KXYÙ[ŠHÂˆ]˜[Y\ÈH]KœÜ]
+X^Ü]Îˆ‹Ú\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+BˆÝX\™˜[Y\Ë˜ÛÝ[H‹ˆ]YÙ[HÛÛ™šYÝ\˜][ÛË˜YÙ[Ë™š\œÝ
+Ú\™NˆÈ	šYOH˜[Y\ÖÌWHJBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÚ]™]ÈËKXYÙ[QHÕUWHŠBˆ™]\›‚ˆBˆ›Ùš[HHÙ\ÜÚ[Û”›Ùš[JYš[š][ÛŽˆYÙ[
+Bˆ]HH˜[Y\Ë˜ÛÝ[OHÈÈ˜[Y\ÖÌ—Hˆˆ‚ˆ^XÚ]YÙ[HYBˆBˆYˆ]Kš\Ñ[\KY^XÚ]YÙ[Ù\ÜÚ[Û‹˜Ú]š\Ñ\ÜÜØX›HÂˆ]ØZ]\›Z[˜[›[™J[™XYH[ˆH™]ÈÚ]ˆŠBˆ™]\›‚ˆBˆ]Ú]HÛÜšÜÜXÙKœÝ\™]ÐÚ]
+ˆš[X\žPYÙ[ˆ›Ùš[K˜YÙ[Yš[š][Û‹ˆ]Nˆ]Kš\Ñ[\HÈš[ˆ]JBˆÙ\ÜÚ[ÛˆH‘TÙ\ÜÚ[ÛŠÚ]ˆÚ]
+Bˆ]ØZ]\›Z[˜[›[™J”Ý\YÚ]	×
+Ú]™\Ü^U]JIÈÚ]YÙ[
+›Ùš[K˜YÙ[Q
+KˆŠBˆØ\ÙH\ÙH‹œÝÚ]Ú‹›Ü[ˆŽ‚ˆÝX\™\™\Ýš\Ñ[\K]Ú]H™\ÛÛ™PÚ]
+™\Ý[ŽˆÛÜšÜÜXÙJH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÚ]\ÙHS‘VQUHŠBˆ™]\›‚ˆBˆÝX\™Ú]šYOHÙ\ÜÚ[Û‹šY[ÙHÂˆ]ØZ]\›Z[˜[›[™J[™XYH[ˆ	×
+Ú]™\Ü^U]JIËˆŠBˆ™]\›‚ˆBˆ]ØZ]ÝÚ]ÚÙ\ÜÚ[ÛŠˆÎˆÚ]Ù\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ÛÜšÜÜXÙNˆ	ÛÜšÜÜXÙKÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH›™^‹œ™]š[Ý\È‹œ™]ˆŽ‚ˆ]Ü™\™YHÛÜšÜÜXÙK›Ü™\™YÚ]ÂˆÝX\™Ü™\™Y˜ÛÝ[ˆKˆ]Ý\œ™[HÜ™\™Y™š\œÝ[™^
+Ú\™NˆÈ	šYOHÙ\ÜÚ[Û‹šYJBˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\™H\ÈÛ›HÛ™HÚ]ˆŠBˆ™]\›‚ˆBˆ]Ù™œÙ]HXÝ[ÛˆOH›™^ˆÈHˆLBˆ]Ú]HÜ™\™YÊÝ\œ™[
+ÈÙ™œÙ]
+ÈÜ™\™Y˜ÛÝ[
+H	HÜ™\™Y˜ÛÝ[Bˆ]ØZ]ÝÚ]ÚÙ\ÜÚ[ÛŠˆÎˆÚ]Ù\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ÛÜšÜÜXÙNˆ	ÛÜšÜÜXÙKÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][Û‹ˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙHš[™›È‹œÚÝÈŽ‚ˆÝX\™]Ú]H™\Ýš\Ñ[\HÈÙ\ÜÚ[Û‹˜Ú]ˆ™\ÛÛ™PÚ]
+™\Ý[ŽˆÛÜšÜÜXÙJH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÚ][™›ÈÒS‘VQUWHŠBˆ™]\›‚ˆBˆ]ØZ]\›Z[˜[›[™JÚ][™›ÊÚ]ÛÜšÜÜXÙNˆÛÜšÜÜXÙKÙ[XÝYQˆÙ\ÜÚ[Û‹šY
+JBˆØ\ÙHœÙ\ÜÚ[ÛˆŽ‚ˆÝÚ]Ú™\Ý›ÝÙ\˜Ø\ÙY
+
+HÂˆØ\ÙHˆŽ‚ˆ]ØZ]\›Z[˜[›[™J”Ù\ÜÚ[ÛŽˆ
+Ù\ÜÚ[Û‹œÙ\ÜÚ[Û’Q
+HŠBˆØ\ÙH›™]ÈŽ‚ˆËÈHœ™\ÚÙ\ÜÚ[Ûˆ›ÜˆHØ[YHÚ]ˆH˜XÚÙ[™]Y]\œÈžHÙ\ÜÚ[Û‚ˆËÈÙY\ÈH™]ÈÛ™Hœ›ÛHH™^Y\ÜØYÙHÛ‹[™›Ý[™È[ÙHÚ[™Ù\Ë‚ˆÙ\ÜÚ[Û‹œÙ\ÜÚ[Û’QHÚ]Ù\ÜÚ[Û‹›™]ÒQ
+
+BˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆ]ØZ]\›Z[˜[›[™J”Ù\ÜÚ[ÛŽˆ
+Ù\ÜÚ[Û‹œÙ\ÜÚ[Û’Q
+H
+™]ÊHŠBˆY˜][‚ˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÚ]Ù\ÜÚ[ÛˆÛ™]×HŠBˆBˆØ\ÙHœ™[˜[YHŽ‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÚ]™[˜[YHUHŠBˆ™]\›‚ˆBˆÙ\ÜÚ[Û‹]HH™\ÝˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆ]ØZ]\›Z[˜[›[™JÚ]™[˜[YYÈ	×
+™\Ý
+IËˆŠBˆØ\ÙH˜\˜Ú]™HŽ‚ˆÝX\™]Ú]H™\Ýš\Ñ[\HÈÙ\ÜÚ[Û‹˜Ú]ˆ™\ÛÛ™PÚ]
+™\Ý[ŽˆÛÜšÜÜXÙJH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÚ]\˜Ú]™HÒS‘VQUWHŠBˆ™]\›‚ˆBˆÝX\™XÚ]š\Ð\˜Ú]™Y[ÙHÂˆ]ØZ]\›Z[˜[›[™J‰×
+Ú]™\Ü^U]JIÈ\È[™XYH\˜Ú]™YˆŠBˆ™]\›‚ˆBˆÝX\™XÚ]š\Ñ\ÜÜØX›H[ÙHÂˆ]ØZ]\›Z[˜[›[™J‰×
+Ú]™\Ü^U]JIÈ\È[\NÈ\™H\È›Ý[™ÈÈ\˜Ú]™KˆŠBˆ™]\›‚ˆBˆÝX\™Ú]šYOHÙ\ÜÚ[Û‹šY[ÙHÂˆÛÜšÜÜXÙKœÙ]\˜Ú]™Y
+YKYˆÚ]šY
+Bˆ]ØZ]\›Z[˜[›[™J\˜Ú]™Y	×
+Ú]™\Ü^U]JIËˆŠBˆ™]\›‚ˆBˆÙ\ÜÚ[Û‹š\Ð\˜Ú]™YHYBˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆÙ\ÜÚ[ÛˆH‘TÙ\ÜÚ[ÛŠˆÚ]ˆÛÜšÜÜXÙKœÝ\™]ÐÚ]
+š[X\žPYÙ[ˆÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Yš[š][ÛŠJBˆ]ØZ]\›Z[˜[›[™J\˜Ú]™Y	×
+Ú]™\Ü^U]JIÈ[™Ý\YH™]ÈÚ]ˆŠBˆØ\ÙH[˜\˜Ú]™H‹œ™\ÝÜ™HŽ‚ˆÝX\™]Ú]H™\Ýš\Ñ[\HÈÙ\ÜÚ[Û‹˜Ú]ˆ™\ÛÛ™PÚ]
+™\Ý[ŽˆÛÜšÜÜXÙJH[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÚ][˜\˜Ú]™HS‘VQUHŠBˆ™]\›‚ˆBˆÝX\™Ú]š\Ð\˜Ú]™Y[ÙHÂˆ]ØZ]\›Z[˜[›[™J‰×
+Ú]™\Ü^U]JIÈ\È›Ý\˜Ú]™YˆŠBˆ™]\›‚ˆBˆYˆÚ]šYOHÙ\ÜÚ[Û‹šYÂˆÙ\ÜÚ[Û‹š\Ð\˜Ú]™YH˜[ÙBˆÙ\ÜÚ[Û‹ÝXÚ
+
+BˆÛÜšÜÜXÙK\Ù\
+Ù\ÜÚ[Û‹˜Ú]Ù[XÝ[™ÎˆYJBˆH[ÙHÂˆÛÜšÜÜXÙKœÙ]\˜Ú]™Y
+˜[ÙKYˆÚ]šY
+BˆBˆ]ØZ]\›Z[˜[›[™J”™\ÝÜ™Y	×
+Ú]™\Ü^U]JIÈÈHXÝ]™HÚ]ËˆŠBˆØ\ÙH˜ÛÜÙH‹™[]HŽ‚ˆÝX\™\Ë˜ÛÝ[OH‹\ÖÌWK›ÝÙ\˜Ø\ÙY
+
+HOH˜ÛÛ™š\›Hˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™JÛÜÚ[™ÈHÚ]\È\›X[™[ˆÛÛ™š\›HÚ]ˆØÚ]ÛÜÙHÛÛ™š\›HŠBˆ™]\›‚ˆBˆ]ÛÜÙYHÙ\ÜÚ[Û‹˜Ú]ˆÈHÛÜšÜÜXÙKœ™[[Ý™PÚ]
+YˆÛÜÙYšY
+BˆYˆ]™^HÛÜšÜÜXÙK˜XÝ]™PÚ]Ë™š\œÝÏÈÛÜšÜÜXÙK›Ü™\™YÚ]Ë™š\œÝÂˆÈHÛÜšÜÜXÙKœÙ[XÝÚ]
+Yˆ™^šY
+BˆÙ\ÜÚ[ÛˆH‘TÙ\ÜÚ[ÛŠˆÚ]ˆÚ]\Z[™ÐÛÛ™šYÝ\™YYÙ[Ù][™ÜÊ™^ÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛŠJBˆ]ØZ]\›Z[˜[›[™JÛÜÙY	×
+ÛÜÙY™\Ü^U]JIÎÈÝÚ]ÚYÈ	×
+Ù\ÜÚ[Û‹]JIËˆŠBˆH[ÙHÂˆÙ\ÜÚ[ÛˆH‘TÙ\ÜÚ[ÛŠˆÚ]ˆÛÜšÜÜXÙKœÝ\™]ÐÚ]
+š[X\žPYÙ[ˆÙ\ÜÚ[Û‹œ›Ùš[K˜YÙ[Yš[š][ÛŠJBˆ]ØZ]\›Z[˜[›[™JÛÜÙY	×
+ÛÜÙY™\Ü^U]JIÎÈÝ\YH™]ÈÚ]ˆŠBˆBˆØ\ÙH›Y\ÜØYÙ\ÈŽ‚ˆ]ØZ][™PÚ]ÛÛ[X[™
+ˆ›\Ý‹ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ\XÝ›Û\ˆÛÛ™šYÝ\˜][ÛËœ›Û\ÏË˜ÛÛ\XÝˆÚ]›ØÙ\ÜÎˆÚ]›ØÙ\ÜËˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH›ÙÈ‹™Y]‹œ™[[Ý™H‹œ›H‹[™È‹š[H‹˜ÛÛ\XÝ‹˜ÛX\ˆ‹š[Ž‚ˆ]ØZ][™PÚ]ÛÛ[X[™
+ˆ\™Ý[Y[ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆÛÛ\XÝ›Û\ˆÛÛ™šYÝ\˜][ÛËœ›Û\ÏË˜ÛÛ\XÝˆÚ]›ØÙ\ÜÎˆÚ]›ØÙ\ÜËˆ\›Z[˜[ˆ\›Z[˜[
+BˆY˜][‚ˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆØÚ]XÝ[Ûˆ	×
+XÝ[ÛŠIË———
+Ú][
+HŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÝÚ]ÚÙ\ÜÚ[ÛŠˆÈÚ]ˆYÙ[Ú]ˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆÛÜšÜÜXÙNˆ[›Ý]YÙ[Ú]ÛÜšÜÜXÙKˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛËˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÈHÛÜšÜÜXÙKœÙ[XÝÚ]
+YˆÚ]šY
+BˆÙ\ÜÚ[ÛˆH‘TÙ\ÜÚ[ÛŠˆÚ]ˆÚ]\Z[™ÐÛÛ™šYÝ\™YYÙ[Ù][™ÜÊÚ]ÛÛ™šYÝ\˜][ÛŽˆÛÛ™šYÝ\˜][ÛŠJBˆ]Ý]\ÈHÚ]š\Ð\˜Ú]™YÈ‹\˜Ú]™Yˆˆˆ‚ˆ]ØZ]\›Z[˜[›[™Jˆ”ÝÚ]ÚYÈ	×
+Ú]™\Ü^U]JIÈ
+YÙ[
+Ú]œš[X\žPYÙ[šY
+W
+Ý]\ÊJKˆŠBˆB‚ˆš]˜]H[[HÚ]\ÝØÛÜHÂˆØ\ÙHXÝ]™K\˜Ú]™Y[‚ˆ[š]ÊÈ˜]ÎˆÝš[™ÊHÂˆÝÚ]Ú˜]Ë›ÝÙ\˜Ø\ÙY
+
+HÂˆØ\ÙHˆ‹˜[ŽˆÙ[ˆH˜[ˆØ\ÙH˜XÝ]™H‹›Ü[ˆŽˆÙ[ˆH˜XÝ]™BˆØ\ÙH˜\˜Ú]™Y‹˜\˜Ú]™H‹›ÛŽˆÙ[ˆH˜\˜Ú]™YˆY˜][ˆ™]\›ˆš[ˆBˆBˆB‚ˆËËÈÚ]ÈÜ›Ý\YHØ^HHØÚÙ]XZHÚYX˜\ˆÜ›Ý\È[NˆXÝ]™HÚ]ÂˆËËÈ[™\ˆÙ^HÈY\Ý\™^HÈ\ÈÙYZÈÈ\ÝÙYZÈÈ]HXY\œË™]Ù\ÝˆËËÈš\œÝ[ˆH\˜Ú]™YÛ™\Ëˆ[™^\ÈX]ÚØÚ]\ÙH˜‚ˆš]˜]HÝ]XÈ[˜È[™T›Ú™XÝÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™Ëˆ›Ú™XÝˆ[›Ý]YÙ[›Ú™XÝˆÛYNˆYÙ[ÛYKˆÝÜ™NˆYÙ[Ú]ÝÜ™Kˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]\ÈH\™Ý[Y[œÜ]
+X^Ü]ÎˆKÚ\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+Bˆ]XÝ[ÛˆH\Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+HÏÈš[™›È‚ˆ]™\ÝH\Ë˜ÛÝ[ˆHÈ\ÖÌWKš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHˆˆ‚‚ˆÝÚ]ÚXÝ[ÛˆÂˆØ\ÙHš[™›È‹œÚÝÈŽ‚ˆ]ØZ]\›Z[˜[›[™J›Ú™XÝ[™›Ê›Ú™XÝÛYNˆÛYKÝÜ™NˆÝÜ™JJBˆØ\ÙH›\Ý‹›È‹œ›Ú™XÝÈŽ‚ˆÈÂˆ]ØZ]\›Z[˜[›[™Jˆ›Ú™XÝ\Ý[™ÊžHÛYK›ØY›Ú™XÝ[™^
+
+KÝ\œ™[Qˆ›Ú™XÝšY›ÝÎˆ]J
+JJBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆØ\ÙH›˜[YH‹œ™[˜[YHŽ‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜ›Ú™XÝ˜[YHSQHŠBˆ™]\›‚ˆBˆ›Ú™XÝœ™[˜[YJÎˆ™\Ý
+Bˆ]ØZ]Ø]™T›Ú™XÝ
+ˆ›Ú™XÝÛYNˆÛYK\›Z[˜[ˆ\›Z[˜[ˆÝXØÙ\ÜÎˆ”›Ú™XÝ™[˜[YYÈ	×
+›Ú™XÝ™\Ü^S˜[YJIËˆŠBˆØ\ÙH[‹˜ÛÛÜˆ‹˜ÛÛÝ\ˆŽ‚ˆ]™\Ù]ÈHYÙ[›Ú™XÝ[œ™\Ù]˜[Y\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠBˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ•[ˆ
+›Ú™XÝ[Ëœ˜]Õ˜[YHÏÈ››Û™HŠKˆ™\Ù]Îˆ
+™\Ù]ÊNÈÜˆÔ”‘ÑÐŽÈ›Û™HÛX\œÈ]ˆ‚ˆ
+Bˆ™]\›‚ˆBˆYˆÈ››Û™H‹›Ù™ˆ‹™Y˜][‹‹H—K˜ÛÛZ[œÊ™\Ý›ÝÙ\˜Ø\ÙY
+
+JHÂˆ›Ú™XÝ[Hš[ˆ]ØZ]Ø]™T›Ú™XÝ
+›Ú™XÝÛYNˆÛYK\›Z[˜[ˆ\›Z[˜[ÝXØÙ\ÜÎˆ”›Ú™XÝ[ÛX\™YˆŠBˆ™]\›‚ˆBˆÝX\™][HYÙ[›Ú™XÝ[
+˜]Õ˜[YNˆ™\Ý
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆ[	×
+™\Ý
+IËˆ\ÙHÛ™HÙˆ
+™\Ù]ÊKÜˆÔ”‘ÑÐ‹ˆŠBˆ™]\›‚ˆBˆ›Ú™XÝ[H[ˆ]ØZ]Ø]™T›Ú™XÝ
+ˆ›Ú™XÝÛYNˆÛYK\›Z[˜[ˆ\›Z[˜[ÝXØÙ\ÜÎˆ”›Ú™XÝ[Ù]È
+[œ˜]Õ˜[YJKˆŠBˆØ\ÙH™›Ü™Ù]Ž‚ˆÝX\™\™\Ýš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆÜ›Ú™XÝ›Ü™Ù]S‘VUSQHŠBˆ™]\›‚ˆBˆÈÂˆ][™^HžHÛYK›ØY›Ú™XÝ[™^
+
+BˆÝX\™]\™Ù]H™\ÛÛ™T›Ú™XÝ
+™\Ý[Žˆ[™^
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J“›È›Ú™XÝX]Ú\È	×
+™\Ý
+IËˆÜ›Ú™XÝ\ÝÚÝÜÈ[KˆŠBˆ™]\›‚ˆBˆÝX\™\™Ù]šYOH›Ú™XÝšY[ÙHÂˆ]ØZ]\›Z[˜[›[™J‰×
+\™Ù]™\Ü^S˜[YJIÈ\ÈHÜ[ˆ›Ú™XÝÈ]Ý^\È\ÝYˆŠBˆ™]\›‚ˆBˆÈHžHÛYK™›Ü™Ù]›Ú™XÝ
+Yˆ\™Ù]šY
+Bˆ]ØZ]\›Z[˜[›[™Jˆ‘›Ü™ÛÝ	×
+\™Ù]™\Ü^S˜[YJIËˆ]Èš[\È[ˆ
+\™Ù]ÛÜšÚ[™Ñ\™XÝÜžJHÙ\™HY[Û™Kˆ‚ˆ
+BˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆØ\ÙHš[Ž‚ˆ]ØZ]\›Z[˜[›[™J›Ú™XÝ[
+BˆY˜][‚ˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆÜ›Ú™XÝXÝ[Ûˆ	×
+XÝ[ÛŠIË———
+›Ú™XÝ[
+HŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈØ]™T›Ú™XÝ
+ˆÈ›Ú™XÝˆYÙ[›Ú™XÝˆÛYNˆYÙ[ÛYKˆ\›Z[˜[ˆ\›Z[˜[Üš]\‹ˆÝXØÙ\ÜÎˆÝš[™Âˆ
+H\Þ[˜ÈÂˆÈÂˆžHÛYKœØ]™T›Ú™XÝ
+›Ú™XÝ
+Bˆ]ØZ]\›Z[˜[›[™JÝXØÙ\ÜÊBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™JˆØ\›š[™ÎˆH›Ú™XÝØ\È›ÝØ]™Yˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È™\ÛÛ™T›Ú™XÝ
+ÈÙ[XÝÜŽˆÝš[™Ë[ˆ[™^ˆYÙ[›Ú™XÝ[™^
+BˆOˆYÙ[›Ú™XÝÂˆÂˆ]Ü™\™YH[™^›Ü™\™Y›Ú™XÝÂˆYˆ][X™\ˆH[
+Ù[XÝÜŠK[X™\ˆHK[X™\ˆHÜ™\™Y˜ÛÝ[Âˆ™]\›ˆÜ™\™YÛ[X™\ˆHWBˆBˆ]]HYÙ[›Ú™XÝœÝ[™\™^™Y]
+Ù[XÝÜŠBˆYˆ]X]ÚH[™^œ›Ú™XÝ
+]ÛÜšÚ[™Ñ\™XÝÜžNˆ]
+HÈ™]\›ˆX]ÚBˆ]ÝÙ\™YHÙ[XÝÜ‹›ÝÙ\˜Ø\ÙY
+
+BˆYˆ]X]ÚHÜ™\™Y™š\œÝ
+Ú\™NˆÈ	šY]ZYÝš[™Ë›ÝÙ\˜Ø\ÙY
+
+Kš\Ô™Yš^
+ÝÙ\™Y
+HJHÂˆ™]\›ˆX]ÚˆBˆ™]\›ˆÜ™\™Y™š\œÝÈ	™\Ü^S˜[YK›ÝÙ\˜Ø\ÙY
+
+HOHÝÙ\™YBˆB‚ˆš]˜]HÝ]XÈ[˜È›Ú™XÝ[™›ÊˆÈ›Ú™XÝˆYÙ[›Ú™XÝˆÛYNˆYÙ[ÛYKˆÝÜ™NˆYÙ[Ú]ÝÜ™Bˆ
+HOˆÝš[™ÈÂˆ]Ý[[X\šY\ÈH
+žOÈÝÜ™K›ØYÝ[[X\šY\Ê
+JHÏÈ×Bˆ]\˜Ú]™YHÝ[[X\šY\Ë™š[\Šš\Ð\˜Ú]™Y
+K˜ÛÝ[ˆ]˜[YS›ÝHBˆ›Ú™XÝš\ÐÝ\ÝÛS˜[YHÈˆˆˆˆ
+œ›ÛHH\™XÝÜžNÈÜ›Ú™XÝ˜[YHSQH™[˜[Y\È]
+H‚ˆ™]\›ˆÂˆ“˜[YNˆ
+›Ú™XÝ™\Ü^S˜[YJW
+˜[YS›ÝJH‹ˆ‘\™XÝÜžNˆ
+›Ú™XÝÛÜšÚ[™Ñ\™XÝÜžJH‹ˆ•[ˆ
+›Ú™XÝ[Ëœ˜]Õ˜[YHÏÈ››Û™HŠH‹ˆÚ]Îˆ
+Ý[[X\šY\Ë˜ÛÝ[H\˜Ú]™Y
+HXÝ]™K
+\˜Ú]™Y
+H\˜Ú]™Y‹ˆ”ÝÜ˜YÙNˆ
+ÝÜ™K™\™XÝÜžUT“œ]
+H‹ˆ’[™^ˆ
+ÛYKœ›Ú™XÝ[™^T“œ]
+H‹ˆ’Qˆ
+›Ú™XÝšY]ZYÝš[™ÊH‹ˆÜ™X]Yˆ
+Ú]]T™\Ù[][Û‹[Y\Ý[\
+›Ú™XÝ˜Ü™X]Y]
+JH‹ˆ“Ü[™Yˆ
+Ú]]T™\Ù[][Û‹[Y\Ý[\
+›Ú™XÝ›\ÝÜ[™Y]
+JH‹ˆKš›Ú[™Y
+Ù\\˜]ÜŽˆ—ˆŠBˆB‚ˆš]˜]HÝ]XÈ[˜È›Ú™XÝ\Ý[™ÊˆÈ[™^ˆYÙ[›Ú™XÝ[™^ˆÝ\œ™[QˆURQËˆ›ÝÎˆ]Bˆ
+HOˆÝš[™ÈÂˆ]›Ú™XÝÈH[™^›Ü™\™Y›Ú™XÝÂˆÝX\™\›Ú™XÝËš\Ñ[\H[ÙHÂˆ™]\›ˆ“›È›Ú™XÝÈY]ˆXZH™YÚ\Ý\œÈH\™XÝÜžH]\ÈÝ\Y[‹ˆ‚ˆBˆ˜\ˆ[™\ÈHÈ”›Ú™XÝË[ÜÝ™XÙ[HÜ[™Yš\œÝˆ—Bˆ›Üˆ
+Ù™œÙ]›Ú™XÝ
+H[ˆ›Ú™XÝË™[[Y\˜]Y
+
+HÂˆ]X\šÙ\ˆH›Ú™XÝšYOHÝ\œ™[QÈŠˆˆˆˆ‚ˆ][X™\ˆHÙ™œÙ]HÈˆ
+Ù™œÙ]
+ÈJHˆˆ—
+Ù™œÙ]
+ÈJH‚ˆ˜\ˆ›Ý\ÎˆÔÝš[™×HH×BˆYˆ][H›Ú™XÝ[È›Ý\Ë˜\[™
+[œ˜]Õ˜[YJHBˆYˆ\›Ú™XÝÛÜšÚ[™Ñ\™XÝÜžQ^\ÝÈÈ›Ý\Ë˜\[™
+›Z\ÜÚ[™ÈŠHBˆ[™\Ë˜\[™
+ˆÂˆ—
+X\šÙ\ŠH
+[X™\ŠH‹YY
+›Ú™XÝ™\Ü^S˜[YKÚYˆ
+KˆYY
+X˜œ™]šX]Y]
+›Ú™XÝÛÜšÚ[™Ñ\™XÝÜžJKÚYˆ
+KˆYY
+›Ý\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠKÚYˆLŠKˆÚ]]T™\Ù[][Û‹˜ÛÛ\XÝ[Y\Ý[\
+›Ú™XÝ›\ÝÜ[™Y]™[]]™UÎˆ›ÝÊKˆKš›Ú[™Y
+Ù\\˜]ÜŽˆˆŠJBˆBˆ™]\›ˆ[™\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ—ˆŠBˆB‚ˆËËÈÚÜ[œÈH]HØ^HÚ[Èš[]ˆ˜›ÜˆÛYK[™HXYˆËËÈ[YYÚ[ˆ]\ÈÝ[ÛÈÛ™ËÙY\[™ÈHZ[[ÜH™XÛÙÛš^™K‚ˆš]˜]HÝ]XÈ[˜ÈX˜œ™]šX]Y]
+È]ˆÝš[™ËÚYˆ[H
+HOˆÝš[™ÈÂˆ˜\ˆÚÝÛˆH]ˆ]ÛYHHYÙ[ÛYK\Ù\’ÛYQ\™XÝÜžJ
+Kœ]ˆYˆÚÝÛˆOHÛYHÂˆÚÝÛˆHŸˆ‚ˆH[ÙHYˆÚÝÛ‹š\Ô™Yš^
+ÛYH
+È‹ÈŠHÂˆÚÝÛˆHŸˆˆ
+ÈÚÝÛ‹™›Üš\œÝ
+ÛYK˜ÛÝ[
+BˆBˆÝX\™ÚÝÛ‹˜ÛÝ[ˆÚY[ÙHÈ™]\›ˆÚÝÛˆBˆ™]\›ˆ¸ )ˆˆ
+ÈÚÝÛ‹œÝY™š^
+ÚYHJBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÚ]\Ý[™ÊˆÈÛÜšÜÜXÙNˆYÙ[Ú]ÛÜšÜÜXÙKˆØÛÜNˆÚ]\ÝØÛÜKˆÙ[XÝYQˆURQËˆ›ÝÎˆ]HH]J
+Bˆ
+HOˆÝš[™ÈÂˆ]Ü™\™YHÛÜšÜÜXÙK›Ü™\™YÚ]Âˆ˜\ˆ[™\ÎˆÔÝš[™×HH×Bˆ[˜È\[™
+ÈÚ]ÎˆÐYÙ[Ú]KXY\Žˆ
+YÙ[Ú]
+HOˆÝš[™ÊHÂˆ˜\ˆ™]š[Ý\ÎˆÝš[™ÏÂˆ›ÜˆÚ][ˆÚ]ÈÂˆ]]HHXY\ŠÚ]
+BˆYˆ]HOH™]š[Ý\ÈÂˆ[™\Ë˜\[™
+]JBˆ™]š[Ý\ÈH]BˆBˆ][™^H
+Ü™\™Y™š\œÝ[™^È	šYOHÚ]šYHÏÈ
+H
+ÈBˆ[™\Ë˜\[™
+Ú]›ÝÊÚ][™^ˆ[™^Ù[XÝYˆÚ]šYOHÙ[XÝYQ›ÝÎˆ›ÝÊJBˆBˆBˆYˆØÛÜHOH˜\˜Ú]™YÂˆ]XÝ]™HHÛÜšÜÜXÙK˜XÝ]™PÚ]ÂˆYˆXÝ]™Kš\Ñ[\HÈ[™\Ë˜\[™
+“›ÈXÝ]™HÚ]ËˆŠHBˆ\[™
+XÝ]™JHÈÚ]]T™\Ù[][Û‹™Ü›Ý\]J›ÜŽˆ	\]Y]™[]]™UÎˆ›ÝÊHBˆBˆYˆØÛÜHOH˜XÝ]™HÂˆ]\˜Ú]™YHÛÜšÜÜXÙK˜\˜Ú]™YÚ]ÂˆYˆ\˜Ú]™Yš\Ñ[\KØÛÜHOH˜\˜Ú]™YÈ[™\Ë˜\[™
+“›È\˜Ú]™YÚ]ËˆŠHBˆ\[™
+\˜Ú]™Y
+HÈÈ[ˆ\˜Ú]™YˆBˆBˆ™]\›ˆ[™\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ—ˆŠBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÚ]›ÝÊÈÚ]ˆYÙ[Ú][™^ˆ[Ù[XÝYˆ›ÛÛ›ÝÎˆ]JHOˆÝš[™ÈÂˆ]X\šÙ\ˆHÙ[XÝYÈŠˆˆˆˆ‚ˆ][X™\ˆH[™^LÈˆ
+[™^
+Hˆˆ—
+[™^
+H‚ˆ]ÛÝ[HÚ]˜ÛÛ™\œØ][Û“Y\ÜØYÙ\Ë˜ÛÝ[ˆ]Ú^™HHÛÝ[OHÈ™[\Hˆˆ—
+ÛÝ[
+H\ÙÈ‚ˆ™]\›ˆÂˆ—
+X\šÙ\ŠH
+[X™\ŠH‹Ýš[™ÊÚ]šY]ZYÝš[™Ëœ™Yš^
+
+JKˆYY
+Ú]™\Ü^U]KÚYˆ
+KYY
+Ú]œš[X\žPYÙ[šYÚYˆL
+KˆYY
+Ú^™KÚYˆ
+KˆÚ]]T™\Ù[][Û‹˜ÛÛ\XÝ[Y\Ý[\
+Ú]\]Y]™[]]™UÎˆ›ÝÊKˆKš›Ú[™Y
+Ù\\˜]ÜŽˆˆŠBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÚ][™›ÊˆÈÚ]ˆYÙ[Ú]ˆÛÜšÜÜXÙNˆYÙ[Ú]ÛÜšÜÜXÙKˆÙ[XÝYQˆURQÂˆ
+HOˆÝš[™ÈÂˆ][™^H
+ÛÜšÜÜXÙK›Ü™\™YÚ]Ë™š\œÝ[™^È	šYOHÚ]šYHÏÈ
+H
+ÈBˆ]ÛÝ[HÚ]˜ÛÛ™\œØ][Û“Y\ÜØYÙ\Ë˜ÛÝ[ˆ˜\ˆÝ]\ÈHÚ]š\Ð\˜Ú]™YÈ˜\˜Ú]™Yˆˆ˜XÝ]™H‚ˆYˆÚ]šYOHÙ[XÝYQÈÝ]\È
+ÏH‹Ý\œ™[ˆBˆ˜\ˆ[™\ÈHÂˆ•]Nˆ
+Ú]™\Ü^U]JH‹ˆ’[™^ˆ
+[™^
+H‹ˆ’Qˆ
+Ú]šY]ZYÝš[™ÊH‹ˆ”Ù\ÜÚ[ÛŽˆ
+Ú]œÙ\ÜÚ[Û’Q
+H‹ˆYÙ[ˆ
+Ú]œš[X\žPYÙ[šY
+H
+
+Ú]œš[X\žPYÙ[œ›ÝšY\ŠHÈ
+Ú]œš[X\žPYÙ[›[Ù[
+JH‹ˆ“Y\ÜØYÙ\Îˆ
+ÛÝ[
+HÛÛ™\œØ][Û‹
+Ú]›Y\ÜØYÙ\Ë˜ÛÝ[
+HÝ[‹ˆ”Ý\Yˆ
+Ú]]T™\Ù[][Û‹[Y\Ý[\
+Ú]˜Ü™X]Y]
+JH‹ˆ•\]Yˆ
+Ú]]T™\Ù[][Û‹[Y\Ý[\
+Ú]\]Y]
+JH
+
+Ú]]T™\Ù[][Û‹™Ü›Ý\]J›ÜŽˆÚ]\]Y]
+JJH‹ˆ”Ý]\Îˆ
+Ý]\ÊH‹ˆBˆYˆXÚ]œ[™[™ÐÛÛ[š\Ñ[\HÂˆ[™\Ë˜\[™
+”[™[™Îˆ
+Ú]œ[™[™ÐÛÛ[˜ÛÝ[
+H]XÚY[
+ÊH]Y]YYŠBˆBˆYˆXÚ]œÝX˜YÙ[Ëš\Ñ[\HÂˆ][›š[™ÈHÚ]œÝX˜YÙ[Ë™š[\ˆÈIœÝ]Kš\Õ\›Z[˜[K˜ÛÝ[ˆ[™\Ë˜\[™
+ˆYÙ[Îˆ
+Ú]œÝX˜YÙ[Ë˜ÛÝ[
+HÝ\YžH]È[œÈ‚ˆ
+È
+[›š[™ÈˆÈ‹
+[›š[™ÊHÝ[[›š[™ÈÚ[ˆ\ÝØ]™YˆˆˆŠBˆ
+Èˆ
+ØYÙ[È™YH\ÝÈ[JHŠBˆBˆ™]\›ˆ[™\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ—ˆŠBˆB‚ˆš]˜]HÝ]XÈ[˜ÈYY
+È^ˆÝš[™ËÚYˆ[
+HOˆÝš[™ÈÂˆ]ÛÝ[H^˜ÛÝ[ˆÝX\™ÛÝ[HÚY[ÙHÈ™]\›ˆÝš[™Ê^œ™Yš^
+ÚYHÊJH
+È‹‹‹ˆˆBˆ™]\›ˆ^
+ÈÝš[™Ê™\X][™Îˆˆ‹ÛÝ[ˆÚYHÛÝ[
+BˆB‚ˆš]˜]HÝ]XÈ[˜È™\ÛÛ™PÚ]
+ˆÈÙ[XÝÜŽˆÝš[™Ëˆ[ˆÛÜšÜÜXÙNˆYÙ[Ú]ÛÜšÜÜXÙBˆ
+HOˆYÙ[Ú]ÈÂˆ]Ü™\™YHÛÜšÜÜXÙK›Ü™\™YÚ]ÂˆYˆ][™^H[
+Ù[XÝÜŠKÜ™\™Yš[™XÙ\Ë˜ÛÛZ[œÊ[™^HJHÂˆ™]\›ˆÜ™\™YÚ[™^HWBˆBˆYˆ]YHURQ
+]ZYÝš[™ÎˆÙ[XÝÜŠHÂˆ™]\›ˆÜ™\™Y™š\œÝÈ	šYOHYBˆBˆ]YX]Ú\ÈHÜ™\™Y™š[\ˆÂˆ	šY]ZYÝš[™Ë›ÝÙ\˜Ø\ÙY
+
+Kš\Ô™Yš^
+Ù[XÝÜ‹›ÝÙ\˜Ø\ÙY
+
+JBˆBˆYˆYX]Ú\Ë˜ÛÝ[OHHÈ™]\›ˆYX]Ú\ÖÌHBˆ]]SX]Ú\ÈHÜ™\™Y™š[\ˆÂˆ	™\Ü^U]K˜Ø\ÙR[œÙ[œÚ]]™PÛÛ\\™JÙ[XÝÜŠHOH›Ü™\™YØ[YBˆBˆ™]\›ˆ]SX]Ú\Ë˜ÛÝ[OHHÈ]SX]Ú\ÖÌHˆš[ˆB‚ˆš]˜]HÝ]XÈ[˜È[™PÚ]ÛÛ[X[™
+ˆÈ\™Ý[Y[ˆÝš[™ËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆÛÛ\XÝ›Û\ˆÝš[™ÏËˆÚ]›ØÙ\ÜÎˆYÙ[QÈHš[ˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]\ÈH\™Ý[Y[œÜ]
+X^Ü]Îˆ‹Ú\™TÙ\\˜]ÜŽˆÚ\˜XÝ\‹š\ÕÚ]\ÜXÙJK›X\
+ˆÝš[™Ëš[š]
+BˆÝX\™]XÝ[ÛˆH\Ë™š\œÝË›ÝÙ\˜Ø\ÙY
+
+KXXÝ[Û‹š\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™JÚ][
+Bˆ™]\›‚ˆBˆ]XÝ[Û\™Ý[Y[HÝš[™Ê\™Ý[Y[™›Üš\œÝ
+\ÖÌK˜ÛÝ[
+JBˆš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊB‚ˆÝÚ]ÚXÝ[ÛˆÂˆØ\ÙH›\ÝŽ‚ˆ]ØZ]\›Z[˜[›[™JÛÛ™\œØ][Û“ÙÊÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹[ˆ˜[ÙJJBˆØ\ÙH›ÙÈŽ‚ˆ]™[™\™\ˆH]ØZ]\›Z[˜[›X\šÙÝÛ”™[™\™\‚ˆ]ØZ]\›Z[˜[›[™JˆÛÛ™\œØ][Û“ÙÊÙ\ÜÚ[ÛŽˆÙ\ÜÚ[Û‹[ˆYJHÈ^[‚ˆÝX\™]™[™\™\ˆ[ÙHÈ™]\›ˆ^Bˆ˜\ˆ™[™\™YH™[™\™\‹œ™[™\Š^
+BˆÚ[H™[™\™Yš\ÔÝY™š^
+—ˆŠHÈ™[™\™Yœ™[[Ý™S\Ý
+
+HBˆ™]\›ˆ™[™\™YˆJBˆØ\ÙH™Y]Ž‚ˆÝX\™\Ë˜ÛÝ[OHË][™^HÚ][™^
+\ÖÌWKÛÝ[ˆÙ\ÜÚ[Û‹š\ÝÜžK˜ÛÝ[
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÚ]Y]S‘VVŠBˆ™]\›‚ˆBˆÈÂˆžHÙ\ÜÚ[Û‹š\ÝÜžK™Y]Y\ÜØYÙJ]ˆ[™^^ˆ\ÖÌ—JBˆ]ØZ]\›Z[˜[›[™J‘Y]YY\ÜØYÙH
+[™^
+ÈJKˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆØ\ÙHœ™[[Ý™H‹™[]H‹œ›HŽ‚ˆÝX\™\Ë˜ÛÝ[H‹][™^HÚ][™^
+\ÖÌWKÛÝ[ˆÙ\ÜÚ[Û‹š\ÝÜžK˜ÛÝ[
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÚ]™[[Ý™HS‘VŠBˆ™]\›‚ˆBˆ]ØZ]™[[Ý™PÚ]Y\ÜØYÙJ]ˆ[™^Ù\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH[™ÈŽ‚ˆ][™^ˆ[ÂˆYˆ\Ë˜ÛÝ[HˆÂˆ[™^HÚ][™^
+\ÖÌWKÛÝ[ˆÙ\ÜÚ[Û‹š\ÝÜžK˜ÛÝ[
+BˆH[ÙHÂˆ[™^HÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\Ë›\Ý[™^
+Ú\™NˆÈ	œ›ÛHOHœÞ\Ý[HJBˆBˆÝX\™][™^[ÙHÂˆ]ØZ]\›Z[˜[›[™JˆÙ\ÜÚ[Û‹š\ÝÜžKš\Ñ[\HÈ“›ÈY\ÜØYÙ\ÈÈ[™Ëˆˆˆ“›ÈÛÛ™\œØ][ÛˆY\ÜØYÙ\ÈÈ[™ËˆŠBˆ™]\›‚ˆBˆ]ØZ]™[[Ý™PÚ]Y\ÜØYÙJ]ˆ[™^Ù\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙHš[HŽ‚ˆÝX\™\Ë˜ÛÝ[H‹][™^HÚ][™^
+\ÖÌWKÛÝ[ˆÙ\ÜÚ[Û‹š\ÝÜžK˜ÛÝ[
+H[ÙHÂˆ]ØZ]\›Z[˜[›[™J•\ØYÙNˆØÚ]š[HS‘VŠBˆ™]\›‚ˆBˆÈÂˆ]™[[Ý™YHžHÙ\ÜÚ[Û‹š\ÝÜžKš[J›ÝYÚˆ[™^
+BˆYˆ™[[Ý™Yš\Ñ[\HÂˆ]ØZ]\›Z[˜[›[™J“›Ý[™È›ÛÝÜÈY\ÜØYÙH
+[™^
+ÈJKˆŠBˆH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ•š[[YY
+™[[Ý™Y˜ÛÝ[
+HY\ÜØYÙW
+™[[Ý™Y˜ÛÝ[OHHÈˆˆˆœÈŠNÈÙ\›ÝYÚY\ÜØYÙH
+Ù\ÜÚ[Û‹š\ÝÜžK˜ÛÝ[
+Kˆ‚ˆ
+BˆBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆØ\ÙH˜ÛÛ\XÝŽ‚ˆ]ØZ]ÛÛ\XÝÚ]
+ˆ›ØÝ\ÎˆXÝ[Û\™Ý[Y[ˆ›Û\[\]NˆÛÛ\XÝ›Û\ˆÙ\ÜÚ[ÛŽˆ	œÙ\ÜÚ[Û‹ˆ[[YNˆ[[YKˆ\›Z[˜[ˆ\›Z[˜[
+BˆØ\ÙH˜ÛX\ˆŽ‚ˆÙ\ÜÚ[Û‹œ™\Ù]
+
+BˆYˆ]Ú]›ØÙ\ÜÈÈ]ØZ][[YKœÝ\\š\ÛÜ‹˜ÛX\‘š[š\ÚY
+[™\ŽˆÚ]›ØÙ\ÜÊHBˆ]ØZ]\›Z[˜[›[™JÛÛ™\œØ][ÛˆÛX\™YˆŠBˆØ\ÙHš[Ž‚ˆ]ØZ]\›Z[˜[›[™JÚ][
+BˆY˜][‚ˆ]ØZ]\›Z[˜[›[™J•[šÛ›ÝÛˆØÚ]XÝ[Ûˆ	×
+XÝ[ÛŠIË———
+Ú][
+HŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜È™[[Ý™PÚ]Y\ÜØYÙJˆ][™^ˆ[ˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆÈÂˆ]™[[Ý™YHžHÙ\ÜÚ[Û‹š\ÝÜžKœ™[[Ý™SY\ÜØYÙJ]ˆ[™^
+Bˆ]ÝY™š^H™[[Ý™Y˜ÛÝ[OHHÈˆˆˆˆ
+[˜ÛY[™È[šÙYÛÛY\ÜØYÙ\ÊH‚ˆ]ØZ]\›Z[˜[›[™Jˆ”™[[Ý™Y
+™[[Ý™Y˜ÛÝ[
+HY\ÜØYÙW
+™[[Ý™Y˜ÛÝ[OHHÈˆˆˆœÈŠW
+ÝY™š^
+KˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆš]˜]HÝ]XÈ]Y˜][ÛÛ\XÝ›Û\HYÙ[ÛÛ\XÝ[Û”›Û\[\]B‚ˆËËÈ\ÚÈHÙ[XÝY[Ù[›Üˆ\˜X›HÛÛ^\Ú[™ÈHÛÛ™šYÝ\™Y›Û\ˆËËÈ[\]K[ˆ™\XÙHH˜[œØÜš\Ú[H™]Z[š[™ÈÞ\Ý[H[œÝXÝ[ÛœË‚ˆš]˜]HÝ]XÈ[˜ÈÛÛ\XÝÚ]
+ˆ›ØÝ\ÎˆÝš[™Ëˆ›Û\[\]NˆÝš[™ÏËˆÙ\ÜÚ[ÛŽˆ[›Ý]‘TÙ\ÜÚ[Û‹ˆ[[YNˆYÙ[[[YKˆ\›Z[˜[ˆ\›Z[˜[Üš]\‚ˆ
+H\Þ[˜ÈÂˆ]ÜÚÙ[ˆHÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\Ë™š[\ˆÂˆ
+	œ›ÛHOH\Ù\ˆ	œ›ÛHOH˜\ÜÚ\Ý[
+Bˆ	‰ˆI^š[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKš\Ñ[\BˆBˆÝX\™ÜÚÙ[‹˜ÛÝ[Hˆ[ÙHÂˆ]ØZ]\›Z[˜[›[™J“›Ý[™ÈÈÛÛ\XÝY]ˆŠBˆ™]\›‚ˆBˆ]ÛÛ™šYÝ\™Y[\]HH›Û\[\]OËš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHÏÈˆ‚ˆÝX\™ÛÛ™šYÝ\™Y[\]Kš\Ñ[\HÛÛ™šYÝ\™Y[\]K˜ÛÛZ[œÊžÞÝ˜[œØÜš\_HŠH[ÙHÂˆ]ØZ]\›Z[˜[›[™Jˆ™\œ›ÜŽˆHÛÛ\XÝ›Û\]\ÝÛÛZ[ˆÞÝ˜[œØÜš\_KˆY]]Ú]ÙY]ÛÛ\XÝˆ‹ˆÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆËÈHØ[YH›Û\[™˜[œØÜš\™[™\š[™È]]ØÛÛ\XÝ\Ù\ËÛÈHÝ[[X\žBˆËÈ™XYÈHØ[YHÚ]\ˆH\œÛÛˆÜˆH[[YH\ÚÙY›Üˆ]‚ˆ]›Û\HYÙ[ÛÛ\XÝ[Û”›Û\œ™[™\Šˆ˜[œØÜš\ˆYÙ[ÛÛ\XÝ[Û”›Û\˜[œØÜš\
+ÙŽˆÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\ÊKˆ›ØÝ\Îˆ›ØÝ\Ëˆ[\]NˆÛÛ™šYÝ\™Y[\]JBˆ]›Ùš[HHÙ\ÜÚ[Û‹œ›Ùš[Bˆ]™\]Y\ÝHYÙ[™\]Y\Ý
+ˆYÙ[Qˆ›Ùš[K˜YÙ[Qˆ›ÝšY\Žˆ›Ùš[Kœ›ÝšY\‹ˆ[Ù[ˆ›Ùš[K›[Ù[ˆY\ÜØYÙ\ÎˆË\Ù\Š›Û\
+WKˆÛÛ˜[Y\Îˆ×KˆÝX˜YÙ[˜[Y\Îˆ×KˆÛÛÚÚXÙNˆ››Û™Kˆ™\ÜÛœÙQ›Ü›X]ˆ^ˆÜ[ÛœÎˆ›Ùš[K›Ü[ÛœËˆ[Z]Îˆ›Ùš[K›[Z]ËˆÝ™X[Nˆ˜[ÙKˆÛÛØ[[™ÔÝ˜]YÞNˆ˜]]ÛX]XËˆ\ÙUÛÛ›ÞNˆ˜[ÙKˆ™]žNˆ›Ùš[Kœ™]žKˆÙ\ÜÚ[Û’QˆÙ\ÜÚ[Û‹œÙ\ÜÚ[Û’Q
+Bˆ]ØZ]\›Z[˜[›[™JÛÛ\XÝ[™ÈÛÛ™\œØ][Û¸ )ˆŠBˆÈÂˆ]™\Ý[HžH]ØZ][[YKœ[Š™\]Y\Ý
+HÈÈ[ˆBˆ]Ý[[X\žHBˆ™\Ý[˜[œØÜš\›\Ý
+Ú\™NˆÈ	œ›ÛHOH˜\ÜÚ\Ý[JOË^ˆš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊHÏÈˆ‚ˆÝX\™\Ý[[X\žKš\Ñ[\H[ÙHÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆÛÛ\XÝ™]\›™Y[ˆ[\HÝ[[X\žKˆ‹ÎˆœÝ[™\™\œ›ÜŠBˆ™]\›‚ˆBˆ˜\ˆÛÛ\XÝYˆÐYÙ[Y\ÜØYÙWHH×BˆYˆ\›Ùš[Kš[œÝXÝ[ÛœËš[[Z[™ÐÚ\˜XÝ\œÊ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\ÊKš\Ñ[\HÂˆÛÛ\XÝY˜\[™
+œÞ\Ý[J›Ùš[Kš[œÝXÝ[ÛœÊJBˆBˆÛÛ\XÝY˜\[™
+œÞ\Ý[JÛÛ™\œØ][ÛˆÝ[[X\žH
+ÛÛ\XÝY
+N———
+Ý[[X\žJHŠJBˆÙ\ÜÚ[Û‹š\ÝÜžKœ™\XÙP[
+Ú]ˆÛÛ\XÝY
+BˆÙ\ÜÚ[Û‹œ[™[™ÐÛÛ[œ™[[Ý™P[
+
+BˆÙ\ÜÚ[Û‹ÝXÚ
+
+Bˆ]ØZ]\›Z[˜[›[™JÛÛ™\œØ][ÛˆÛÛ\XÝY[ÈHÝ[[X\žKˆŠBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™J™\œ›ÜŽˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÚ][™^
+È˜]ÎˆÝš[™ËÛÝ[ˆ[
+HOˆ[ÈÂˆÝX\™]˜[YHH[
+˜]ÊK˜[YHOH[ÙHÈ™]\›ˆš[Bˆ][™^H˜[YHˆÈ˜[YHHHˆÛÝ[
+È˜[YBˆ™]\›ˆ
+‹ÛÝ[
+K˜ÛÛZ[œÊ[™^
+HÈ[™^ˆš[ˆB‚ˆš]˜]HÝ]XÈ[˜ÈÛÛ™\œØ][Û“ÙÊˆÙ\ÜÚ[ÛŽˆ‘TÙ\ÜÚ[Û‹ˆ[ˆ›ÛÛˆ™[™\•^ˆ
+Ýš[™ÊHOˆÝš[™ÈHÈ	Bˆ
+HOˆÝš[™ÈÂˆÝX\™\Ù\ÜÚ[Û‹š\ÝÜžKš\Ñ[\H[ÙHÈ™]\›ˆ“›ÈÛÛ™\œØ][ÛˆY\ÜØYÙ\ÈY]ˆˆBˆ˜\ˆ[™\ÈHÙ[ÈˆÈ[ÛÛ™\œØ][ÛˆÙÈˆˆÛÛ™\œØ][ÛˆÙÎˆ—BˆYˆY[È[™\Ë˜\[™
+‹KKKKKKKKKKKKKKKKHŠHBˆ›Üˆ
+[™^Y\ÜØYÙJH[ˆÙ\ÜÚ[Û‹š\ÝÜžK›Y\ÜØYÙ\Ë™[[Y\˜]Y
+
+HÂˆ]›ÛHHY\ÜØYÙKœ›ÛKœ˜]Õ˜[YK˜Ø\][^™YˆYˆ[Âˆ[™\Ë˜\[™
+—ˆÈÈ×
+[™^
+ÈJWH
+›ÛJH
+Yˆ
+Y\ÜØYÙKšY
+JHŠBˆ[™\Ë˜\[™
+ˆY\ÜØYÙK˜ÛÛ[›X\È™[™\‘[ÛÛ[
+	™[™\•^ˆ™[™\•^
+HBˆš›Ú[™Y
+Ù\\˜]ÜŽˆ—ˆŠJBˆ[™\Ë˜\[™
+‹KKKKKKKKKKKKKKKKKKKHŠBˆH[ÙHÂˆ[™\Ë˜\[™
+–×
+[™^
+ÈJWH
+›ÛJNˆ
+Y\ÜØYÙT™]šY]ÊY\ÜØYÙJJHŠBˆBˆBˆ[™\Ë˜\[™
+—•Ý[Y\ÜØYÙ\Îˆ
+Ù\ÜÚ[Û‹š\ÝÜžK˜ÛÝ[
+HŠBˆYˆ\Ù\ÜÚ[Û‹œ[™[™ÐÛÛ[š\Ñ[\HÂˆ[™\Ë˜\[™
+ˆ”[™[™È›Üˆ™^Y\ÜØYÙNˆ
+Ù\ÜÚ[Û‹œ[™[™ÐÛÛ[›X\
+™[™\ÛÛ\XÝÛÛ[
+Kš›Ú[™Y
+Ù\\˜]ÜŽˆ‹ŠJH‚ˆ
+BˆBˆ™]\›ˆ[™\Ëš›Ú[™Y
+Ù\\˜]ÜŽˆ—ˆŠBˆB‚ˆš]˜]HÝ]XÈ[˜ÈY\ÜØYÙT™]šY]ÊÈY\ÜØYÙNˆYÙ[Y\ÜØYÙJHOˆÝš[™ÈÂˆ]™[™\™YHY\ÜØYÙK˜ÛÛ[›X\
+™[™\ÛÛ\XÝÛÛ[
+Kš›Ú[™Y
+Ù\\˜]ÜŽˆˆŠBˆœ™\XÚ[™ÓØØÝ\œ™[˜Ù\ÊÙŽˆ—ˆ‹Ú]ˆˆŠBˆÝX\™™[™\™Y˜ÛÝ[ˆLŒ[ÙHÈ™]\›ˆ™[™\™YBˆ™]\›ˆÝš[™Ê™[™\™Yœ™Yš^
+LMÊJH
+È‹‹‹ˆ‚ˆB‚ˆš]˜]HÝ]XÈ[˜È™[™\ÛÛ\XÝÛÛ[
+È\ˆÛÛ[\
+HOˆÝš[™ÈÂˆÝÚ]Ú\ÂˆØ\ÙH^
+]^
+N‚ˆ^ˆØ\ÙHš[XYÙJ][XYÙJN‚ˆ–Ú[XYÙH
+[XYÙK›˜[YHÏÈ[XYÙK›Z[YU\JWH‚ˆØ\ÙH™š[J]š[JN‚ˆ–Ùš[H
+š[K›˜[YJWH‚ˆØ\ÙH˜]Y[Ê]]Y[ÊN‚ˆ–Ø]Y[È
+]Y[Ë›˜[YHÏÈ]Y[Ë›Z[YU\JWH‚ˆØ\ÙHœ™\ÛÝ\˜ÙJ]™\ÛÝ\˜ÙJN‚ˆ–Ü™\ÛÝ\˜ÙH
+™\ÛÝ\˜ÙK›˜[YHÏÈ™\ÛÝ\˜ÙK\šJWH‚ˆØ\ÙHœ™X\ÛÛš[™Ê]™X\ÛÛš[™ÊN‚ˆ–Ü™X\ÛÛš[™×H
+™X\ÛÛš[™ÊH‚ˆØ\ÙHÛÛØ[
+]Ø[
+N‚ˆ–ÝÛÛØ[
+Ø[›˜[YJH
+Ø[˜\™Ý[Y[Ë˜ÛÛ\XÝ”ÓÓ”Ýš[™ÊWH‚ˆØ\ÙHÛÛ™\Ý[
+]™\Ý[
+N‚ˆ–ÝÛÛ™\Ý[
+™\Ý[˜Ø[Q
+W
+™\Ý[š\Ñ\œ›ÜˆÈˆ\œ›ÜˆˆˆˆŠWH
+™\Ý[^
+H‚ˆBˆB‚ˆš]˜]HÝ]XÈ[˜È™[™\‘[ÛÛ[
+ˆÈ\ˆÛÛ[\ˆ™[™\•^ˆ
+Ýš[™ÊHOˆÝš[™ÈHÈ	Bˆ
+HOˆÝš[™ÈÂˆÝÚ]Ú\ÂˆØ\ÙH^
+]^
+N‚ˆ™]\›ˆ™[™\•^
+^
+BˆØ\ÙHš[XYÙJ][XYÙJN‚ˆ™]\›‚ˆ–Ú[XYÙH˜[YOW
+[XYÙK›˜[YHÏÈ‹HŠHZ[YOW
+[XYÙK›Z[YU\JHÛÝ\˜ÙOW
+š[˜\žTÛÝ\˜ÙTÝ[[X\žJ[XYÙKœÛÝ\˜ÙJJWH‚ˆØ\ÙH™š[J]š[JN‚ˆ™]\›‚ˆ–Ùš[H˜[YOW
+š[K›˜[YJHZ[YOW
+š[K›Z[YU\JW
+š[KœÛÝ\˜ÙK›X\ÈˆÛÝ\˜ÙOW
+š[˜\žTÛÝ\˜ÙTÝ[[X\žJ	
+JHˆHÏÈˆŠWW
+š[K^›X\È——
+	
+HˆHÏÈˆŠH‚ˆØ\ÙH˜]Y[Ê]]Y[ÊN‚ˆ™]\›‚ˆ–Ø]Y[È˜[YOW
+]Y[Ë›˜[YHÏÈ‹HŠHZ[YOW
+]Y[Ë›Z[YU\JHÛÝ\˜ÙOW
+š[˜\žTÛÝ\˜ÙTÝ[[X\žJ]Y[ËœÛÝ\˜ÙJJWH‚ˆØ\ÙHœ™\ÛÝ\˜ÙJ]™\ÛÝ\˜ÙJN‚ˆ™]\›‚ˆ–Ü™\ÛÝ\˜ÙH˜[YOW
+™\ÛÝ\˜ÙK›˜[YHÏÈ‹HŠH\šOW
+™\ÛÝ\˜ÙK\šJHZ[YOW
+™\ÛÝ\˜ÙK›Z[YU\HÏÈ‹HŠWW
+™\ÛÝ\˜ÙK^›X\È——
+	
+HˆHÏÈˆŠH‚ˆØ\ÙHœ™X\ÛÛš[™Ê]™X\ÛÛš[™ÊN‚ˆ™]\›ˆ–Ü™X\ÛÛš[™×W—
+™X\ÛÛš[™ÊH‚ˆØ\ÙHÛÛØ[
+]Ø[
+N‚ˆ™]\›ˆ–ÝÛÛØ[˜[YOW
+Ø[›˜[YJHYW
+Ø[šY
+WW—
+Ø[˜\™Ý[Y[Ë˜ÛÛ\XÝ”ÓÓ”Ýš[™ÊH‚ˆØ\ÙHÛÛ™\Ý[
+]™\Ý[
+N‚ˆ˜\ˆ˜[YHH–ÝÛÛ™\Ý[Ø[W
+™\Ý[˜Ø[Q
+HÝ]\ÏW
+™\Ý[š\Ñ\œ›ÜˆÈ™\œ›Üˆˆˆ›ÚÈŠWH‚ˆYˆ\™\Ý[˜ÛÛ[š\Ñ[\HÂˆ˜[YH
+ÏH—ˆˆ
+È™\Ý[˜ÛÛ[›X\È™[™\‘[ÛÛ[
+	
+HKš›Ú[™Y
+Ù\\˜]ÜŽˆ—ˆŠBˆBˆYˆ]ÝXÝ\™YH™\Ý[œÝXÝ\™YÛÛ[Âˆ˜[YH
+ÏH—–ÜÝXÝ\™YÛÛ[W—
+ÝXÝ\™Y˜ÛÛ\XÝ”ÓÓ”Ýš[™ÊH‚ˆBˆ™]\›ˆ˜[YBˆBˆB‚ˆš]˜]HÝ]XÈ[˜Èš[˜\žTÛÝ\˜ÙTÝ[[X\žJÈÛÝ\˜ÙNˆš[˜\žTÛÝ\˜ÙJHOˆÝš[™ÈÂˆÝÚ]ÚÛÝ\˜ÙHÂˆØ\ÙH™]J]]JNˆš[›[™N—
+]K˜ÛÝ[
+KXž]\È‚ˆØ\ÙH\›
+]\›
+Nˆ\›˜XœÛÛ]TÝš[™ÂˆBˆB‚ˆš]˜]HÝ]XÈ[˜ÈY˜][ÛÛ™šYÝ\˜][Û”]
+[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×JHOˆÝš[™ÈÂˆYÙ[ÛYK™^[™\Ù\”]
+Ÿ‹Ë˜ÛÛ™šYËÜXZKØÛÛ™šYËšœÛÛˆ‹[š\›Û›Y[ˆ[š\›Û›Y[
+BˆB‚ˆËËÈÚ\™HXZHÙ\Ú]È[™\ÝÜžH™Y›Ü™H›Ú™XÝÈ^\ÝY‚ˆš]˜]HÝ]XÈ]YØXÞTÝ]Q\™XÝÜžHHŸ‹Ë˜ÛÛ™šYËÜXZH‚‚ˆš]˜]HÝ]XÈ[˜È™\ÛÛ™YÛYJÜ[ÛœÎˆÓSÜ[ÛœË[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×JBˆOˆYÙ[ÛYBˆÂˆYˆ]]HÜ[ÛœËšÛYT]Âˆ™]\›ˆYÙ[ÛYJˆ›ÛÝT“ˆT“
+ˆš[UT“Ú]]ˆYÙ[ÛYK™^[™\Ù\”]
+][š\›Û›Y[ˆ[š\›Û›Y[
+Kˆ\Ñ\™XÝÜžNˆYJJBˆBˆ™]\›ˆYÙ[ÛYKœ™\ÛÛ™J[š\›Û›Y[ˆ[š\›Û›Y[
+BˆB‚ˆËËÈ™K\›Ú™XÝÝ]H\ÈYÜYÛ›H[ÈHY˜][ÛYNˆH™[ØØ]YˆËËÈÛYH\ÈH[X™\˜]Hœ™\ÚÙ]\[™ØÜ˜]Ú[œÈ]\Ý›ÝÝXÚBˆËËÈš[\È[™\ˆH™X[ÛYH\™XÝÜžK‚ˆš]˜]HÝ]XÈ[˜È\Ù\ÑY˜][ÛYJÜ[ÛœÎˆÓSÜ[ÛœË[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×JBˆOˆ›ÛÛˆÂˆÜ[ÛœËšÛYT]OHš[ˆ	‰ˆ
+[š\›Û›Y[ÐYÙ[ÛYK™[š\›Û›Y[˜\šXX›WHÏÈˆŠKš[[Z[™ÐÚ\˜XÝ\œÊˆ[ŽˆÚ]\ÜXÙ\Ð[™™]Û[™\Âˆ
+Kš\Ñ[\BˆB‚ˆš]˜]HÝ]XÈ[˜È™\ÛÛ™YÚ]ÝÜ™JˆÜ[ÛœÎˆÓSÜ[ÛœËˆÛYNˆYÙ[ÛYKˆ›Ú™XÝˆYÙ[›Ú™XÝˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×Bˆ
+HOˆYÙ[Ú]ÝÜ™HÂˆYˆ]]HÜ[ÛœËœÝ]T]Âˆ™]\›ˆYÙ[Ú]ÝÜ™Jˆ\™XÝÜžUT“ˆT“
+ˆš[UT“Ú]]ˆYÙ[ÛYK™^[™\Ù\”]
+][š\›Û›Y[ˆ[š\›Û›Y[
+Kˆ\Ñ\™XÝÜžNˆYJJBˆBˆ™]\›ˆÛYK˜Ú]ÝÜ™J›ÜŽˆ›Ú™XÝ
+BˆB‚ˆËËÈHÚ\™Y[œ]\ÝÜžKÛÜYYÛ˜ÙHœ›ÛH]È™K\›Ú™XÝØØ][Û‹‚ˆš]˜]HÝ]XÈ[˜È™\ÛÛ™Y\ÝÜžUT“
+ˆÜ[ÛœÎˆÓSÜ[ÛœËˆÛYNˆYÙ[ÛYKˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×Bˆ
+HOˆT“ÂˆYˆ]]HÜ[ÛœËš\ÝÜžT]Âˆ™]\›ˆT“
+š[UT“Ú]]ˆYÙ[ÛYK™^[™\Ù\”]
+][š\›Û›Y[ˆ[š\›Û›Y[
+JBˆBˆ]\›HÛYKš\ÝÜžUT“ˆ]YØXÞHHT“
+ˆš[UT“Ú]]ˆYÙ[ÛYK™^[™\Ù\”]
+ˆ—
+YØXÞTÝ]Q\™XÝÜžJKÚ\ÝÜžKšœÛÛˆ‹[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆYˆ\Ù\ÑY˜][ÛYJÜ[ÛœÎˆÜ[ÛœË[š\›Û›Y[ˆ[š\›Û›Y[
+KˆQš[SX[˜YÙ\‹™Y˜][™š[Q^\ÝÊ]]ˆ\›œ]
+Kˆš[SX[˜YÙ\‹™Y˜][™š[Q^\ÝÊ]]ˆYØXÞKœ]
+BˆÂˆžOÈš[SX[˜YÙ\‹™Y˜][˜Ü™X]Q\™XÝÜžJ]ˆÛYKœ›ÛÝT“Ú][\›YYX]Q\™XÝÜšY\ÎˆYJBˆžOÈš[SX[˜YÙ\‹™Y˜][˜ÛÜR][J]ˆYØXÞKÎˆ\›
+BˆBˆ™]\›ˆ\›ˆB‚ˆËËÈYÜÈHÚ[™ÛKYš[HÛÜšÜÜXÙHXZHÙ\™Y›Ü™H›Ú™XÝÈ^\ÝY[ÂˆËËÈHš\œÝ›Ú™XÝÝ\YY\Ø\™Ë[ˆÙ]ÈHš[H\ÚYHÛÈ]\ÂˆËËÈ[\ÜYÛ›HÛ˜ÙK‚ˆš]˜]HÝ]XÈ[˜È[\ÜYØXÞPÚ]Êˆ[ÈÝÜ™NˆYÙ[Ú]ÝÜ™Kˆ›Ú™XÝˆYÙ[›Ú™XÝˆÜ[ÛœÎˆÓSÜ[ÛœËˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×Bˆ
+HÂˆÝX\™Ü[ÛœËœÝ]T]OHš[\Ù\ÑY˜][ÛYJÜ[ÛœÎˆÜ[ÛœË[š\›Û›Y[ˆ[š\›Û›Y[
+Bˆ[ÙHÈ™]\›ˆBˆ]YØXÞHHT“
+ˆš[UT“Ú]]ˆYÙ[ÛYK™^[™\Ù\”]
+ˆ—
+YØXÞTÝ]Q\™XÝÜžJKØÚ]ËšœÛÛˆ‹[š\›Û›Y[ˆ[š\›Û›Y[
+JBˆÝX\™š[SX[˜YÙ\‹™Y˜][™š[Q^\ÝÊ]]ˆYØXÞKœ]
+H[ÙHÈ™]\›ˆBˆÈÂˆ˜\ˆÛÜšÜÜXÙHHžHYÙ[Ú]ÛÜšÜÜXÙK›ØY
+œ›ÛNˆYØXÞJBˆ]ÛÝ[HÛÜšÜÜXÙK˜Ú]Ë™š[\ˆÈIš\Ñ\ÜÜØX›HK˜ÛÝ[ˆžHÝÜ™K˜ÛÛ[Z]
+	ÛÜšÜÜXÙJBˆ][\ÜYHYØXÞK˜\[™[™Ô]^[œÚ[ÛŠš[\ÜYŠBˆžOÈš[SX[˜YÙ\‹™Y˜][œ™[[Ý™R][J]ˆ[\ÜY
+BˆžHš[SX[˜YÙ\‹™Y˜][›[Ý™R][J]ˆYØXÞKÎˆ[\ÜY
+Bˆš[R[™KœÝ[™\™\œ›Ü‹Üš]Jˆ]Jˆ’[\ÜY
+ÛÝ[
+HX\›Y\ˆÚ]
+ÛÝ[OHHÈˆˆˆœÈŠHœ›ÛH
+YØXÞKœ]
+H[È›Ú™XÝ	×
+›Ú™XÝ™\Ü^S˜[YJIË—ˆ‚ˆ]Ž
+JBˆHØ]ÚÂˆš[R[™KœÝ[™\™\œ›Ü‹Üš]Jˆ]JˆØ\›š[™ÎˆX\›Y\ˆÚ]È[ˆ
+YØXÞKœ]
+HÙ\™H›Ý[\ÜYˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠWˆ‚ˆ]Ž
+JBˆBˆB‚ˆËËÈH›Ú™XÝ[ÛÛÜœÈH›Û\ÛÈH\›Z[˜[ÚÝÜÈÚXÚ›Ú™XÝ\ÈÜ[‹‚ˆš]˜]HÝ]XÈ[˜È[YRJÈZNˆÛÛ™šYÝ\™Y\›Z[˜[RK›Ú™XÝˆYÙ[›Ú™XÝ
+BˆOˆÛÛ™šYÝ\™Y\›Z[˜[RBˆÂˆÝX\™][H›Ú™XÝ[[ÙHÈ™]\›ˆZHBˆ˜\ˆ[YHZBˆ[Yœ›Û\›Ü™YÜ›Ý[™H[š^ˆ™]\›ˆ[YˆB‚ˆš]˜]HÝ]XÈ[˜ÈØYÚ]ÛÜšÜÜXÙJˆœ›ÛHÝÜ™NˆYÙ[Ú]ÝÜ™Kˆ[š]X[›Ùš[NˆÙ\ÜÚ[Û”›Ùš[KˆÛÛ™šYÝ\™YYÙ[ÎˆÐYÙ[Yš[š][Û—Kˆ›ÝšY\“Ý™\œšYNˆ›ÝšY\’QËˆ[Ù[Ý™\œšYNˆÝš[™ÏËˆÜ[ÛœÎˆÓSÜ[ÛœÂˆ
+H›ÝÜÈOˆYÙ[Ú]ÛÜšÜÜXÙHÂˆ˜\ˆÛÜšÜÜXÙHHžHÝÜ™K›ØYÛÜšÜÜXÙHÈ\œ›Üˆ[‚ˆš[R[™KœÝ[™\™\œ›Ü‹Üš]Jˆ]JØ\›š[™ÎˆÚÚ\YHÚ]š[Kˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠWˆ‹]Ž
+JBˆBˆÞ[˜Ú›Ûš^™PÛÛ™šYÝ\™YYÙ[Ù][™ÜÊ[Žˆ	ÛÜšÜÜXÙKYÙ[ÎˆÛÛ™šYÝ\™YYÙ[ÊBˆ]Ý™\œšY\Ó[Z]ÈBˆÜ[ÛœË›X^ÛÛØ[ÈOHš[Ü[ÛœË›X^[Ù[\›œÈOHš[ˆÜ[ÛœË›X^ÝX˜YÙ[ÈOHš[ˆYˆ›ÝšY\“Ý™\œšYHOHš[[Ù[Ý™\œšYHOHš[Ý™\œšY\Ó[Z]ÈÂˆ›Üˆ˜\ˆÚ][ˆÛÜšÜÜXÙK˜Ú]ÈÂˆYˆ]›ÝšY\“Ý™\œšYHÈÚ]œš[X\žPYÙ[œ›ÝšY\ˆH›ÝšY\“Ý™\œšYHBˆYˆ][Ù[Ý™\œšYHÈÚ]œš[X\žPYÙ[›[Ù[H[Ù[Ý™\œšYHBˆÜ[ÛœË˜\S[Z]Ý™\œšY\ÊÎˆ	˜Ú]œš[X\žPYÙ[›[Z]ÊBˆÛÜšÜÜXÙK\Ù\
+Ú]
+BˆBˆBˆËÈZÙHHØÚÙ]XZH\]™\žH][˜ÚÜ[œÈHœ™\ÚÚ][™ÙY\ÈBˆËÈX\›Y\ˆÛ™\ÈÛ™HØÚ]\ÙX]Ø^NÈK\™\Ý[YX™[Ü[œÈHØ]™YÚ][œÝXY‚ˆYˆÜ[ÛœËœ™\Ý[YHÂˆYˆ]Ù[XÝÜˆHÜ[ÛœËœ™\Ý[YTÙ[XÝÜˆÂˆÝX\™]Ú]H™\ÛÛ™PÚ]
+Ù[XÝÜ‹[ŽˆÛÜšÜÜXÙJH[ÙHÂˆ›ÝÈÓQ\œ›Ü‹[šÛ›ÝÛÚ]
+Ù[XÝÜŠBˆBˆÛÜšÜÜXÙKœÙ[XÝÚ]
+YˆÚ]šY
+Bˆ™]\›ˆÛÜšÜÜXÙBˆBˆYˆ]™XÙ[HÛÜšÜÜXÙK›[ÜÝ™XÙ[Ú]ÂˆÛÜšÜÜXÙKœÙ[XÝÚ]
+Yˆ™XÙ[šY
+Bˆ™]\›ˆÛÜšÜÜXÙBˆBˆBˆÛÜšÜÜXÙKœÝ\™]ÐÚ]
+š[X\žPYÙ[ˆ[š]X[›Ùš[K˜YÙ[Yš[š][ÛŠBˆ™]\›ˆÛÜšÜÜXÙBˆB‚ˆËËÈÚ]š[\È™]Z[ˆ[ˆYÙ[Û˜\ÚÝ›ÜˆÜXš[]K]™]\ØX›HYÙ[ˆËËÈÛÛ›ÛÈ\™HÛÛ™šYÝ\™Y[ˆXZKšœÛÛ‹ˆ™Yœ™\Ú[™È[H™]™[È[ˆÛˆËËÈÚ]œ›ÛHX\ÚÚ[™ÈÜˆÝ™\Üš][™È™]Ù\ˆÙY]ÛÛ™šYØ[™ÜÙ]˜[Y\Ë‚ˆš]˜]HÝ]XÈ[˜ÈÞ[˜Ú›Ûš^™PÛÛ™šYÝ\™YYÙ[Ù][™ÜÊˆ[ˆÛÜšÜÜXÙNˆ[›Ý]YÙ[Ú]ÛÜšÜÜXÙKˆYÙ[ÎˆÐYÙ[Yš[š][Û—Bˆ
+HÂˆ]ÛÛ™šYÝ\™YžRQHXÝ[Û˜\žJ[š\]YRÙ^\ÕÚ]˜[Y\ÎˆYÙ[Ë›X\È
+	šY	
+HJBˆ›Üˆ˜\ˆÚ][ˆÛÜšÜÜXÙK˜Ú]ÈÂˆÝX\™]ÛÛ™šYÝ\™YHÛÛ™šYÝ\™YžRQØÚ]œš[X\žPYÙ[šYH[ÙHÈÛÛ[YHBˆ\PÛÛ™šYÝ\™YYÙ[Ù][™ÜÊÛÛ™šYÝ\™YÎˆ	˜Ú]
+BˆÛÜšÜÜXÙK\Ù\
+Ú]
+BˆBˆB‚ˆš]˜]HÝ]XÈ[˜È\PÛÛ™šYÝ\™YYÙ[Ù][™ÜÊˆÈÛÛ™šYÝ\™YˆYÙ[Yš[š][Û‹ˆÈÚ]ˆ[›Ý]YÙ[Ú]ˆ
+HÂˆ]™]š[Ý\Ò[œÝXÝ[ÛœÈHÚ]œš[X\žPYÙ[š[œÝXÝ[ÛœÂˆÚ]œš[X\žPYÙ[›[Z]ÈHÛÛ™šYÝ\™Y›[Z]ÂˆÚ]œš[X\žPYÙ[ÛÛØ[[™ÔÝ˜]YÞHHÛÛ™šYÝ\™YÛÛØ[[™ÔÝ˜]YÞBˆÚ]œš[X\žPYÙ[š[œÝXÝ[ÛœÈHÛÛ™šYÝ\™Yš[œÝXÝ[ÛœÂˆÚ]œš[X\žPYÙ[œÞ\Ý[T›Û\HÛÛ™šYÝ\™YœÞ\Ý[T›Û\ˆËÈHÚ]ÙY\ÈHÛÜHÙˆ]ÈYÙ[[™]™\žHÛÛÚ[™ÙHXYHœ›ÛHBˆËÈ‘T\ÈØ]™Y[ÈHÛÛ™šYÝ\˜][Û‹ÛÈHÛÛ™šYÝ\˜][Ûˆ\ÈH]‚ˆËÈHÚ]Ü[™YY\ˆHÜ›Ý\Ø\È[˜X›Y]\ÝÙYHH™]ÈÛÛÈÛË‚ˆÚ]œš[X\žPYÙ[ÛÛ˜[Y\ÈHÛÛ™šYÝ\™YÛÛ˜[Y\ÂˆÚ]œš[X\žPYÙ[ÛÛÜ›Ý\˜[Y\ÈHÛÛ™šYÝ\™YÛÛÜ›Ý\˜[Y\ÂˆÚ]œš[X\žPYÙ[œÝX˜YÙ[˜[Y\ÈHÛÛ™šYÝ\™YœÝX˜YÙ[˜[Y\ÂˆÚ]œš[X\žPYÙ[ÛÛ[YØ][ÛˆHÛÛ™šYÝ\™YÛÛ[YØ][Û‚ˆÚ]œš[X\žPYÙ[\ÙUÛÛ›ÞHHÛÛ™šYÝ\™Y\ÙUÛÛ›ÞBˆÚ]œš[X\žPYÙ[œ›ÞQ^ÜÙYÛÛÈHÛÛ™šYÝ\™Yœ›ÞQ^ÜÙYÛÛÂˆÚ]œš[X\žPYÙ[˜ÛÛ^HÛÛ™šYÝ\™Y˜ÛÛ^ˆÝX\™™]š[Ý\Ò[œÝXÝ[ÛœÈOHÛÛ™šYÝ\™Yš[œÝXÝ[ÛœÈ[ÙHÈ™]\›ˆBˆ˜\ˆ˜[œØÜš\HYÙ[˜[œØÜš\
+Y\ÜØYÙ\ÎˆÚ]›Y\ÜØYÙ\ÊBˆYˆ][™^H˜[œØÜš\›Y\ÜØYÙ\Ë™š\œÝ[™^
+Ú\™NˆÂˆ	œ›ÛHOHœÞ\Ý[H	‰ˆ	^OH™]š[Ý\Ò[œÝXÝ[ÛœÂˆJHÂˆYˆÛÛ™šYÝ\™Yš[œÝXÝ[ÛœËš\Ñ[\HÂˆÈHžOÈ˜[œØÜš\œ™[[Ý™SY\ÜØYÙJ]ˆ[™^
+BˆH[ÙHÂˆÈHžOÈ˜[œØÜš\™Y]Y\ÜØYÙJ]ˆ[™^^ˆÛÛ™šYÝ\™Yš[œÝXÝ[ÛœÊBˆBˆH[ÙHYˆXÛÛ™šYÝ\™Yš[œÝXÝ[ÛœËš\Ñ[\HÂˆ˜[œØÜš\œ™\XÙP[
+Ú]ˆËœÞ\Ý[JÛÛ™šYÝ\™Yš[œÝXÝ[ÛœÊWH
+È˜[œØÜš\›Y\ÜØYÙ\ÊBˆBˆÚ]›Y\ÜØYÙ\ÈH˜[œØÜš\›Y\ÜØYÙ\ÂˆB‚ˆš]˜]HÝ]XÈ[˜ÈÚ]\Z[™ÐÛÛ™šYÝ\™YYÙ[Ù][™ÜÊˆÈÚ]ˆYÙ[Ú]ˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛÂˆ
+HOˆYÙ[Ú]ÂˆÝX\™ˆ]ÛÛ™šYÝ\™YHÛÛ™šYÝ\˜][ÛË˜YÙ[Ë™š\œÝ
+Ú\™NˆÈ	šYOHÚ]œš[X\žPYÙ[šYJBˆ[ÙHÈ™]\›ˆÚ]Bˆ˜\ˆÚ]HÚ]ˆ\PÛÛ™šYÝ\™YYÙ[Ù][™ÜÊÛÛ™šYÝ\™YÎˆ	˜Ú]
+Bˆ™]\›ˆÚ]ˆB‚ˆËËÈÛÛ[Z]ÈHÛÜšÜÜXÙHÈH›Ú™XÝ	ÜÈÚ]ÝÜ™KˆHÙ[XÝYˆËËÈXÙZÛ\ˆÝ^\È[ˆY[[ÜžHÚ[HH‘T[œÈ[™\È›ÜYÚ[ˆ]ˆËËÈÛÜÙ\ÎÈHÝÜ™H™]™\ˆÜš]\ÈHXÙZÛ\‹ÛÈ[ˆ[\HÚ]X]™\È›ÂˆËËÈš[H™Z[™ÝÙ]™\ˆH›ØÙ\ÜÈ[™Ë‚ˆš]˜]HÝ]XÈ[˜ÈØ]™UÛÜšÜÜXÙJˆÈÛÜšÜÜXÙNˆ[›Ý]YÙ[Ú]ÛÜšÜÜXÙKˆÝÜ™NˆYÙ[Ú]ÝÜ™Kˆ\›Z[˜[ˆ\›Z[˜[Üš]\‹ˆÛÜÚ[™Îˆ›ÛÛH˜[ÙBˆ
+H\Þ[˜ÈÂˆÛÜšÜÜXÙKœ™[[Ý™Q\ÜÜØX›PÚ]ÊÙY\[™ÎˆÛÜÚ[™ÈÈš[ˆÛÜšÜÜXÙKœÙ[XÝYÚ]Q
+BˆÈÂˆžHÝÜ™K˜ÛÛ[Z]
+	ÛÜšÜÜXÙJBˆHØ]ÚÂˆ]ØZ]\›Z[˜[›[™JˆØ\›š[™ÎˆÚ]ÈÙ\™H›ÝØ]™Yˆ
+\œ›Ü‹›ØØ[^™Y\ØÜš\[ÛŠH‹ˆÎˆœÝ[™\™\œ›ÜŠBˆBˆB‚ˆÚYˆPRWÒT×Õ’TÕPSˆš]˜]HÝ]XÈ[˜Èš\ÝX[Û˜\ÚÝ
+›ÜˆÛÜšÜÜXÙNˆYÙ[Ú]ÛÜšÜÜXÙJHOˆš\ÝX[ÛÜšÜÜXÙTÛ˜\ÚÝˆÂˆ]ÛÛ™\œØ][ÛœÈHÛÜšÜÜXÙK˜Ú]Ë›X\ÈÚ][‚ˆš\ÝX[ÛÛ™\œØ][Û”ÙYY
+ˆYˆÚ]šYˆ]NˆÚ]]Kˆ›Ùš[NˆÚ]œš[X\žPYÙ[ˆY\ÜØYÙ\ÎˆÚ]›Y\ÜØYÙ\Ëˆ[™[™ÐÛÛ[ˆÚ]œ[™[™ÐÛÛ[ˆÙ\ÜÚ[Û’QˆÚ]œÙ\ÜÚ[Û’Q
+BˆBˆ™]\›ˆš\ÝX[ÛÜšÜÜXÙTÛ˜\ÚÝ
+ˆÛÛ™\œØ][ÛœÎˆÛÛ™\œØ][ÛœËˆ^[Ý]ˆ[™S^[Ý]
+ÛÛ™\œØ][ÛŽˆÛÜšÜÜXÙKœÙ[XÝYÚ]QÏÈÛÛ™\œØ][ÛœÖÌKšY
+JBˆB‚ˆš]˜]HÝ]XÈ[˜ÈÚ]ÛÜšÜÜXÙJˆœ›ÛHÛ˜\ÚÝˆš\ÝX[ÛÜšÜÜXÙTÛ˜\ÚÝˆ›ØÝ\ÙYQˆURQˆ™]š[Ý\ÎˆYÙ[Ú]ÛÜšÜÜXÙBˆ
+HOˆYÙ[Ú]ÛÜšÜÜXÙHÂˆ]™]š[Ý\ÐžRQHXÝ[Û˜\žJ[š\]YRÙ^\ÕÚ]˜[Y\Îˆ™]š[Ý\Ë˜Ú]Ë›X\È
+	šY	
+HJBˆ]Ú]ÈHÛ˜\ÚÝ˜ÛÛ™\œØ][ÛœË›X\ÈÛÛ™\œØ][Ûˆ[‚ˆ]ÛH™]š[Ý\ÐžRQØÛÛ™\œØ][Û‹šYBˆ][ÝXÚYBˆÛ›X\Âˆ	]HOHÛÛ™\œØ][Û‹]H	‰ˆ	œš[X\žPYÙ[OHÛÛ™\œØ][Û‹œ›Ùš[Bˆ	‰ˆ	›Y\ÜØYÙ\ÈOHÛÛ™\œØ][Û‹›Y\ÜØYÙ\Âˆ	‰ˆ	œ[™[™ÐÛÛ[OHÛÛ™\œØ][Û‹œ[™[™ÐÛÛ[ˆHÏÈ˜[ÙBˆ™]\›ˆYÙ[Ú]
+ˆYˆÛÛ™\œØ][Û‹šYˆ]NˆÛÛ™\œØ][Û‹]Kˆš[X\žPYÙ[ˆÛÛ™\œØ][Û‹œ›Ùš[KˆY\ÜØYÙ\ÎˆÛÛ™\œØ][Û‹›Y\ÜØYÙ\Ëˆ[™[™ÐÛÛ[ˆÛÛ™\œØ][Û‹œ[™[™ÐÛÛ[ˆÜ™X]Y]ˆÛË˜Ü™X]Y]ÏÈ]J
+Kˆ\]Y]ˆ[ÝXÚYÈÛK\]Y]ˆ]J
+Kˆ\Ð\˜Ú]™YˆÛËš\Ð\˜Ú]™YÏÈ˜[ÙKˆÙ\ÜÚ[Û’QˆÛÛ™\œØ][Û‹œÙ\ÜÚ[Û’QˆÝX˜YÙ[ÎˆÛËœÝX˜YÙ[ÈÏÈ×JBˆBˆ™]\›ˆYÙ[Ú]ÛÜšÜÜXÙJÚ]ÎˆÚ]ËÙ[XÝYÚ]Qˆ›ØÝ\ÙYQ
+BˆBˆÙ[™Y‚‚ˆš]˜]HÝ]XÈ[˜ÈÛÛ\][ÛØ[™Y]\ÊˆÛÜšÜÜXÙNˆYÙ[Ú]ÛÜšÜÜXÙKˆÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][ÛËˆÚÚ[ÎˆÐYÙ[ÚÚ[HH×Bˆ
+HOˆÔÝš[™×HÂˆ˜\ˆ˜[Y\ÈHÂˆ‹Ú[‹‹Ú[Ù]‹‹Ù^]‹‹Ü]Z]‹‹ÜÙ][ÛÈÛˆ‹‹ÜÙ][ÛÈÙ™ˆ‹ˆ‹ÜÙ]ZKˆ‹‹ÜÙ]Y™›Ü‹‹ÜÙ]Y™›ÜÙ™ˆ‹‹ÜÙ]Y™›Ü]]È‹‹Û›Ý[šÈ‹ˆ‹ÜÙ]ZK[šÚ[™ÈÝ]\È‹‹ÜÙ]ZK[šÚ[™È[™H‹‹ÜÙ]ZK[šÚ[™È™YH‹ˆ‹ÜÙ]ZK[šÚ[™Èš]™H‹‹ÜÙ]ZK[šÚ[™È[‹ˆ‹ØÈ‹ˆ‹Ú[Y[[ÜžH‹‹Ú[YÙ[È‹‹Ú[Ú]‹‹Ú[Y]‹‹Ú[ÛÛÈ‹ˆ‹ØYÙ[XÜ\Ý‹‹ØYÙ[XÜY‹‹ØYÙ[ÈXÜ\Ý‹ˆ‹ÛY[[ÜžH‹‹ÛY[[ÜžHY]‹‹ÛY[[ÜžHX\›ˆ‹‹ÛY[[ÜžHX\›ˆKX[‹‹ÛY[[ÜžHY‹ˆ‹ÛY[[ÜžHÛX\ˆ‹‹ÛY[[ÜžHÛˆ‹‹ÛY[[ÜžHÙ™ˆ‹‹ÛY[[ÜžHØÛÜH›Û™H‹ˆ‹ÛY[[ÜžHØÛÜH›Ú™XÝ‹‹ÛY[[ÜžHØÛÜH[‹‹ÙY]Y[[ÜžH‹‹ÙY]Y[[ÜžK\›Û\‹ˆ‹Ú[ÙÈ‹‹ÝÙÈ‹‹ÝÙÈY‹‹ÝÙÈÛ™H‹‹ÝÙÈY]‹‹ÝÙÈÝÙY\‹ˆ‹ÝÙÈÛX\ˆ‹‹ÝÙÈ]‹ˆ‹ÜÙ][Z]Ëˆ‹‹ÜÙ][Z]Ë›X^ÛÛØ[È‹‹ÜÙ][Z]Ë›X^[Ù[\›œÈ‹ˆ‹ÜÙ][Z]Ë›X^ÝX˜YÙ[È‹‹ÜÙ][Z]Ë›X^ÙXÛÛ™È‹‹ÜÙ][Z]Ë›X^Ý[ÚÙ[œÈ‹ˆ‹ÜÙ]™]žK˜][\È‹‹ÜÙ]™]žK™[^H‹‹ÜÙ]ÝœÝ˜]YÞH‹‹ÜÙ]Ý˜ÛÛ\XÝ‹ˆ‹ÜÙ]Ý˜ÛÛ\XÝÙ™ˆ‹ˆ‹ØÛÛ[YH‹‹ÜÝÜ‹ˆ‹ÜÙ]ÛÛˆ‹‹ÜÙ]ÛÛ˜Ø[[™È]]ÛX]XÈ‹‹ÜÙ]ÛÛ˜Ø[[™È˜]]™H‹ˆ‹ÜÙ]ÛÛ˜Ø[[™È^‹‹ÜÙ]ÛÛ˜Ø[[™È[‹‹ÜÙ]ÛÛ˜Ø[[™ÈœÛÛˆ‹ˆ‹ÜÙ]ÛÛœ›ÞHÛˆ‹‹ÜÙ]ÛÛœ›ÞHÙ™ˆ‹ˆ‹ÜÙ]ZK]H‹‹ÜÙ]ZK]H›Û™H‹‹ÜÙ]ZK™Y]Üˆ‹‹ÜÙ]ZK™Y]Üˆ›Û™H‹ˆ‹ÜÙ]ZK˜™Û[™H™ØŽŒ‹‹ÜÙ]ZK˜™Û[™H›Û™H‹ˆ‹ÜÙ]ZK™™Ü›Û\Y[ÝÈ‹ˆ‹ÜÙ]ZK™™ØÛÛÜˆ›Û™H‹‹ÜÙ]ZK˜™ØÛÛÜˆ›Û™H‹‹ÜÙ]ZK˜™Ü›Û\›Û™H‹ˆ‹ÜÙ]ZK™™ÝÛÛ™\Ý[Y[ÝÈ‹‹ÜÙ]\ÙKˆ‹‹ÜÙ]\ÙK˜YÙ[ÛYÛˆ‹‹ÜÙ]\ÙK˜YÙ[ÛYÙ™ˆ‹ˆ‹ÜÙ]\ÙKœ[ˆÛˆ‹‹ÜÙ]\ÙKœ[ˆÙ™ˆ‹ˆ‹ÜÙ]ZK˜›ÛÛˆ‹‹ÜÙ]ZK˜›ÛÙ™ˆ‹‹ÜÙ]ZK›X\šÙÝÛˆÛˆ‹‹ÜÙ]ZK›X\šÙÝÛˆÙ™ˆ‹ˆ‹ÜÙ]ZKÛÛ™\Ý[[™\È[‹‹ÜÙ]ZKÛÛ™\Ý[[™\È‹ˆ‹ØÝÙ‹‹ÜÙ‹‹ØÙ‹‹ÜYÚ[œÈ‹ˆ‹Ü›ÝšY\œÈ‹‹Û[Ù[È‹‹Ü›ÝšY\ˆ‹‹Ø˜\Ù]\›‹‹Û[Ù[‹‹Ü›Û\È‹‹Ü›Û\‹ˆ‹Ü›Û\\Ý‹‹Ü›Û\ÚÝÈ‹‹Ü›Û\Y‹‹Ü›Û\Ù]‹‹Ü›Û\Y]‹ˆ‹Ü›Û\›H‹‹Ü›Û\\ÙH‹‹Ú[›Û\È‹‹Ü›Û\È\Ý‹‹Ü›Û\ÈÚÝÈ‹ˆ‹Ü›Û\ÈY‹‹Ü›Û\ÈY]‹‹Ü›Û\È›H‹‹ÙY]\Ù\ˆ‹‹ÙY]Þ\Ý[H‹ˆ‹ØYÙ[È‹‹ØYÙ[È™YH‹‹ØYÙ[ÈÛX\ˆ‹‹ØYÙ[ÈÙÈ‹‹ØYÙ[ÈÚ[‹‹ØYÙ[È›ØÝ\È‹ˆ‹ØYÙ[È›ØÝ\ÈXZ[ˆ‹‹Ü]Y]YH‹‹Ü]Y]YH\Ú‹‹Ü]Y]YHÜ‹‹Ü]Y]YH›Ü‹ˆ‹Ú[]Y]YH‹‹Ú[^Ü‹‹Ú[[\Ü‹‹Ù^Ü\˜Ú]™H‹‹Ú[\Ü‹ˆ‹Ù^ÜX\šÙÝÛˆ‹‹Ù^Ü[‹‹Ù^ÜœÛÛˆ‹‹Ù^ÜXYÈ‹ˆ‹ÜÝ]È‹‹ÜÝ]È˜[šÚ[™È‹‹ÜÝ]ÈÜYY‹‹ÜÝ]È[YH‹‹ÜÝ]ÈY™šXÚY[˜ÞH‹ˆ‹ÜÝ]ÈÚÝÈ‹ˆ‹ÜÝ]È™\Ù]‹‹ÜÝ]È›H‹‹ÜÝ]È]‹‹Ú[Ý]È‹ˆ‹Ù^Ü\Xˆ‹‹Ù^ÜØÞ‹‹ÜÙ]ZKœÝX˜YÙ[È[‹‹ÜÙ]ZKœÝX˜YÙ[ÈÛÛÈ‹ˆ‹ÜÙ]ZKœÝX˜YÙ[ÈÝ]È‹‹ÜÙ]ZKœÝX˜YÙ[È›Û™H‹ˆ‹ØYÙ[\ÙH‹ˆ‹ØYÙ[ÚÝÈ‹‹ØYÙ[Y‹‹ØYÙ[ÛÛÈ‹‹ØYÙ[[Ù[‹‹ØYÙ[›Û\‹ˆ‹ØYÙ[›ÝšY\ˆ‹‹ØYÙ[™[[Ý™H‹‹ÙY]YÙ[‹‹ÝÛÛÈ‹ˆ‹ÜÚÚ[È‹‹ÜÚÚ[È\Ý‹‹ÜÚÚ[ÈÚÝÈ‹‹ÜÚÚ[È[˜X›H‹‹ÜÚÚ[È\ØX›H‹ˆ‹ÜÚÚ[È[˜X›H[‹‹ÜÚÚ[È\ØX›H[‹‹ÜÚÚ[È›Û\‹‹ÜÚÚ[È]‹ˆ‹ÜÚÚ[È™[ØY‹‹Ú[ÚÚ[È‹ˆ‹ÛXÜ\Ý‹ˆ‹ÛXÜY‹‹ÛXÜ[˜X›H‹‹ÛXÜ\ØX›H‹ˆ‹ÙY]›Û\‹‹ÙY]ÛÛ\XÝ‹‹ÙY]ÛÛ™šYÈ‹‹ÙY]XÜÈ‹‹ÙY]›ÝšY\ˆ‹ˆ‹ÙY][œ]‹ˆ‹ØÚ]ÛÛ\XÝ‹ˆ‹Ú[XYÙH[žH‹‹Ú[XYÙHÛX[‹‹Ú[XYÙHYY][H‹‹Ú[XYÙHšYÈ‹‹Ú[XYÙH[‹ˆ‹Ú[XYÙHØÜˆ‹‹Ø]XÚ‹‹Ø]XÚÛÝ\˜ÙH‹‹Ø]XÚX\šÙÝÛˆ‹‹Ø]XÚÛÜH‹ˆ‹Ø]XÚÛX\ˆ‹‹ØÛÜH‹‹Ú[ÛÜH‹‹Ü™\H‹‹Ú[™\H‹ˆ‹ØÛX\ˆ‹‹ØÚ]\Ý‹ˆ‹ØÚ]\ÝXÝ]™H‹‹ØÚ]\Ý\˜Ú]™Y‹‹ØÚ]\Ý[‹‹ØÚ]™]È‹ˆ‹ØÚ]\ÙH‹‹ØÚ]™^‹‹ØÚ]™]š[Ý\È‹‹ØÚ][™›È‹‹ØÚ]Ù\ÜÚ[Ûˆ‹ˆ‹ØÚ]Ù\ÜÚ[Ûˆ™]È‹‹ØÚ]™[˜[YH‹ˆ‹ØÚ]\˜Ú]™H‹‹ØÚ][˜\˜Ú]™H‹‹ØÚ]ÛÜÙHÛÛ™š\›H‹‹ØÚ]Y\ÜØYÙ\È‹ˆ‹ØÚ]ÙÈ‹‹ØÚ]Y]‹‹ØÚ]™[[Ý™H‹‹ØÚ][™È‹‹ØÚ]š[H‹ˆ‹ØÚ]ÛX\ˆ‹‹Ü›Ú™XÝ‹‹Ü›Ú™XÝ[™›È‹‹Ü›Ú™XÝ\Ý‹‹Ü›Ú™XÝ˜[YH‹ˆ‹Ü›Ú™XÝ[‹‹Ü›Ú™XÝ[›Û™H‹‹Ü›Ú™XÝ›Ü™Ù]‹ˆBˆ›Üˆ[[ˆYÙ[›Ú™XÝ[œ™\Ù]˜[Y\ÈÂˆ˜[Y\Ë˜\[™
+‹Ü›Ú™XÝ[
+[
+HŠBˆBˆÚYˆPRWÒT×Õ’TÕPSˆ˜[Y\Ë˜\[™
+‹Ýš\ÝX[ŠBˆÙ[™Y‚ˆ›Üˆ
+[™^Ú]
+H[ˆÛÜšÜÜXÙK›Ü™\™YÚ]Ë™[[Y\˜]Y
+
+HÂˆ˜[Y\Ë˜\[™
+‹ØÚ]\ÙH
+[™^
+ÈJHŠBˆ˜[Y\Ë˜\[™
+‹ØÚ]\ÙH
+Ú]šY]ZYÝš[™Ëœ™Yš^
+
+JHŠBˆ˜[Y\Ë˜\[™
+‹ØÚ]\ÙH
+Ú]™\Ü^U]JHŠBˆ˜[Y\Ë˜\[™
+‹ØÚ][™›È
+[™^
+ÈJHŠBˆ˜[Y\Ë˜\[™
+Ú]š\Ð\˜Ú]™YÈ‹ØÚ][˜\˜Ú]™H
+[™^
+ÈJHˆˆ‹ØÚ]\˜Ú]™H
+[™^
+ÈJHŠBˆBˆ›ÜˆYÙ[[ˆÛÛ™šYÝ\˜][ÛË˜YÙ[ÈÏÈ×HÂˆ˜[Y\Ë˜\[™
+‹ØYÙ[\ÙH
+YÙ[šY
+HŠBˆ˜[Y\Ë˜\[™
+‹ØYÙ[ÚÝÈ
+YÙ[šY
+HŠBˆ˜[Y\Ë˜\[™
+‹ØÚ]™]ÈKXYÙ[
+YÙ[šY
+HŠBˆBˆ›Üˆ˜[YH[ˆÛÛ™šYÝ\˜][ÛËœ›Û\ÏËœÞ\Ý[KšÙ^\ËœÛÜY
+
+HÏÈ×HÂˆ˜[Y\Ë˜\[™
+‹Ü›Û\
+˜[YJHŠBˆ˜[Y\Ë˜\[™
+‹ÙY]›Û\
+˜[YJHŠBˆ˜[Y\Ë˜\[™
+‹ÙY]
+˜[YJHŠBˆBˆ›Üˆ›ÝšY\ˆ[ˆÛÛ™šYÝ\˜][ÛËœ›ÝšY\œÈÏÈ×HÂˆ˜[Y\Ë˜\[™
+‹Ü›ÝšY\ˆ
+›ÝšY\‹šY
+HŠBˆ˜[Y\Ë˜\[™
+‹Û[Ù[È
+›ÝšY\‹šY
+HŠBˆ˜[Y\Ë˜\[™
+‹ÙY]›ÝšY\ˆ
+›ÝšY\‹šY
+HŠBˆBˆ›ÜˆÚÚ[[ˆÚÚ[ÈÂˆ˜[Y\Ë˜\[™
+‹ÜÚÚ[ÈÚÝÈ
+ÚÚ[›˜[YJHŠBˆ˜[Y\Ë˜\[™
+‹ÜÚÚ[È›Û\
+ÚÚ[›˜[YJHŠBˆYˆÚÚ[š\Ó[Ù[[›ØØX›HÂˆ˜[Y\Ë˜\[™
+‹ÜÚÚ[È[˜X›H
+ÚÚ[›˜[YJHŠBˆ˜[Y\Ë˜\[™
+‹ÜÚÚ[È\ØX›H
+ÚÚ[›˜[YJHŠBˆBˆBˆ]Ø][ÙÈHÛÛ™šYÝ\˜][ÛËœ›Û\Ø][ÙÊÚÚ[ÎˆÚÚ[ÊHÏÈ›Û\Ø][ÙÊÚÚ[ÎˆÚÚ[ÊBˆ›Üˆ[žH[ˆØ][ÙË™[šY\ÈÂˆ˜[Y\Ë˜\[™
+‰
+[žK˜ÛÛ[X[™˜[YJHŠBˆ˜[Y\Ë˜\[™
+‹Ü›Û\È
+[žK˜ÛÛ[X[™˜[YJHŠBˆ˜[Y\Ë˜\[™
+‹Ü›Û\ÈÚÝÈ
+[žK˜ÛÛ[X[™˜[YJHŠBˆBˆ›Üˆ˜[YH[ˆ
+ÛÛ™šYÝ\˜][ÛËœ›Û\ÏË\Ù\ˆÏÈÎ—JKšÙ^\ËœÛÜY
+
+HÂˆ˜[Y\Ë˜\[™
+‹Ü›Û\ÈY]
+˜[YJHŠBˆ˜[Y\Ë˜\[™
+‹Ü›Û\È›H
+˜[YJHŠBˆ˜[Y\Ë˜\[™
+‹ÙY]\Ù\ˆ
+˜[YJHŠBˆBˆ˜\ˆÜ›Ý\˜[Y\ÈHÙ]
+ÛÜšÜÜXÙK˜Ú]Ë™›]X\
+œš[X\žPYÙ[ÛÛÜ›Ý\˜[Y\ÊJBˆYˆÚÚ[Ë˜ÛÛZ[œÊÚ\™Nˆš\Ó[Ù[[›ØØX›JHÈÜ›Ý\˜[Y\Ëš[œÙ\
+XZTÚÚ[ÛÛË™Ü›Ý\Q
+HBˆYˆÛÛ™šYÝ\˜][ÛËÛÛÛÝ\˜Ù\Ë˜ÛÛZ[œÊÚ\™NˆÂˆ	™[˜X›Y	‰ˆ	šÚ[™OHXZTÝ[™\™ÛÛÔYÚ[‹™˜XÝÜžRÚ[™ˆJHOHYHÂˆÜ›Ý\˜[Y\Ë™›Ü›U[š[ÛŠˆÂˆ™XÚÈ‹™]][YH‹˜Ø[È‹™š[\È‹œ[ˆ‹ÙX]\ˆ‹ÙXˆ‹›X\ÝÙÛˆ‹™Ú]Xˆ‹ˆÙÈ‹˜ÛÛ^‹ˆJBˆBˆ›Üˆ]™[[ˆ™X\ÛÛš[™ÑY™›Ü›˜[Y\ÈÂˆ˜[Y\Ë˜\[™
+‹ÜÙ]Y™›Ü
+]™[
+HŠBˆBˆ›ÜˆÜ›Ý\[ˆÜ›Ý\˜[Y\ÈÂˆ˜[Y\Ë˜\[™
+‹ÝÛÛÈÚÝÈ
+Ü›Ý\
+HŠBˆ˜[Y\Ë˜\[™
+‹ÝÛÛÈ[˜X›H
+Ü›Ý\
+HŠBˆ˜[Y\Ë˜\[™
+‹ÝÛÛÈ\ØX›H
+Ü›Ý\
+HŠBˆ˜[Y\Ë˜\[™
+‹ÝÛÛÈÙ]
+Ü›Ý\
+HŠBˆBˆ™]\›ˆ\œ˜^JÙ]
+˜[Y\ÊJBˆB‚ˆš]˜]HÝ]XÈ[˜ÈØYÛÛ™šYÝ\˜][ÛŠˆÜ[ÛœÎˆÓSÜ[ÛœËˆ[š\›Û›Y[ˆÔÝš[™ÎˆÝš[™×Bˆ
+H›ÝÜÈOˆ
+ÛÛ™šYÝ\˜][ÛŽˆXZPÛÛ™šYÝ\˜][Û‹]ˆÝš[™ÊOÈÂˆYˆ]^XÚ]HÜ[ÛœË˜ÛÛ™šYÔ]Âˆ]^[™YHYÙ[ÛYK™^[™\Ù\”]
+^XÚ][š\›Û›Y[ˆ[š\›Û›Y[
+BˆÝX\™š[SX[˜YÙ\‹™Y˜][™š[Q^\ÝÊ]]ˆ^[™Y
+H[ÙHÂˆ›ÝÈÓQ\œ›Ü‹˜ÛÛ™šYÓ›Ý›Ý[™
+^[™Y
+BˆBˆ™]\›ˆ
+žHXZPÛÛ™šYÝ\˜][Û‹›ØY
+œ›ÛNˆT“
+š[UT“Ú]]ˆ^[™Y
+JK^[™Y
+BˆBˆ]Ø[™Y]\ÈHÂˆš[SX[˜YÙ\‹™Y˜][˜Ý\œ™[\™XÝÜžT]
+È‹ÜXZKšœÛÛˆ‹ˆY˜][ÛÛ™šYÝ\˜][Û”]
+[š\›Û›Y[ˆ[š\›Û›Y[
+KˆBˆ›Üˆ][ˆØ[™Y]\ÈÚ\™Hš[SX[˜YÙ\‹™Y˜][™š[Q^\ÝÊ]]ˆ]
+HÂˆ™]\›ˆ
+žHXZPÛÛ™šYÝ\˜][Û‹›ØY
+œ›ÛNˆT“
+š[UT“Ú]]ˆ]
+JK]
+BˆBˆ™]\›ˆš[ˆB‚ˆËËÈ™XYÈÝ[™\™[œ]È]È[™[™]XÚ\È]\ÈH^š[KHØ^BˆËËÈØ]XÚÙ\ÈÚ]Hš[HÛˆ\ÚËˆÚ]HY\ÜØYÙHÛˆHÛÛ[X[™[™BˆËËÈH[ˆ\ÈÛ™K\ÚÝÈÚ]Ý]Û™HH‘T›ÛÝÜËÛÈH\›Z[˜[ZÙ\ÂˆËËÈÝ™\ˆ\ÈÝ[™\™[œ]ÚXÚ™YYÈÛ™HÈ^\Ý‚ˆš]˜]HÝ]XÈ[˜ÈÝ[]XÚY[
+™[Ü[š[™Õ\›Z[˜[ˆ›ÛÛ
+H›ÝÜÈOˆÛÛ[\Âˆ]]HHš[R[™KœÝ[™\™[œ]œ™XY]UÑ[™Ù‘š[J
+Bˆ]]XÚY[HžHØÝ[Y[]XÚY[[\Ü\‹˜]XÚY[
+]Nˆ]Kš[[˜[YNˆœÝ[‹ŠBˆYˆ™[Ü[š[™Õ\›Z[˜[ÂˆÚYˆÜÊÚ[™ÝÜÊBˆÝX\™Ú[™ÝÜÐÛÛœÛÛKœ™[Ü[”Ý[™\™[œ]ÛÛÛœÛÛJ
+H[ÙHÂˆ›ÝÈÓQ\œ›Ü‹œÝ[•Ú]Ý]\›Z[˜[ˆBˆÙ[ÙBˆ]HHÜ[Š‹Ù]‹ÝH‹×Ô‘Ó“JBˆÝX\™HH[ÙHÈ›ÝÈÓQ\œ›Ü‹œÝ[•Ú]Ý]\›Z[˜[BˆY™\ˆÈÛÜÙJJHBˆÝX\™\ŠKÕS—Ñ’SS“ÊHH[ÙHÈ›ÝÈÓQ\œ›Ü‹œÝ[•Ú]Ý]\›Z[˜[BˆÙ[™Y‚ˆBˆ™]\›ˆ]XÚY[˜ÛÛ[ˆB‚ˆš]˜]HÝ]XÈ[˜È[XYÙPÛÛ[
+]ˆÝš[™ÊH›ÝÜÈOˆÛÛ[\Âˆ]ØYYHžHØY[XYÙJ]ˆ]
+Bˆ™]\›ˆš[XYÙJˆ[XYÙPÛÛ[
+ˆÛÝ\˜ÙNˆ™]JØYY™]JKˆZ[YU\NˆØYY›Z[YU\Kˆ˜[YNˆØYY\››\Ý]ÛÛ\Û™[
+JBˆB‚ˆš]˜]HÝ]XÈ[˜È[XYÙPÛÛ[
+ˆ]ˆÝš[™Ëˆ[ÙNˆ[XYÙP]XÚY[[ÙKˆØÜ”›ÝšY\Žˆ[žHÐÔ”›ÝšY\‚ˆ
+H\Þ[˜È›ÝÜÈOˆÛÛ[\Âˆ]ØYYHžHØY[XYÙJ]ˆ]
+Bˆ™]\›ˆžH]ØZ][XYÙP]XÚY[[\Ü\‹˜ÛÛ[
+ˆ]NˆØYY™]KˆZ[YU\NˆØYY›Z[YU\Kˆš[[˜[YNˆØYY\››\Ý]ÛÛ\Û™[ˆ[ÙNˆ[ÙKˆØÜ”›ÝšY\Žˆ[ÙHOH›ØÜˆÈØÜ”›ÝšY\ˆˆš[
+BˆB‚ˆš]˜]HÝ]XÈ[˜ÈØY[XYÙJ]ˆÝš[™ÊH›ÝÜÈOˆ
+]Nˆ]K\›ˆT“Z[YU\NˆÝš[™ÊHÂˆ]^[™YH”ÔÝš[™ÊÝš[™Îˆ]
+K™^[™[™Õ[R[”]ˆ]\›HT“
+š[UT“Ú]]ˆ^[™Y
+BˆÝX\™]]HHžOÈ]JÛÛ[ÓÙŽˆ\›
+KY]Kš\Ñ[\H[ÙHÂˆ›ÝÈÓQ\œ›Ü‹š[˜[Y[XYÙJ]
+BˆBˆ]Z[YU\NˆÝš[™ÂˆÝÚ]Ú\›œ]^[œÚ[Û‹›ÝÙ\˜Ø\ÙY
+
+HÂˆØ\ÙHœ™ÈŽˆZ[YU\HHš[XYÙKÜ™È‚ˆØ\ÙH™ÚYˆŽˆZ[YU\HHš[XYÙKÙÚYˆ‚ˆØ\ÙHÙXœŽˆZ[YU\HHš[XYÙKÝÙXœ‚ˆØ\ÙHšZXÈ‹šZYˆŽˆZ[YU\HHš[XYÙKÚZXÈ‚ˆY˜][ˆZ[YU\HHš[XYÙKÚœYÈ‚ˆBˆ™]\›ˆ
+]K\›Z[YU\JBˆB‚ˆš]˜]HÝ]XÈ[˜ÈØ[\PÛÛ™šYÝ\˜][ÛŠ
+HOˆXZPÛÛ™šYÝ\˜][ÛˆÂˆXZPÛÛ™šYÝ\˜][ÛŠˆY˜][YÙ[ˆš[È‹ˆYÚ[œÎˆÂˆÛÛ™šYÝ\™YYÚ[Š]ˆ‹‹ÜYÚ[œËÙ^[\K™[Xˆ‹[˜X›Yˆ˜[ÙJBˆKˆ›ÝšY\œÎˆÂˆÛÛ™šYÝ\™Y›ÝšY\ŠYˆš[È‹Ú[™ˆš[ÊKˆÛÛ™šYÝ\™Y›ÝšY\ŠˆYˆ›Ü[˜ZH‹ˆÚ[™ˆ›Ü[RPÛÛ\]X›Kˆ˜\ÙUT“ˆT“
+Ýš[™ÎˆšÎ‹ËØ\K›Ü[˜ZK˜ÛÛKÝŒHŠKˆ\RÙ^Q[š\›Û›Y[ˆ“ÔSRWÐTWÒÑVHŠKˆKˆÛÛÛÝ\˜Ù\ÎˆÂˆÛÛ™šYÝ\™YÛÛÛÝ\˜ÙJˆYˆœÝ[™\™]ÛÛÈ‹ˆÚ[™ˆXZTÝ[™\™ÛÛÔYÚ[‹™˜XÝÜžRÚ[™ˆÜ[ÛœÎˆÂˆÙX”ÙX\˜Ú›ÝšY\ˆŽˆœÝš[™ÊXZUÙX”ÙX\˜Ú›ÝšY\‹™^Kœ˜]Õ˜[YJKˆÙX]\“ØØ][ÛˆŽˆœÝš[™ÊˆŠKˆ›X\ÝÙÛ’[œÝ[˜ÙHŽˆœÝš[™Ê›X\ÝÙÛ‹œÛØÚX[ŠKˆ›X\ÝÙÛTRÙ^Q[š\›Û›Y[ŽˆœÝš[™Ê“PTÕÑÓ—ÐTWÒÑVHŠKˆ›X\ÝÙÛ•Üš]Q[˜X›YŽˆ˜›ÛÛ
+˜[ÙJKˆJKˆÛÛ™šYÝ\™YÛÛÛÝ\˜ÙJYˆ™^[\K]ÛÛÈ‹Ú[™ˆ™^[\H‹[˜X›Yˆ˜[ÙJKˆKˆØÜ”›ÝšY\œÎˆÂˆÛÛ™šYÝ\™YÐÔ”›ÝšY\ŠˆYˆXZUš\Ú[Û“ÐÔ”YÚ[‹œ™Y™\œ™Y˜XÝÜžRÚ[™ˆÚ[™ˆXZUš\Ú[Û“ÐÔ”YÚ[‹œ™Y™\œ™Y˜XÝÜžRÚ[™
+BˆKˆXÜÙ\™\œÎˆÂˆÛÛ™šYÝ\™YPÔÙ\™\ŠˆYˆœ™[[ÝH‹ˆ[˜X›Yˆ˜[ÙKˆ\Ü^S˜[YNˆ‘^[\HPÔ‹ˆ\›ˆT“
+Ýš[™ÎˆšÎ‹ËÞ[Ý\‹[XÜ™^[\KÛXÜŠHKˆ™X\™\•ÚÙ[‘[š\›Û›Y[ˆ“PÔÐTWÒÑVH‹ˆÛÛ˜[YT™Yš^ˆœ™[[ÝH‹ˆY˜][\›Ý˜[ˆ˜ÛÛ™š\›JKˆÛÛ™šYÝ\™YPÔÙ\™\ŠˆYˆ›ØØ[‹ˆÚ[™ˆœÝ[È‹ˆ[˜X›Yˆ˜[ÙKˆ\Ü^S˜[YNˆ‘^[\HØØ[PÔ‹ˆÛÛ[X[™ˆž[Ý\‹[XÜ\Ù\™\ˆ‹ˆ\™ÜÎˆÈ‹K\Ý[È—KˆÝÙˆ‹ˆ‹ˆÛÛ˜[YT™Yš^ˆ›ØØ[‹ˆY˜][\›Ý˜[ˆ˜ÛÛ™š\›JKˆKˆYÙ[ÎˆÂˆYÙ[Yš[š][ÛŠˆYˆš[È‹ˆ\ØÜš\[ÛŽˆ“Ù™›[™HÛ[ÚÙH\ÝÈ›ÈÛÛÈ[™›È™]ÛÜšËˆ‹ˆ[œÝXÝ[ÛœÎˆ‘^\˜Ú\ÙHHÙ™›[™HXZPÛÜ™H›ÝšY\‹ˆ‹ˆÞ\Ý[T›Û\ˆš[È‹ˆ›ÝšY\Žˆš[È‹ˆ[Ù[ˆˆŠKˆYÙ[Yš[š][ÛŠˆYˆ›XZ[ˆ‹ˆ\ØÜš\[ÛŽˆ‘Ù[™\˜[\ÜÚ\Ý[Ú]H[ÛÛÙ]ˆ‹ˆ[œÝXÝ[ÛœÎˆ–[ÝH\™HH[[\ÜÚ\Ý[ˆ\ÙHÛÛÈÚ[ˆ™YYYˆ‹ˆÞ\Ý[T›Û\ˆ›XZ[ˆ‹ˆ›ÝšY\Žˆ›Ü[˜ZH‹ˆ[Ù[ˆž[Ý\‹[[Ù[‹ˆÛÛ˜[Y\ÎˆÙ]
+ˆÂˆXZPØ[Ý[]Ü•ÛÛ›˜[YKˆXZPÝ\œ™[[YUÛÛ›˜[YKˆXZQXÚÕÛÛ›˜[YKˆXZUÙX]\•ÛÛ›˜[YKˆXZUÙX”ÙX\˜ÚÛÛ›˜[YKˆXZUÙX‘™]ÚÛÛ›˜[YKˆXZSX\ÝÙÛ•ÛÛ›˜[YKˆH
+ÈXZQš[UÛÜšÜÜXÙUÛÛÛÛ˜[Y\È
+ÈXZT[•ÛÛÛÛ˜[Y\È
+ÈXZQÚ]X•ÛÛÛÛ˜[Y\Âˆ
+ÈXZUÙÕÛÛËÛÛ˜[Y\È
+ÈXZPÛÛ^ÛÛËÛÛ˜[Y\ÊKˆÛÛÜ›Ý\˜[Y\ÎˆÂˆ™XÚÈ‹™]][YH‹˜Ø[È‹™š[\È‹œ[ˆ‹ÙX]\ˆ‹ÙXˆ‹›X\ÝÙÛˆ‹ˆ™Ú]Xˆ‹ÙÈ‹˜ÛÛ^‹ˆKˆÝX˜YÙ[˜[Y\ÎˆÈœ™\ÙX\˜Ú\ˆ—Kˆ[Z]ÎˆYÙ[[“[Z]Ê
+Kˆ\ÙUÛÛ›ÞNˆYJKˆYÙ[Yš[š][ÛŠˆYˆœ™\ÙX\˜Ú\ˆ‹ˆ\ØÜš\[ÛŽˆ’[™\ÝYØ]\ÈÛ™H]Y\Ý[Ûˆ[™[œÝÙ\œÈ[ˆH™]È[™\Ëˆ‹ˆ[œÝXÝ[ÛœÎˆ’[™\ÝYØ]HH[YØ]Y\ÚÈ[™™]\›ˆHÛÛ˜Ú\ÙH™\Ý[ˆ‹ˆÞ\Ý[T›Û\ˆœ™\ÙX\˜Ú\ˆ‹ˆ›ÝšY\Žˆ›Ü[˜ZH‹ˆ[Ù[ˆž[Ý\‹[[Ù[‹ˆÛÛ˜[Y\ÎˆÓXZPÝ\œ™[[YUÛÛ›˜[YWKˆÛÛÜ›Ý\˜[Y\ÎˆÈ™]][YH—JKˆKˆ›Û\ÎˆÛÛ™šYÝ\™Y›Û\Êˆ[YØ][ÛŽˆYÙ[[YØ][Û”›Û\[\]KˆÛÜšÙ\ŽˆYÙ[[YØ][Û”›Û\ÛÜšÙ\’[œÝXÝ[ÛœËˆY[[ÜžNˆYÙ[Y[[ÜžT›Û\[\]KˆÞ\Ý[NˆÂˆš[ÈŽˆ‘^\˜Ú\ÙHHÙ™›[™HXZPÛÜ™H›ÝšY\‹ˆ‹ˆ›XZ[ˆŽˆ–[ÝH\™HH[[\ÜÚ\Ý[ˆ\ÙHÛÛÈÚ[ˆ™YYYˆ‹ˆœ™\ÙX\˜Ú\ˆŽˆ’[™\ÝYØ]HH[YØ]Y\ÚÈ[™™]\›ˆHÛÛ˜Ú\ÙH™\Ý[ˆ‹ˆJKˆY[[ÜžNˆÛÛ™šYÝ\™YY[[ÜžJ
+Kˆ\›Ý˜[ÎˆÛÛ™šYÝ\™Y\›Ý˜[ÊÛÛ™š\›Nˆ˜\ÚË[™Ù\›Ý\Îˆ˜\ÚÊJBˆB‚ˆš]˜]HÝ]XÈ]š\ÝX[[ˆÝš[™ÈHÂˆÚYˆPRWÒT×Õ’TÕPSˆ‹Ýš\ÝX[Ü[ˆH\›Z[˜[ÛÜšÜÜXÙNˆÜ]Ú]Ë›ÝšY\œËPÔËÛÛ×ˆ‚ˆÙ[ÙBˆˆ‚ˆÙ[™Y‚ˆJ
+B‚ˆš]˜]HÝ]XÈ]™\[Hˆˆ‚ˆØYÙ[Ù[XÝÜˆY]\ÈÚ]	ÜÈYÙ[ÈÚ[YÙ[\ÝÈÛÛ[X[™ÂˆØYÙ[ÈX[˜YÙHYÙ[Yš[š][ÛœÈ[™[›š[™ÈYÙ[ÎÈÚ[YÙ[È\ÝÈÛÛ[X[™ÂˆØ]XÚÓSÑWHU]XÚHØÝ[Y[ÜÛÝ\˜ÙHš[NÈS\ÚÜÈ›ÜˆÛÝ\˜ÙKX\šÙÝÛ‹ÜˆÛÜBˆØ]XÚÛX\ˆ›ÜH]XÚY[È]Y]YY›ÜˆH™^Y\ÜØYÙBˆØ˜\Ù]\›T“Ú[™ÙHHÝ\œ™[›ÝšY\ˆ[™Ú[ˆØÈ“ÓT\ÚÈ[ˆHœ™\ÚÛÛ^Ú]Ý]Ú[™Ú[™È\ÈÚ]ˆØÙUÚ[™ÙHHÝ\œ™[ÛÜšÚ[™È\™XÝÜžBˆØÚ]\ÝÝÚ]Ú\˜Ú]™K™[˜[YKÜˆY]\È›Ú™XÝ	ÜÈÚ]ÂˆØÛX\ˆÛX\ˆÛÛ™\œØ][Ûˆ\ÝÜžBˆØÛÛ[YH™\Ý[YHHÝÜYÜˆ[\œ\Y\ÚË[˜ÛY[™È]Y]YYY\ÜØYÙ\ÂˆØÛÜHÓ—HÔUHÛÜHH\Ý™\KÜˆˆY\ÜØYÙ\ËÈHÛ\›Ø\™ÜˆHš[BˆØÝÙš[HÝ\œ™[ÛÜšÚ[™È\™XÝÜžBˆÙY]T‘ÑUY]H›Û\YÙ[ÛÛ™šYËPÔ\ÝÜˆY\ÜØYÙH[ˆ	QUÔ‚ˆÙY][œ]Üš]HH™^Y\ÜØYÙH[ˆ	QUÔˆ[œÝXYÙˆ]H›Û\ˆÙ^]^]H‘TˆÙ^Ü“Ô“PUÔUHØ]™HHÜX›H\˜Ú]™KÜˆ\ÈÚ]\ÈX\šÙÝÛ‹[œÛÛ‹XYË\X‹ÜˆØÞˆÚ[ÐÓÓSPS‘HÚÝÈÛÛ[X[™ÈÜˆ[›ÜˆÛ™HÛÛ[X[™ˆÚ[XYÙHSÑHU]XÚ][žKÜÛX[ÛYY][KØšYËÙ[Ú^™KÜˆÐÔˆÈX\šÙÝÛ‚ˆÚ[\ÜUY\™ÙHHØÚÙ]XZKÜXZH\˜Ú]™H[ÈÙ][™ÜËÚÚ[Ë[™Ú]ÂˆÛXÜX[˜YÙHPÔÙ\™\œÎÈÚ[XÜ\ÝÈÛÛ[X[™ÂˆÛY[[ÜžHÚÝËY]X\›‹ÜˆØÛÜH\È›Ú™XÝ	ÜÈ\˜X›HY[[ÜžBˆÛ[Ù[SQHÙ[XÝH[Ù[ˆÛ[Ù[ÈÔ“Õ’QT—H\Ý[Ù[Èœ›ÛHHÝ\œ™[Üˆ˜[YY›ÝšY\‚ˆÛ›Ý[šÈ\ØX›H™X\ÛÛš[™ÈÚ\™HH[Ù[Ý\ÜÈ]ˆÜYÚ[œÈ\ÝÝ]XØ[H[™[˜[ZXØ[HØYYYÚ[œÂˆÜ›Ú™XÝÚÝË\Ý™[˜[YKÜˆ[H›Ú™XÝ
+HÝ\\™XÝÜžJBˆÜ›Û\X[˜YÙH˜[YYÞ\Ý[H›Û\ÎÈÚ[›Û\\ÝÈÛÛ[X[™ÂˆÜ›Û\È\Ý]™\žH›Û\[™ÚÚ[È	SQHÕVHÙ[™ÈÛ™H
+Ú[›Û\
+BˆÜ›ÝšY\ˆQÙ[XÝH›ÝšY\‚ˆÜ›ÝšY\œÈ\Ý™YÚ\Ý\™Y›ÝšY\œÂˆÜ]Y]YH\Ý\ÚÜÜˆ›ÜY\ÜØYÙ\ÈØZ][™È›Üˆ[ˆYÙ[ˆÜ™\HÕÒQH[œÝÙ\ˆH\Ý™\H[ˆ	QUÔˆÚ]]][ÝYX›Ý™H
+Ú[™\JBˆÜÙ]ÔÑUS‘ÈSQWHÚÝÈÜˆÚ[™ÙHÙ][™ÜÎÈÚ[Ù]\ÝÈ[BˆÜÚÚ[È\Ý[˜X›K\ØX›KÜˆÙ[™ÚÚ[È
+Ú[ÚÚ[ÊBˆÜÝ]ÈÛÛXš[™Y˜[šÚ[™ËÚÙ[œËÜË[YH[ˆ\ÙK[™Y™šXÚY[˜ÞH\ˆ›ÝšY\Ž›[Ù[\È˜\œÂˆÜÝÜ[\œ\HÝ\œ™[\›ˆ[™ÙY\]È]Y]YNÈØÛÛ[YH™\Ý[Y\È]ˆÝÙÈÚÝËYËXÚÈÙ™‹ÜˆY]\È›Ú™XÝ	ÜÈÙÈ\ÝˆÝÛÛÈ\ÝÙÚXØ[ÛÛÜ›Ý\È›ÜˆHÝ\œ™[YÙ[ˆÝ™\œÚ[Ûˆš[HXZH™\œÚ[Û‚ˆ
+š\ÝX[[
+Bˆ[œ]ˆÚY
+Ñ[\ˆYÈH[™H
+[
+Ñ[\ˆÜˆÝ›
+ÒˆÚ\™HH\›Z[˜[Ù[™È[\ˆ›Üˆ]
+BˆH\ÝHÙY\È]È[™\È0­È[\ˆÙ[™ÈHÚÛH^ˆÓÔ‘Ý\ÈH][[[™HY\ÜØYÙH[™[™È]ÓÔ‘[Û™Bˆ	SQHÕVHÙ[™ÈH›Û\ÜˆÚÚ[žH˜[YNÈÜ›Û\È\ÝÈ[BˆPÓÓSPS‘[œÈH[™H[ˆHÞ\Ý[HÚ[
+[\˜XÝ]™H›ÙÜ˜[\ÈÛÜšÊBˆ\ÑÝÛˆÜˆÝ›
+ÔÓˆ[Ý™H™]ÙY[ˆ[™\Ë[ˆ\ÝÜžH0­ÈÝ›
+Ôˆ™]™\œÙHÙX\˜ÚˆÝ›
+ÐKÑHÜˆÛYKÑ[™™YÚ[›š[™ËÙ[™ÙˆH[™BˆÝ›
+Ð‹Ñˆ[Ý™HYÜšYÚZÙHH\œ›ÝÈÙ^\ÂˆÝ›
+ÕÈ[]HÛÜ™0­ÈÝ›
+ÐÈÜˆÜÝÜ[\œ\H[ˆ0­ÈÝ›
+ÖˆÝ\Ü[™ˆH›Û\Ý^\ÈÜ[ˆÚ[HH\›ˆ[œÎˆHY\ÜØYÙH\Y[ˆ\È]Y]YY[™ˆ›Ú[œÈHÛÛ™\œØ][Ûˆ]H™^[Ù[\›‹ˆQV™XXÚ\ÈÛ™HYÙ[‚ˆÛÛ[X[™È[ˆšYÚ]Ø^HÛÎÈHÙ][™ÈÚ[™ÙY[ˆ™XXÚ\ÈH™^\›‹‚ˆÚ[YÙ[Èš[[ˆ›ØÚÜÈ™Yš^YYÙ[ÔQÈÜÙ]ZKœÝX˜YÙ[ÈXÚÜÈÝÈ]XÚ‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]Y™›Ü[Hˆˆ‚ˆ™X\ÛÛš[™ÈY™›Ü‚ˆÜÙ]Y™›ÜÚÝÈHÝ\œ™[YÙ[	ÜÈ™X\ÛÛš[™ÈY™›Ü[™ÝZY[˜ÙBˆÜÙ]Y™›ÜU‘SÙ]]ˆÙ™‹Z[š[X[ÝËYY][KYÚYÚÜˆX^ˆH›ÝšY\ˆÙ]ÈBˆšY[]ÈTHZÙ\È
+™X\ÛÛš[™×ÙY™›Ü[šË[˜X›WÝ[šÚ[™Ëˆ[šÚ[™ø )ŠH[™HÞ\Ý[H›Û\Ø^\ÈÝÈ]XÚØ\™HÈZÙBˆÜÙ]Y™›ÜU‘SVH]™[\ÈVYYÈHÞ\Ý[H›Û\\ÈÝZY[˜ÙBˆÜÙ]Y™›Ü]]È\ÙHXZIÜÈ]]ÛX]XÈÛXÞKÚ]›ÈÝZY[˜ÙNÈY\ÙYZÈ›\ÚˆY˜][ÈÈÙ™ˆ™XØ]\ÙH]È›ÝšY\ˆY˜][\ÈYÚˆÜÙ]Y™›ÜÙ™ˆ\ØX›H[šÚ[™ÈÚ\™HÝ\ÜY
+[ÛÈÛ›Ý[šÊB‚ˆ^[\\Î‚ˆÜÙ]Y™›ÜYÚˆÜÙ]Y™›ÜX^ÚXÚÈ]™\žHYÙHØ\ÙH[™™\šYžHH™\Ý[™Y›Ü™H[œÝÙ\š[™ÂˆÜÙ]Y™›ÜÝÈÙY\[œÝÙ\œÈÈÛ™H\˜YÜ˜\ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]Ù][Hˆˆ‚ˆÙ][™ÜÈÛÛ[X[™Î‚ˆÜÙ]\ÝÝ\œ™[Ù][™ÜÈ[™Z\ˆ˜[Y\ÂˆÜÙ]Y™›ÜÓU‘SHÕVHÚÝÈÜˆÙ]™X\ÛÛš[™ÈY™›Ü[™Ü[Û˜[ÝZY[˜ÙBˆÜÙ][ÛÈ“ÓÓ\›Z][ÛÛØ[ÈÚ]Ý]\ÚÚ[™È
+Û‹ÛÙ™ŠNÈÙ\›Üˆ]\ˆ[œÂˆÜÙ]ÛÛˆ\ÝHÛÛØ[[™ÈÙ][™ÜÂˆÜÙ]ÛÛ˜Ø[[™ÈSÑH\ÙH]]ÛX]XËÛ˜]]™HÛÛËÜˆ^ÖSÒ”ÓÓˆ[][][Û‚ˆÜÙ]ÛÛœ›ÞH“ÓÓÚÝÈ[Ù[ÈÛ›HHÚ\™Y\Ý]ÛÛÈ[™Ø[]ÛÛZ\ˆ
+Û‹ÛÙ™ŠBˆÜÙ][YØ][ÛˆSÑHÙ™Žˆ[œÈ]™\žHÛÛ]Ù[ŽÈÝX˜YÙ[ˆX^H[ÛÈ[™ÛÜšÈÈHÚ[ˆÜÙ][Z]Ëˆ\ÝHÛÛ\›‹[™ÝX˜YÙ[[Z]ÂˆÜÙ][Z]Ë›X^ÛÛØ[ÈˆÛÛØ[È[ÝÙY\ˆ[‚ˆÜÙ][Z]Ë›X^[Ù[\›œÈˆ[Ù[\›œÈ[ÝÙY\ˆ[‚ˆÜÙ][Z]Ë›X^ÝX˜YÙ[ÈˆÚ[YÙ[È[ÝÙY]Û˜ÙH
+\ØX›\È[YØ][ÛŠBˆÜÙ][Z]Ë›X^ÝX˜YÙ[\ˆX^[][H\ÙˆHYÙ[™YBˆÜÙ][Z]Ë›X^Ý[ÚÙ[œÈÙ™ŸŸšÏˆÚÙ[œÈH[ˆX^HÜ[™™Y›Ü™H]]\Ù\ÂˆÜÙ][Z]Ë›X^ÙXÛÛ™ÈÙ™ŸŸ›_šˆØ[XÛØÚÈ[YHH[ˆX^HZÙH™Y›Ü™H]]\Ù\ÂˆÜÙ]™]žK˜][\Èˆ[Y\ÈH˜Z[Y[Ù[Ø[\È™\X]Y
+Y˜][ŠBˆÜÙ]™]žK™[^HÑPÓÓ‘ÈØZ]™Y›Ü™HXXÚ™]žH
+Y˜][JBˆÜÙ]Ý˜ÛÛ\XÝÙ™ŸŸšÏˆÝ[[X\š^™HÛ\ˆ^Ú[™Ù\ÈÛ˜ÙHHÚ]ÛÈ“ˆÚÙ[œÂˆÜÙ]ÝœÝ˜]YÞHØXÚ_Ú^™OˆÙY\›Û\XØXÚH\ÝÜžH[XÝÜˆÛÛ\XÝÛš[H™XYÂˆÜÙ]ZKˆ\Ý\›Z[˜[RHÙ][™ÜÂˆÜÙ]ZK]HVÙ]H›Û\X™[[™\›Z[˜[ÝXˆ]H
+›Û™XÛX\œÈ]
+BˆÜÙ]ZK™Y]ÜˆÓÓSPS‘Y]ÜˆÙY]Ü[œÈ
+›Û™X˜[È˜XÚÈÈ	QUÔ‹	’TÕPSš[JBˆÜÙ]ZK˜™Û[™HÓÓÔˆÙ]H[œ][[™H˜XÚÙÜ›Ý[™ˆÜÙ]ZK™™ØÛÛÜˆÓÓÔˆÙ]H[œ]›Ü™YÜ›Ý[™ˆÜÙ]ZK˜™ØÛÛÜˆÓÓÔˆÙ]H[œ]˜XÚÙÜ›Ý[™ˆÜÙ]ZK™™Ü›Û\ÓÓÔˆÙ]H›Û\›Ü™YÜ›Ý[™ˆÜÙ]ZK˜™Ü›Û\ÓÓÔˆÙ]H›Û\˜XÚÙÜ›Ý[™ˆÜÙ]ZK™™ÝÛÛ™\Ý[ÓÓÔˆÙ]ÝXØÙ\ÜÙ[ÛÛ\™\Ý[Ý]]ÛÛÜ‚ˆÜÙ]ZK˜›Û“ÓÓ™[™\ˆ[œ][ˆ›Û
+Û‹ÛÙ™ŠBˆÜÙ]ZK›X\šÙÝÛˆ“ÓÓ™[™\ˆ™\Y\È\ÈÝ[YX\šÙÝÛˆ
+Û‹ÛÙ™ŠBˆÜÙ]ZKÛÛ™\Ý[[™\È[ˆÚÝÈ[ÜˆHš\œÝˆ™\Ý[[™\È
+Y\È[JBˆÜÙ]ZK[šÚ[™ÈSÑH[šÚ[™È\Ü^NˆÝ]\Ë[™K™YKš]™KÜˆ[ˆÜÙ]ZKœÝX˜YÙ[ÈU‘SÚ]Ú[YÙ[Èš[ˆ[ÛÛËÝ]ËÜˆ›Û™BˆÜÙ]\ÙK˜YÙ[ÛY“ÓÓ]HÛÜšÚ[™È™YIÜÈQÑS•Ë›Yš[\È8 %\È\™XÝÜžH\ÂˆH™\ÜÚ]ÜžH›ÛÝ8 %[È]™\žH[‰ÜÈÞ\Ý[H›Û\
+Û‹ÛÙ™ŠBˆÜÙ]\ÙKœ[ˆ“ÓÓ\ÚÈ[ˆYÙ[]Ø[ˆÝ\Ú[™[ˆÈÜ[ˆH™\]Y\ÝÙ‚ˆÙ]™\˜[Ý\ÈÚ]H[X™\™Y[ˆ™Y›Ü™H[YØ][™È
+Û‹ÛÙ™ŠB‚ˆSÓËYÙ[[™RHÙ][™ÜÈ\™H\œÚ\ÝY[ˆHXÝ]™HÛÛ™šYÝ\˜][ÛŽÈH^Bˆ›YÈ\›œÈSÓÈÛˆ›ÜˆÛ™H[ˆÛ›KˆÓÓÔˆXØÙ\ÈH˜[YYS”ÒHÛÛÜ‹™ØŽ”‘Ð‹ˆÜˆ›Û™K‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]Ú][Hˆˆ‚ˆ\œÚ\Ý[Ú]X[˜YÙ[Y[ÛÛ[X[™Î‚ˆØÚ]\ÝØXÝ]™_\˜Ú]™Y[H\ÝÚ]ÈžH^K™]Ù\Ýš\œÝÈ\˜Ú]™Y\ÝˆØÚ]™]ÈÕUWHÝ\Hœ™\ÚÚ]\Ú[™ÈHÝ\œ™[YÙ[ˆØÚ]™]ÈKXYÙ[QÕUWHÝ\Hœ™\ÚÚ]\Ú[™ÈHÛÛ™šYÝ\™YYÙ[ˆØÚ]\ÙHS‘VQUHÝÚ]ÚÈHÚ]žH\Ý[™^Q™Yš^Üˆ]BˆØÚ]™^™]š[Ý\ÈÞXÛH›ÝYÚÚ]ÂˆØÚ][™›ÈÒS‘VQUWHÚÝÈHÚ]	ÜÈYÙ[Ù\ÜÚ[Û‹Ú^™K[™[Y\Ý[\ÂˆØÚ]Ù\ÜÚ[ÛˆÛ™]×HÚÝÈHÙ\ÜÚ[ÛˆY›ÝšY\œÈÙYKÜˆÝ\Hœ™\ÚÛ™BˆØÚ]™[˜[YHUH™[˜[YHHXÝ]™HÚ]ˆØÚ]\˜Ú]™HÒS‘VQUWH\˜Ú]™HHÚ]È\˜Ú]š[™ÈHXÝ]™HÛ™HÝ\Èœ™\ÚˆØÚ][˜\˜Ú]™HS‘VQUH™]\›ˆ[ˆ\˜Ú]™YÚ]ÈHXÝ]™H\ÝˆØÚ]ÛÜÙHÛÛ™š\›H\›X[™[HÛÜÙHHXÝ]™HÚ]ˆØÚ]Y\ÜØYÙ\È\Ü^HHÛÛ\XÝ[™^YY\ÜØYÙH\ÝˆØÚ]ÙÈ\Ü^HH[ÝXÝ\™YÛÛ™\œØ][Û‚ˆØÚ]Y]S‘VV™\XÙHHY\ÜØYÙIÜÈ^È™\Ù\™H]XÚY[ÂˆØÚ]™[[Ý™HS‘V™[[Ý™HHY\ÜØYÙBˆØÚ][™ÈÒS‘VH™[[Ý™HH\ÝÛÛ™\œØ][ÛˆY\ÜØYÙHÜˆÙ[XÝYY\ÜØYÙBˆØÚ]š[HS‘VÙY\›ÝYÚHÙ[XÝYY\ÜØYÙNÈ™[[Ý™H™]Ù\ˆY\ÜØYÙ\ÂˆØÚ]ÛÛ\XÝÑ“ÐÕT×HÝ[[X\š^™HHÚ]š[Üš]^š[™ÈÚ]“ÐÕTÈØ^\ÈÈ™\Ù\™BˆØÚ]ÛX\ˆÛX\ˆHÛÛ™\œØ][Ûˆ[™™\ÝÜ™HÛÛ™šYÝ\™Y[œÝXÝ[ÛœÂ‚ˆY\ÜØYÙH[™^\È\™HKX˜\ÙYˆ™YØ]]™H[™^\ÈÛÝ[˜XÚÈœ›ÛHH[™ÂˆLHÙ[XÝÈH\ÝY\ÜØYÙKLˆHÙXÛÛ™]Ë[\Ý[™ÛÈÛ‹‚ˆ™[[Ýš[™ÈHÛÛØ[Üˆ™\Ý[[ÛÈ™[[Ý™\È]È[šÙYÛÛ˜[œØXÝ[Û‹‚ˆXZHÜ[œÈHœ™\ÚÚ]Ûˆ]™\žH][˜Ú[™˜[Y\È]Y\ˆHš\œÝˆY\ÜØYÙNÈÚ]È]™]™\ˆ™XÙZ]™YHY\ÜØYÙH\™H™]™\ˆÜš][‹ˆÝ\ˆÝ\Ú][È\ÝØ]™YÚ]Ë[ˆ\ˆS‘VQUHÈ™[Ü[ˆÛ™NÂˆ\ˆÚ]Ý]HÙ[XÝÜˆ™[Ü[œÈH[ÜÝ™XÙ[H\]YÚ]ˆÚ]Âˆ™[Û™ÈÈH›Ú™XÝ›ÛÝY]HÝ\\™XÝÜžNÈÜ›Ú™XÝÚÝÜÈ]‚ˆHÚ]\ÈØ]™YÚ]HYÙ[È]È[œÈÝ\Y[™Z\ˆ˜[œØÜš\Î‚ˆ™[Ü[š[™È]\ÝÈ[H[™\ˆØYÙ[È™YKØYÙ[ÈÙÈQ™XYÈÛ™KˆØÚ][™›ÈÛÝ[È[K[™ØYÙ[ÈÛX\ˆ›ÜÈ[Hœ›ÛHHÚ]‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]›Ú™XÝ[Hˆˆ‚ˆ›Ú™XÝÛÛ[X[™È
+H›Ú™XÝ\ÈH\™XÝÜžHXZHØ\ÈÝ\Y[ŠN‚ˆÜ›Ú™XÝÚ[™›×HÚÝÈH›Ú™XÝ	ÜÈ˜[YK[\™XÝÜžK[™Ú]ÛÝ[ÂˆÜ›Ú™XÝ\Ý\Ý]™\žH›Ú™XÝXZH\È™Y[ˆÝ\Y[‹™XÙ[š\œÝˆÜ›Ú™XÝ˜[YHSQH™[˜[YHH›Ú™XÝÈH\™XÝÜžH˜[YH\ÈHY˜][ˆÜ›Ú™XÝ[ÓÓÔˆÛÛÜˆH›Û\ˆH™\Ù]ÝXÚ\ÈZ[ÜˆÔ”‘ÑÐŽÈ›Û™HÛX\œÈ]ˆÜ›Ú™XÝ›Ü™Ù]S‘VUSQH›Ü[›Ý\ˆ›Ú™XÝœ›ÛHH\ÝÈ]Èš[\ÈÝ^B‚ˆÚ]È]™H[ˆœXZKØÚ]È[œÚYHH›Ú™XÝ\™XÝÜžNÈH\ÝÙ‚ˆ›Ú™XÝÈ]™\È[ˆ‹ËœXZKÜ›Ú™XÝËšœÛÛˆ
+Üˆ[™\ˆ	PRWÒÓQJKˆØÙÚ[™Ù\ÂˆÚ\™HÛÛÈ[‹›ÝÚXÚ›Ú™XÝHÚ]È™[Û™ÈË‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]XÜÛÛ[X[™[Hˆˆ‚ˆPÔÛÛ[X[™Î‚ˆÛXÜ\ÝˆÛXÜ[˜X›HQˆÛXÜ\ØX›HQˆÛXÜYÓÓSPS‘ÐT‘È‹‹—BˆÛXÜYËK[˜[YHQHËKY[ˆÑVOUSQWHËKXÝÙUHËK][Y[Ý]ÑPÓÓ‘×BˆËK\™Yš^‘Q’VHËKX\›Ý˜[SÑWHKHÓÓSPS‘ÐT‘È‹‹—B‚ˆSÑH\È]]ÛX]XËÛÛ™š\›KÜˆ[™Ù\›Ý\Ëˆ][Ý\È[™˜XÚÜÛ\Ú\ØØ\\È\™BˆÝ\ÜYˆÚ]Ý]K[˜[YKHÛÛ[X[™	ÜÈ˜\Ù[˜[YH™XÛÛY\ÈHÙ\™\ˆ˜[YK‚ˆHÙ\™\ˆ\ÈÛÛ›™XÝY[[YYX][KØ]™Y[ˆH›Ü›X[XÜÙ\™\œÂˆÛÛ™šYÝ\˜][Û‹[™[Ùˆ]ÈÛÛÈ\™H[˜X›Y›Üˆ]™\žHYÙ[‚‚ˆ^[\\Î‚ˆÛXÜYŒ›XÜˆÛXÜYK[˜[YHÙX]\ˆKHœ^HÙX]\‹[XÜˆˆˆ‚‚ˆš]˜]HÝ]XÈ]Y][Hˆˆ‚ˆÙY]›Û\ÓSQWHY]H›Û\Ø[YSQKÞ\Ý[HÜˆ\Ù\ˆ
+Ý\œ™[YÙ[	ÜÈÚ[ˆÛZ]Y
+BˆÙY]Þ\Ý[HÓSQWHY]ØÜ™X]HH˜[YYÞ\Ý[H›Û\
+Ý\œ™[Ú[ˆÛZ]Y
+BˆÙY]\Ù\ˆSQHY]ØÜ™X]HH\Ù\ˆ›Û\ÈHZ[[‰ÜÈ˜[YHÝ\Èœ›ÛH]È^ˆÙY]SQHY][ˆ^\Ý[™ÈÞ\Ý[HÜˆ\Ù\ˆ›Û\ˆÙY]YÙ[ÒQHY]HØ]™YYÙ[\È”ÓÓˆ
+Ý\œ™[Ú[ˆÛZ]Y
+BˆÙY]›ÝšY\ˆÒQHY]HÛÛ™šYÝ\™Y›ÝšY\ˆ\È”ÓÓˆ
+Ý\œ™[Ú[ˆÛZ]Y
+BˆÙY]ÛÛ\XÝY]HÛØ˜[Ú]XÛÛ\XÝ[Ûˆ›Û\[\]BˆÙY]Y[[ÜžHY]\È›Ú™XÝ	ÜÈ\˜X›HY[[ÜžH›Ý\ÂˆÙY]Y[[ÜžK\›Û\Y]H[\]HÛY[[ÜžHX\›ˆ\Ù\ÂˆÙY][YØ][ÛˆY]HœšYYˆ[\]HÚ[YÙ[È™XÙZ]™BˆÙY]ÛÜšÙ\ˆY]H[œÝXÝ[ÛœÈÙˆH\š]™YÛÜšÙ\ˆYÙ[ˆÙY]ÛÛ™šYÈY]HXÝ]™HÛÛ™šYÝ\˜][Ûˆš[BˆÙY]XÜÈY]HÛÛ™šYÝ\™YPÔÙ\™\ˆ\Ý\È”ÓÓ‚ˆÙY]ŸQTÔÐQÑWÒQY]ÛÛ™\œØ][ÛˆY\ÜØYÙHˆÜˆ]È[Y\ÜØYÙHQˆÙY][œ]Üš]HH™^Y\ÜØYÙH[ˆHY]Üˆ[™Ù[™]‚ˆHÛÛ\XÝ[™Y[[ÜžH[\]\È]\ÝÛÛZ[ˆÞÝ˜[œØÜš\_NÈÞÙ›ØÝ\ß_H[™ˆÞÛY[[Üž__H\™HÜ[Û˜[ˆH[YØ][Ûˆ[\]H]\ÝÛÛZ[ˆÞÝ\Úß_NÂˆÞØÛÛ^_KÞÛÝ]]_KÞØYÙ[_K[™ÞØÝÙ_H\™HÜ[Û˜[‚ˆÛX\š[™È]™\ÝÜ™\ÈHZ[Z[ˆY˜][ˆ\Ù\ÈÜÙ]ZK™Y]ÜˆÚ[ˆ]\ÂˆÙ][ˆ	QUÔ‹[ˆ	’TÕPS[ˆš[KˆYÙ[[Z]È[™ÛÛXØ[[™ÂˆÝ˜]YÞH\H[[YYX][K[™[ˆY]Y›ÝšY\ˆ\È™XZ[[ˆXÙNÂˆÝ\ˆ›ÝšY\‹YÚ[‹ÛÛ[™PÔÚ[™Ù\ÈXYH›ÝYÚÙY]ÛÛ™šYÂˆ™\]Z\™HH™\Ý\‚‚ˆH›ÝšY\‰ÜÈšXY\œÈˆ\È[ˆØš™XÝÙˆ˜[Y\ÈÈ˜[Y\ÈÜˆ[ˆ\œ˜^HÙ‚ˆ“˜[YNˆ˜[YHˆÝš[™ÜËÙ[Ú]]™\žH™\]Y\ÝˆH˜[YHX^HÛÛZ[‚ˆÞÜÙ\ÜÚ[ÛŸ_KÚXÚ™XÛÛY\ÈHÙ\ÜÚ[ÛˆYÙˆHÚ]H™\]Y\Ý™[Û™ÜÂˆÈ
+ØÚ]Ù\ÜÚ[ÛˆÚÝÜÈ]ÈÜ[ÛÙH™[ˆ™YYÈ][ˆ[Ü[˜ÛÙK\Ù\ÜÚ[ÛŠK‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]Y[[ÜžR[Hˆˆ‚ˆ\˜X›H›Ý\ÈX›Ý][ÝKÙ\\ˆ›Ú™XÝ[ˆœXZKÛY[[ÜžK›Y[™YYÂˆHÞ\Ý[H›Û\Ùˆ\ÈÚ]8 %™]™\ˆÙˆHÝX˜YÙ[È]Ý\Ë‚‚ˆÛY[[ÜžHÚÝÈH›Ý\È[™ÝÈ^H\™HÛÛ™šYÝ\™YˆÛY[[ÜžHY]Y][H[ˆ	QUÔˆ
+Ø[YH\ÈÙY]Y[[ÜžJBˆÛY[[ÜžHX\›ˆÑ“ÐÕT×H›Û\ÈÚ][ÈH›Ý\ËÙY\[™ÈÚ]\ÈÛ›ÝÛ‚ˆÛY[[ÜžHX\›ˆKX[Ñ“ÐÕT×H›Û]™\žHÚ][ˆ\È›Ú™XÝ[È[BˆÛY[[ÜžHYV\[™Û™H›ÝBˆÛY[[ÜžHÙ]V™\XÙH]™\žH›ÝBˆÛY[[ÜžHÛX\ˆ›Ü™Ù]]™\ž][™ÂˆÛY[[ÜžH™[ØY™K\™XYHš[HY\ˆY][™È][Ù]Ú\™BˆÛY[[ÜžHÛŸÙ™ˆÚ]\ˆH›Ý\È™XXÚH[Ù[ˆÛY[[ÜžHØÛÜHSÑHÚ]ÈHÚ]×ÊˆÛÛÈX^H™XY‚ˆSÑH\È›Û™K›Ú™XÝÜˆ[È[Ü›ÜÜÙ\ÈÛÜšÚ[™È\™XÝÜšY\ËˆHÛÛÂˆ\™HÚ]×Û\ÝÚ]×ÜÙX\˜ÚÚ]×Ü™XY[™Ú]×Ü™XYÙØÝ[Y[È[˜X›Bˆ[H›Üˆ[ˆYÙ[Ú]ÝÛÛÈ[˜X›HÚ]ËˆY]HX\›š[™È›Û\Ú]ˆÙY]Y[[ÜžK\›Û\‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]ÙÒ[Hˆˆ‚ˆH›Ú™XÝ	ÜÈÙÈ\ÝÙ\[ˆœXZKÝÙË›Y\ÈHX\šÙÝÛˆ\ÚÈ\ÝBˆYÙ[[œÈÚ][™XÚÜÈÙ™ˆ›ÝYÚHÙ×Û\ÝÙ×ØY[™ˆÙ×ÙÛ™HÛÛËˆ]Ý\š]™\ÈXÜ›ÜÜÈÚ]Ë[™Y][™ÈHš[HžH[™ˆ\Èš[™Nˆ]™\žHÛÛ[X[™[™ÛÛØ[™XYÈ]Yœ™\Ú‚‚ˆÝÙÈÚÝÈH\Ý[X™\™YˆÝÙÈYV\[™Û™H[™[™È][BˆÝÙÈÛ™H•SP‘TŸVX\šÈ[ˆ][HÛ™HžH[X™\ˆÜˆ]Hœ˜YÛY[ˆÝÙÈ™[[Ý™H•SP‘TŸV›Ü[ˆ][HžH[X™\ˆÜˆ]Hœ˜YÛY[ˆÝÙÈÝÙY\™[[Ý™H]™\žHÛÛ\]Y][BˆÝÙÈY]Y]H\Ý[ˆ	QUÔ‚ˆÝÙÈÛX\ˆ™[[Ý™H]™\žH][BˆÝÙÈ]š[Ú\™HHš[H]™\Â‚ˆ[˜X›HHÛÛÈ›Üˆ[ˆYÙ[Ú]ÝÛÛÈ[˜X›HÙË‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]ÚÚ[Ò[Hˆˆ‚ˆÚÚ[È\™H›Û\œÈÛ[™ÈHÒÒS›YÚÜÙHœ›ÛX]\ˆÚ]™\ÈH˜[YH[™ˆH\ØÜš\[Ûˆ[™ÚÜÙH›ÙH\ÈH[œÝXÝ[ÛœÈÈ›ÛÝÎˆH^[Ý]ˆÝ\ˆÛÙ[™ÈYÙ[È\ÙKÛÈZ\ˆÚÚ[ÈÛÜšÈ\™H[˜Ú[™ÙYˆXZH™XYÂˆH›Ú™XÝ	ÜÈœXZKÜÚÚ[È[™‹ËœXZKÜÚÚ[È
+Üˆ	PRWÒÓQKÜÚÚ[ÊNÈBˆ›Ú™XÝÚÚ[ÚYÝÜÈHÛYHÛ™HÙˆHØ[YH˜[YKˆXXÚÚÚ[\È[ÛÈBˆÚÚ[×ÓSQHÛÛH[Ù[X^HØ[ÈÙ]H[œÝXÝ[ÛœËÛ˜ÙH]\Âˆ[˜X›Y›ÜˆHYÙ[‚‚ˆÜÚÚ[È\ÝÚÚ[ÎÈ
+ˆX\šÜÈHÛ™\ÈHYÙ[X^HØ[ˆÜÚÚ[ÈÚÝÈSQHš[HÚÚ[	ÜÈš[KÛÛÝ]K[™[œÝXÝ[ÛœÂˆÜÚÚ[È[˜X›HSQ_[Ù™™\ˆHÚÚ[
+Üˆ]™\žHÚÚ[
+HÈHÝ\œ™[YÙ[ˆÜÚÚ[È\ØX›HSQ_[ÝÜÙ™™\š[™È]ÈÜÚÚ[È›Û\Ý[ÛÜšÜÂˆÜÚÚ[È›Û\SQHÕVHÙ[™H[œÝXÝ[ÛœË[ˆV\È[Ý\ˆ™^Y\ÜØYÙBˆÜÚÚ[È]š[H\™XÝÜšY\ÈØØ[›™YˆÜÚÚ[È™[ØY™\ØØ[ˆH\™XÝÜšY\È
+]™\žHÜÚÚ[ÈÛÛ[X[™Ù\ÊB‚ˆÝÛÛÈ[˜X›HÚÚ[È\ÈHØ[YH\ÈÜÚÚ[È[˜X›H[[™[ÛÈXÚÜÈ\ˆÚÚ[ÈYY]\‹ˆHÚÚ[ÚÜÙHœ›ÛX]\ˆØ^\Âˆ\ØX›K[[Ù[Z[›ØØ][ÛŽˆYH\È™]™\ˆHÛÛˆÚ\™HH›ÙHØ^\Âˆ	T‘ÕSQS•ÈHVÛÙ\È\™NÈÝ\Ú\ÙH]›ÛÝÜÈH[œÝXÝ[ÛœË‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]›Û\[Hˆˆ‚ˆ›Û\ËˆHÞ\Ý[H›Û\\È[ˆYÙ[	ÜÈ[œÝXÝ[ÛœÎˆ]™\žHYÙ[ZÙ\Âˆ[Hœ›ÛHÛ™H›Û\[ˆHØ][ÙÈ
+›Û\ËœÞ\Ý[H[ˆHÛÛ™šYÝ\˜][ÛŠKˆ™Y™\™[˜ÙYžH˜[YH[ˆ]ÈÞ\Ý[T›Û\šY[ÈÙ]™\˜[YÙ[ÈX^HÚ\™BˆÛ™K[™Y][™ÈH›Û\\]\È[Ùˆ[KˆH\Ù\ˆ›Û\\ÈBˆY\ÜØYÙHÙ[žH˜[YH
+›Û\Ë\Ù\ŠK[™XZPÛÜ™HÚ\ÈZ[[ˆÛ™\È8 %ˆÛØ[™]Ø\‹›ÛÝÝ\8 %]H\Ù\ˆ›Û\ÙˆHØ[YH˜[YBˆ™\XÙ\ËˆÚÚ[È
+ÜÚÚ[ÊH\™HÙ[žH˜[YHHØ[YHØ^KÚ]\ˆÜˆ›ÝˆHYÙ[X^HØ[[H\ÈÛÛË‚‚ˆÜ›Û\È\Ý]™\žH›Û\[™ÚÚ[žHÚ[™ˆ	SQHÕVHÙ[™›Û\ÜˆÚÚ[SQHÚ]VY\ˆ]ˆVÛÙ\ÂˆÚ\™H	T‘ÕSQS•ÈÝ[™ËÜˆY\ˆH^ˆ›ÜˆBˆÞ\Ý[H›Û\ÝÚ]Ú\ÈYÙ[È][ˆÙ[™V‚ˆÜ›Û\ÈSQHÕVH\ÈHÛ™È›Ü›K‚ˆÜ›Û\ÈÚÝÈSQHš[Ú]SQH\ÈÜˆÙ[™ÂˆÜ›Û\ÈYSQHVÜ™X]HH\Ù\ˆ›Û\œ›ÛHÛ™H[™H
+Ù]™\XÙ\È]
+BˆÜ›Û\ÈY]SQHY]ÜˆÜ™X]HH\Ù\ˆ›Û\[ˆ	QUÔˆ
+ÙY]\Ù\ˆSQHÛÊBˆÜ›Û\È›HSQH›ÜH\Ù\ˆ›Û\
+HZ[[ˆ]™\XÙYÚÝÜÈYØZ[ŠB‚ˆÜ›Û\ÚÝÈHÝ\œ™[YÙ[	ÜÈÞ\Ý[H›Û\ˆÜ›Û\ÚÝÈSQHš[Û™HÞ\Ý[H›Û\ˆÜ›Û\YSQHVÜ™X]HHÞ\Ý[H›Û\œ›ÛHÛ™H[™H
+Ù]™\XÙ\È]
+BˆÜ›Û\Y]ÓSQWHY]ÜˆÜ™X]HÛ™H[ˆ	QUÔˆ
+Ý\œ™[Ú[ˆÛZ]YÈÙY]Þ\Ý[HSQHÛÊBˆÜ›Û\›HSQH›Ü[ˆ[\ÙYÞ\Ý[H›Û\ˆÜ›Û\\ÙHSQHÚ[HÝ\œ™[YÙ[]HÞ\Ý[H›Û\
+Ü›Û\SQHÛÊBˆØYÙ[›Û\QSQHÚ[[›Ý\ˆØ]™YYÙ[]HÞ\Ý[H›Û\ˆÙY]›Û\SQHY]SQKÚXÚ]™\ˆÚ[™Ùˆ›Û\]\Â‚ˆ™YÚ\Ý\ˆ[ˆYÙ[\›Ý[™H›Û\[ˆÛÈ[™\Î‚ˆÜ›Û\Y™]šY]Ù\ˆ[ÝH™]šY]ÈY™œÈ[™\ÝÛ›H™X[Y™XÝË‚ˆØYÙ[Y™]šY]Ù\ˆHš[\Ë[ˆ™]šY]Ù\‚‚ˆÙY\HY\ÜØYÙH[ÝHÙ[™Ù[ˆ\ÈH\Ù\ˆ›Û\‚ˆÜ›Û\ÈYÛÛ[Z]Üš]HHÛÛ[Z]Y\ÜØYÙH›ÜˆHÝYÙYÚ[™Ù\Îˆ	T‘ÕSQS•Âˆ	ÛÛ[Z]Û™H[™K[\\˜]]™H[ÛÙ‚ˆHÝ\ˆ[\]\È8 %ÛÛ\XÝ[YØ][Û‹ÛÜšÙ\‹Y[[ÜžH8 %\™HY]YˆÚ]ÙY]ÛÛ\XÝÙY][YØ][Û‹ÙY]ÛÜšÙ\‹[™ÙY]Y[[ÜžK\›Û\‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]YÙ[Ò[Hˆˆ‚ˆYÙ[ÛÛ[X[™ËˆHYš[š][Ûˆ\ÈHØ]™YÙ]\8 %›ÝšY\‹[Ù[Þ\Ý[Bˆ›Û\ÛÛË[™[Z]È8 %][ÝHÝÚ]Ú™]ÙY[ŽÈH›ØÙ\ÜÈ\ÈÛ™H[‚ˆÝ\Yœ›ÛHHYš[š][Û‹Y™\ÜÙYžH]ÈY‚‚ˆØYÙ[È\ÝYš[š][ÛœË[ˆH[›š[™È›ØÙ\ÜÈ™YBˆØYÙ[È\ÝYš[š][ÛœÈÛ›BˆØYÙ[È™YHH[›š[™È›ØÙ\ÜÈ™YHÛ›BˆØYÙ[ÈÛX\ˆ›Ü™Ù]š[š\ÚY›ØÙ\ÜÙ\Ë[™›ÜHÛ™\ÈØ]™YÚ]\ÈÚ]ˆØYÙ[È\ÙHQÝÚ]Ú\ÈÚ]ÈHYš[š][Û‚ˆØYÙ[ÈÚÝÈÒQHÚÝÈÛ™HYš[š][Ûˆ[ˆ[ˆØYÙ[È\ØÜšX™HQVÙ]HÛ™K[[™H\œÜÙHH[Ù[™XYÈÈXÚÈ]ˆØYÙ[È[˜X›_\ØX›HQ\šÈHYš[š][ÛˆÚ]Ý][][™È]ˆØYÙ[ÈXÜÛ\ÝH\Ý^\›˜[PÔYÙ[È[™Ú]\È[œÝ[YˆØYÙ[ÈXÜYSQHÐÓQT‘È‹‹—H™YÚ\Ý\ˆ[ˆPÔYÙ[\ÈH\ØX›HYÙ[‚ˆØ]š[™È[™Ú[™Ú[™ÈYš[š][ÛœËÛ™H[™HXXÚ
+ØYÙ[[™ØYÙ[È›ÝÛÜšÊN‚‚ˆØYÙ[YSQHSÑSÔ“ÕTÈ“ÓTÔ“Õ’QTˆÐTÑWÕT“WBˆÔ“ÕTÈ\ÈK‹È
+ÙYHÝÛÛÊHÜˆNÈ“ÓT˜[Y\ÈHÞ\Ý[Bˆ›Û\
+ÙYHÜ›Û\ÊNÈ“Õ’QTˆY˜][ÈÈ\ÈÚ]	ÜË[™ˆÚ]TÑWÕT“™YÚ\Ý\œÈH™]ÈÜ[RKXÛÛ\]X›H[™Ú[ˆØYÙ[ÛÛÈQÔ“ÕTÈ™\XÙH]ÈÛÛÜ›Ý\È
+K‹ÊKY\Ý[H
+
+ØKXŠKÜˆÛX\ˆ
+JBˆØYÙ[[Ù[QSÑSÚ[™ÙH]È[Ù[
+H›ÜˆH›ÝšY\ˆY˜][
+BˆØYÙ[›Û\Q“ÓTÚ[]][›Ý\ˆ˜[YYÞ\Ý[H›Û\ˆØYÙ[›ÝšY\ˆQ“Õ’QTˆ[Ý™H]ÈHÛÛ™šYÝ\™Y›ÝšY\‚ˆØYÙ[™[[Ý™HQ›Ü]ÈÝX˜YÙ[\ÝÈ[™HY˜][YÙ[\™H\]YˆÙY]YÙ[ÒQHY]HYš[š][Ûˆ\È”ÓÓˆ[ˆ	QUÔˆ
+Ý\œ™[Ú[ˆÛZ]Y
+B‚ˆHYš[š][Û‰ÜÈÛÛÈ\™H]ÈÝÛ‹Ú]]™\ˆ]È\[ˆH™YNˆÚ]™HBˆÝX˜YÙ[]ÈÜ›Ý\ÈHØ[YHØ^Kˆ˜[YY›Û\È\™HX[˜YÙYÚ]Ü›Û\‚ˆØYÙ[ÈÙÈQš[H[›š[™Ëš[š\ÚYÜˆØ]™YYÙ[	ÜÈÝÛˆ˜[œØÜš\ˆØYÙ[ÈÝÜQ]\ÙH[ˆYÙ[[™]™\ž][™È]Ý\Y]Z\ˆ™^Ý\ˆØYÙ[ÈÛÛ[YHQ]H]\ÙYYÙ[ÛÈÛŽÈ]Y]YYY\ÜØYÙ\È™XXÚ][‚ˆØYÙ[ÈÚ[QÔ‘PTÓÓ—H[™[ˆYÙ[[™]™\ž][™È]Ý\YˆØYÙ[È›ØÝ\ÈQXZ[ˆÙ[™Ú][ÝH\HÈÛ™H[›š[™ÈYÙ[Üˆ˜XÚÈÈHÚ]‚ˆÚ[HYÙ[È[‹Ú][ÝH\H\È]Y]YY›Üˆ[H[™™XY]Z\ˆ™^ˆ[Ù[\›ŽˆÜ]Y]YH\ÝÈ]QVY™\ÜÙ\ÈÛ™HYÙ[Û˜ÙKˆZ\‚ˆÝ]]š[È[ˆ›ØÚÜÈ™Yš^YYÙ[ÔQÈÜÙ]ZKœÝX˜YÙ[ÈXÚÜÈÝÈ]XÚ‚‚ˆ[ˆYÙ[[Ø^\È\ÈHÛÛÈ]ÈYš[š][Ûˆ[ÝÜË][žH\ÙˆBˆ™YKˆÜÙ][YØ][ÛˆÝX˜YÙ[[ÛÈ]È][™[ÞHÛÜšÈÈHÚ[Ú]ˆHØ[YHÛÛËÛÈÛ›HH[œÝÙ\ˆ[™È\™KˆÜÙ][Z]Ë›X^ÝX˜YÙ[È[™ˆÜÙ][Z]Ë›X^ÝX˜YÙ[\›Ý[™H™YK‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ]ÛÛ[Hˆˆ‚ˆÛÛÜ›Ý\ÛÛ[X[™Î‚ˆÝÛÛÈ\Ý\ÝÙÚXØ[ÛÛÜ›Ý\ÂˆÝÛÛÈÚÝÈÔ“ÕTÚ]HÜ›Ý\\È›Ü‹XXÚÛÛÚ]]È\˜[Y]\œË[™]ÈÙ][™ÜÂˆÝÛÛÈ[˜X›_\ØX›HÔ“ÕTÚ[™ÙHHÝ\œ™[YÙ[	ÜÈ[ÝÙYÜ›Ý\ÂˆÝÛÛÈÙ]Ô“ÕTÔSÓˆSQHÛÛ™šYÝ\™HHÛÛÜ›Ý\[™™[ØY]ÈÛÛÂˆÝÛÛÈ[œÙ]Ô“ÕTÔSÓˆ™\ÝÜ™H[ˆÜ[Û‰ÜÈY˜][‚ˆ^[\\Î‚ˆÝÛÛÈ[˜X›HÚ]X‚ˆÝÛÛÈÙ]X\ÝÙÛˆX\ÝÙÛ’[œÝ[˜ÙHX\ÝÙÛ‹œÛØÚX[ˆÝÛÛÈÙ]X\ÝÙÛˆX\ÝÙÛTRÙ^Q[š\›Û›Y[PTÕÑÓ—ÐTWÒÑVBˆÝÛÛÈÙ]X\ÝÙÛˆX\ÝÙÛ•Üš]Q[˜X›YÛ‚ˆˆˆ‚‚ˆš]˜]HÝ]XÈ[˜Èš[\ØYÙJ
+HÂˆš[
+ˆˆˆ‚ˆXZH8 %HØÚÙ]XZHÛÛ[X[™[[™HYÙ[‚ˆ\ØYÙN‚ˆXZHÛÜ[Ûœ×HÛY\ÜØYÙWB‚ˆÜ[ÛœÎ‚ˆKXXÜÙ\™HXZH\È[ˆPÔYÙ[ÛˆÝ[È
+›ÜˆQ\ÊBˆKXYÙ[QÙ[XÝHÛÛ™šYÝ\™YYÙ[ˆKX\KZÙ^HÑVH™Y™\ˆ[ˆ[š\›Û›Y[˜\šXX›HÜˆÛÛ™šYÈ™Y™\™[˜ÙBˆKX˜\ÙK]\›T“YZØÈÜ[RKXÛÛ\]X›H[™Ú[ˆKXÛÛ™šYÈUØYYÚ[œË›ÝšY\œËÛÛËPÔËYÙ[Ë[™\›Ý˜[ÂˆZKZ[ÚÝÈ\È[ˆKZ\ÝÜžHU\œÚ\ÝY]X›H[œ]\ÝÜžH
+ÜˆPRWÒTÕÔ–JBˆKZÛYHTˆÙY\H›Ú™XÝ[™^[™Ú\™YÝ]H[ˆTˆ
+ÜˆPRWÒÓQJBˆKZ[XYÙHU]XÚ[ˆ[XYÙH
+™\X]X›JBˆ[K[\Ý\ÝØ]™YÚ]È[ˆ\È›Ú™XÝ[™^]ˆK[X\šÙÝÛˆ™[™\ˆ™\Y\È\ÈX\šÙÝÛˆ]™[ˆÚ[ˆ\YˆK[X^\ÝX˜YÙ[ÈˆÚ[™[ˆ[ˆYÙ[X^H[ˆ]Û˜ÙH
+Y˜][JBˆK[X^]ÛÛXØ[ÈˆÛÛØ[È[ÝÙY\ˆYÙ[[ˆ
+Y˜][L
+BˆK[X^]\›œÈˆ[Ù[\›œÈ[ÝÙY\ˆYÙ[[ˆ
+Y˜][L
+BˆK[XÜÙ\™HXZH\È[ˆPÔÙ\™\ˆÛˆÝ[È
+Û™H›Û\ÛÛ
+BˆK[[Ù[SQHÝ™\œšYHHÙ[XÝY[Ù[ˆK[›Ë[X\šÙÝÛˆš[™\Y\È™\˜˜][BˆK[›Ë\Ý™X[H\ØX›H™\ÜÛœÙHÝ™X[Z[™ÂˆK\YÚ[ˆUØYH˜]]™H™[XˆYÚ[ˆ
+™\X]X›JBˆK\š[XÛÛ™šYÈš[HÛÛ\]H^[\HÛÛ™šYÝ\˜][Û‚ˆK\›Ú™XÝÈ\Ý]™\žH›Ú™XÝXZH\È™Y[ˆÝ\Y[‹[ˆ^]ˆK\›ÝšY\ˆQÝ™\œšYHHÙ[XÝY›ÝšY\‚ˆ\‹K\™\Ý[YHÐÒUH™[Ü[ˆÒU
+\Ý[™^QÜˆ]JKÜˆH]\ÝÚ]ˆÚ]HYÙ[È]È[œÈÝ\YˆK\Ý]HTˆÙY\\È›Ú™XÝ	ÜÈÚ]È[ˆT‹›Ý‹ËœXZKØÚ]È
+ÜˆPRWÔÕUJBˆK\Ý[ˆ]XÚÝ[™\™[œ]\ÈH^š[H
+Ú]Y™ˆXZHK\Ý[ˆœ™]šY]È]ŠBˆK\Þ\Ý[HVÝ™\œšYHYÙ[[œÝXÝ[ÛœÂˆ]‹K]™\œÚ[Ûˆš[HXZH™\œÚ[Û‚ˆ^KK^[ÛÈ\›Z][ÛÛØ[ÈÚ]Ý]›Û\[™È›Üˆ\È[‚ˆ
+ÜÙ][ÛÈÛˆØ]™\ÈHÚÚXÙH›Üˆ]™\žH[ŠB‚ˆÛÛ™šYÈ\ØÛÝ™\žN‚ˆKXÛÛ™šYËPRWÐÓÓ‘’QË‹ÜXZKšœÛÛ‹‹Ë˜ÛÛ™šYËÜXZKØÛÛ™šYËšœÛÛ‚‚ˆYZØÈ›ÝšY\ˆ
+Ý™\œšY\ÈHÙ[XÝYYÙ[	ÜÊN‚ˆPRWÔ“Õ’QT‹PRWÓSÑSPRWÐTÑWÕT“[™PRWÐTWÒÑVKÜ‚ˆPRWÐTWÒÑVWÑ’SH˜[Z[™ÈHš[H]ÛÈHÙ^KÛÈHÙXÜ™]ˆ™]™\ˆÚ]È[ˆH[š\›Û›Y[‚ˆ\œÚ\Ý[‘TÝ]N‚ˆÚ]È™[Û™ÈÈH›Ú™XÝ›ÛÝY]HÝ\œ™[\™XÝÜžH[™\™BˆÙ\Û™Hš[H\ˆÚ][ˆ‹ËœXZKØÚ]ÎÈ‹ËœXZKÜ›Ú™XÝËšœÛÛˆ\ÝÂˆ]™\žH›Ú™XÝ[™‹ËœXZKÚ\ÝÜžKšœÛÛˆÛÈH[œ]\ÝÜžK‚‚ˆÚ]Ý]HÛÛ™šYÈš[KHÙ™›[™H[È[™Ü[RKXÛÛ\]X›H›ÝšY\œÂˆ\™H™YÚ\Ý\™Y\È™Y›Ü™K‚ˆˆˆŠBˆBŸB

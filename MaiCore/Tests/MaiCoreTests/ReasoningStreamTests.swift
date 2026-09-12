@@ -62,6 +62,10 @@ func thinkingPreviewRows() {
   #expect(preview.text.count == ThinkingPreview.capacity)
   #expect(ThinkingPreview.lines(preview.text, count: 1, width: 80) == ["newest"])
   #expect(ThinkingPreview.lines("a\nb\nc\nd", count: 3, width: 80) == ["b", "c", "d"])
+  #expect(ThinkingDisplay.five.lineCount == 5)
+  #expect(
+    ThinkingPreview.lines("a\nb\nc\nd\ne\nf", count: ThinkingDisplay.five.lineCount, width: 80)
+      == ["b", "c", "d", "e", "f"])
   #expect(ThinkingPreview.lines("abcdef", count: 3, width: 2) == ["ab", "cd", "ef"])
   #expect(
     ThinkingPreview.lines("界界a", count: 3, width: 3, measure: { $0 == "界" ? 2 : 1 }) == ["界", "界a"])

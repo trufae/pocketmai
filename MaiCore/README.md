@@ -462,21 +462,24 @@ overridden, and a value that is not one of the levels (`custom`, say) is sent
 as `reasoning_effort` unchanged. The runtime also adds a system prompt section
 that says how much care the task deserves, followed by `TEXT` when given, so a
 model without a reasoning control hears it too. `/set effort` shows the current
-setting; `/set effort auto` restores provider defaults. `/set effort off` (or
+setting; `/set effort auto` normally restores provider defaults, but explicitly
+disables thinking for DeepSeek Flash because that provider otherwise defaults to
+high effort. `/set effort off` (or
 `/nothink`) explicitly disables thinking where supported; models such as GPT-OSS
 only allow lowering effort. These settings persist on the agent. iOS uses the
 same MaiCore enum and request mapping, including `xhigh` and `max`.
 
-`/set ui.thinking status|line|three|full` controls presentation independently:
+`/set ui.thinking status|line|three|five|full` controls presentation independently:
 `status` shows “Thinking…”, `line` keeps the newest line, `three` keeps three
-scrolling rows with a grey gradient, and `full` prints all reasoning in grey
-italics. Compact previews occupy transient rows above the REPL prompt and clear
+scrolling rows with a grey gradient, `five` keeps five, and `full` prints all
+reasoning in grey italics. Compact previews occupy transient rows above the REPL prompt and clear
 at text/tool boundaries, cancellation and errors. Pipes and captured output use
 a plain status instead of cursor controls; `full` retains plain reasoning there.
 `NO_COLOR` disables styling. The complete reasoning stays in the transcript in
 every mode. iOS offers the same display modes in Settings, keeps completed
 reasoning in separate disclosure blocks, and preserves their order between
-responses and tool calls.
+responses and tool calls. Its default is a five-line tail with an estimated token
+and character count; the complete block is rendered only when expanded.
 
 Provider mapping references: [OpenAI](https://developers.openai.com/api/docs/guides/latest-model),
 [Ollama](https://docs.ollama.com/capabilities/thinking),
@@ -488,7 +491,7 @@ Provider mapping references: [OpenAI](https://developers.openai.com/api/docs/gui
 
 | Backend/model | Shared effort mapping |
 | --- | --- |
-| DeepSeek | `thinking.type` plus `reasoning_effort` low/high/max |
+| DeepSeek Flash | Auto/off sends `thinking.type=disabled`; minimal/low maps to low, medium/high/xhigh to high, and max to max |
 | Kimi K2.5/K2.6 API | `thinking.type` enabled/disabled |
 | Kimi K2.5/K2.6 local | `chat_template_kwargs.thinking`; MLX template context |
 | Kimi K3 | low/high/max; off requests low |
@@ -501,8 +504,10 @@ Provider mapping references: [OpenAI](https://developers.openai.com/api/docs/gui
 | Ollama/OpenRouter | The host's API takes precedence over model-specific fields |
 
 MiniMax reasoning is returned in tagged assistant content when continuing tool
-calls. DeepSeek and Kimi retain `reasoning_content` for continuation regardless
-of the display choice. Gemma's `<|channel>thought` / `<channel|>` delimiters are
+calls. DeepSeek retains `reasoning_content` only for requests carrying native
+tools, as its API requires; tool-free requests omit it so old thinking does not
+inflate the context. Kimi retains it for continuation regardless of the display
+choice. Gemma's `<|channel>thought` / `<channel|>` delimiters are
 normalized alongside `<think>` by the same stream parser. Unknown providers can
 still use explicit `options.additional` fields without frontend changes.
 
