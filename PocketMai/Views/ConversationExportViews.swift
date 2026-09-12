@@ -81,7 +81,7 @@ final class ConversationExportCoordinator: ObservableObject {
       return await store.exportConversationDebugJSONFile(id: conversationID)
     case .markdown, .json:
       return await store.exportConversationFile(id: conversationID, format: format)
-    case .epub, .docx:
+    case .html, .epub, .docx:
       return await store.exportConversationFile(
         id: conversationID,
         format: format,
@@ -141,7 +141,7 @@ struct ConversationExportMenu: View {
     Menu {
       ConversationExportMenuItems(isExporting: coordinator.isExporting) { format in
         guard let conversationID else { return }
-        if format == .epub || format == .docx {
+        if format == .html || format == .epub || format == .docx {
           coordinator.shareDocument(format: format, conversationID: conversationID, store: store)
           return
         }
@@ -341,7 +341,7 @@ struct ActivityShareSheet: UIViewControllerRepresentable {
 
 private extension ConversationExportFormat {
   static var shareMenuFormats: [ConversationExportFormat] {
-    [.markdown, .epub, .docx, .audio]
+    [.markdown, .html, .epub, .docx, .audio]
   }
 
   static var dataMenuFormats: [ConversationExportFormat] {
@@ -351,6 +351,7 @@ private extension ConversationExportFormat {
   var exportMenuTitle: String {
     switch self {
     case .markdown: "Markdown (.md)"
+    case .html: "HTML (.html)"
     case .epub: "EPUB (.epub)"
     case .docx: "Word (.docx)"
     case .audio: "Audio (.m4a)"

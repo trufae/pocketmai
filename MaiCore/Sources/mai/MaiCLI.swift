@@ -2451,6 +2451,7 @@ struct MaiCLI {
               catalogs: &catalogs,
               visual: visual,
               chatProcess: chatProcessIDs[session.id],
+              editor: editor,
               terminal: terminal)
           }
           if exits {
@@ -2928,6 +2929,7 @@ struct MaiCLI {
     catalogs: inout [MCPServerCatalog],
     visual: VisualBridge,
     chatProcess: AgentPID? = nil,
+    editor: TerminalLineEditor? = nil,
     terminal: TerminalWriter
   ) async -> Bool {
     let parts = input.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(String.init)
@@ -3209,7 +3211,11 @@ struct MaiCLI {
       }
     case "/attach":
       await attachDocument(
-        argument, session: &session, ocrProvider: ocrProvider, terminal: terminal)
+        argument,
+        session: &session,
+        ocrProvider: ocrProvider,
+        editor: editor,
+        terminal: terminal)
     case "/copy":
       await copyToClipboard(argument, session: session, terminal: terminal)
     case "/export":
@@ -8037,6 +8043,7 @@ struct MaiCLI {
       /export json [PATH]       The chat as stored, in a JSON envelope (.json)
       /export debug [PATH]      The JSON plus the tools, settings, and every child agent's
                                 transcript from this chat's runs
+      /export html [PATH]       A self-contained HTML document
       /export epub [PATH]       An EPUB book, one chapter per message
       /export docx [PATH]       A Word document
 
@@ -8217,13 +8224,14 @@ struct MaiCLI {
     _ argument: String,
     session: inout REPLSession,
     ocrProvider: any OCRProvider,
+    editor: TerminalLineEditor?,
     terminal: TerminalWriter
   ) async {
     var trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else {
-      await terminal.line("Usage: /attach PATH | /attach clear")
+      await terminal.line("Usage: /attach [source|markdown|copy] PATH | /attach clear")
       await terminal.line(
-        "Word, EPUB and PDF files become Markdown, JSON becomes an outline, text files attach as they are, and images attach at medium size."
+        "Word, EPUB and PDF files become Markdown, JSON becomes an outline, arbitrary text/source files attach as they are, and images attach at medium size. HTML asks whether to attach its source, convert it to Markdown, or copy it into the working directory."
       )
       return
     }
@@ -8236,6 +8244,17 @@ struct MaiCLI {
           : "Dropped \(count) pending attachment\(count == 1 ? "" : "s").")
       return
     }
+    var htmlChoice: String?
+    if trimmed.first != "\"" && trimmed.first != "'" {
+      let fields = trimmed.split(maxSplits: 1, whereSeparator: \Character.isWhitespace).map(
+        String.init)
+      if fields.count == 2,
+        ["source", "markdown", "copy"].contains(fields[0].lowercased())
+      {
+        htmlChoice = fields[0].lowercased()
+        trimmed = fields[1]
+      }
+    }
     if trimmed.count >= 2, let first = trimmed.first, first == "\"" || first == "'",
       trimmed.last == first
     {
@@ -8244,7 +8263,9 @@ struct MaiCLI {
     let path = NSString(string: trimmed).expandingTildeInPath
     let url = URL(fileURLWithPath: path)
     do {
-      if DocumentAttachmentImporter.kind(forFilename: url.lastPathComponent) == .image {
+      let data = try DocumentAttachmentImporter.data(at: url)
+      let kind = DocumentAttachmentImporter.kind(for: data, filename: url.lastPathComponent)
+      if kind == .image {
         session.pendingContent.append(
           try await imageContent(path: path, mode: .medium, ocrProvider: ocrProvider))
         await terminal.line(
@@ -8252,7 +8273,52 @@ struct MaiCLI {
         )
         return
       }
-      let attachment = try DocumentAttachmentImporter.attachment(at: url)
+      if htmlChoice != nil, kind != .html {
+        await terminal.line(
+          "error: source, markdown, and copy choices apply only to HTML files.",
+          to: .standardError)
+        return
+      }
+      if kind == .html, htmlChoice == nil {
+        guard isatty(STDIN_FILENO) != 0, let editor else {
+          await terminal.line(
+            "HTML needs a choice: /attach source \(trimmed), /attach markdown \(trimmed), or /attach copy \(trimmed).",
+            to: .standardError)
+          return
+        }
+        await terminal.line("Import \(url.lastPathComponent) as HTML source, Markdown, or a working-directory file?")
+        let answer = editor.readLine(
+          prompt: "html [source/markdown/copy/cancel]> ",
+          completions: ["source", "markdown", "copy", "cancel"],
+          rememberInput: false)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !editor.wasInterrupted, let answer, !["cancel", "c", ""].contains(answer) else {
+          await terminal.line("HTML import cancelled.")
+          return
+        }
+        switch answer {
+        case "source", "s", "1": htmlChoice = "source"
+        case "markdown", "md", "m", "2": htmlChoice = "markdown"
+        case "copy", "file", "3": htmlChoice = "copy"
+        default:
+          await terminal.line("HTML import cancelled: unknown choice '\(answer)'.")
+          return
+        }
+      }
+      if htmlChoice == "copy" {
+        let destination = try DocumentAttachmentImporter.copy(
+          data: data,
+          filename: url.lastPathComponent,
+          into: URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath,
+            isDirectory: true),
+          sourceURL: url)
+        await terminal.line("Copied HTML to \(destination.path).")
+        return
+      }
+      let attachment = try DocumentAttachmentImporter.attachment(
+        data: data,
+        filename: url.lastPathComponent,
+        htmlMode: htmlChoice == "markdown" ? .markdown : .source)
       session.pendingContent.append(attachment.content)
       var message = "Attached \(attachment.name) (\(attachment.characterCount) characters"
       if let note = attachment.note { message += ", \(note)" }
@@ -9489,7 +9555,7 @@ struct MaiCLI {
       "/agents", "/agents tree", "/agents clear", "/agents log ", "/agents kill ", "/agents focus ",
       "/agents focus main", "/queue", "/queue push ", "/queue pop", "/queue drop",
       "/help queue", "/help export", "/help import", "/export archive ", "/import ",
-      "/export markdown ", "/export json ", "/export debug ",
+      "/export markdown ", "/export html ", "/export json ", "/export debug ",
       "/stats", "/stats ranking", "/stats speed", "/stats time", "/stats efficiency",
       "/stats show ",
       "/stats reset", "/stats rm ", "/stats path", "/help stats",
@@ -9507,7 +9573,8 @@ struct MaiCLI {
       "/edit input",
       "/chat compact ",
       "/image tiny ", "/image small ", "/image medium ", "/image big ", "/image full ",
-      "/image ocr ", "/attach ", "/attach clear", "/copy", "/help copy", "/reply", "/help reply",
+      "/image ocr ", "/attach ", "/attach source ", "/attach markdown ", "/attach copy ",
+      "/attach clear", "/copy", "/help copy", "/reply", "/help reply",
       "/clear", "/chat list",
       "/chat list active", "/chat list archived", "/chat list all", "/chat new ",
       "/chat use ", "/chat next", "/chat previous", "/chat info", "/chat session",
@@ -9789,7 +9856,7 @@ struct MaiCLI {
   private static let replHelp = """
     /agent                 Select or edit this chat's agent; /help agent lists commands
     /agents                Manage agent definitions and running agents; /help agents lists commands
-    /attach PATH           Attach a Word, EPUB, PDF, JSON, or text file as Markdown/plain text
+    /attach [MODE] PATH    Attach a document/source file; HTML asks for source, markdown, or copy
     /attach clear          Drop the attachments queued for the next message
     /baseurl URL           Change the current provider endpoint
     /btw PROMPT            Ask in a fresh context without changing this chat
@@ -9802,7 +9869,7 @@ struct MaiCLI {
     /edit TARGET           Edit a prompt, agent, config, MCP list, or message in $EDITOR
     /edit input            Write the next message in $EDITOR instead of at the prompt
     /exit                  Exit the REPL
-    /export FORMAT [PATH]  Save a portable archive, or this chat as markdown, json, debug, epub, or docx
+    /export FORMAT [PATH]  Save a portable archive, or this chat as markdown, html, json, debug, epub, or docx
     /help [COMMAND]        Show commands or help for one command
     /image MODE PATH       Attach at tiny/small/medium/big/full size, or OCR to Markdown
     /import PATH           Merge a PocketMai/pmai archive into settings, skills, and chats

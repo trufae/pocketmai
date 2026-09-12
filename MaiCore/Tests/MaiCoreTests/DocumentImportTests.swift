@@ -664,6 +664,14 @@ func documentAttachments() throws {
   #expect(file.text?.hasPrefix("# Fixture Report") == true)
   #expect(word.characterCount == file.text?.count)
 
+  let source = try DocumentAttachmentImporter.attachment(
+    data: Data("int main(void) { return 0; }\n".utf8), filename: "main.c")
+  #expect(
+    source.content
+      == .file(
+        FileContent(
+          name: "main.c", mimeType: "text/x-c", text: "int main(void) { return 0; }\n")))
+
   #expect(DocumentAttachmentImporter.kind(forFilename: "photo.JPG") == .image)
   #expect(DocumentAttachmentImporter.kind(forFilename: "README") == .text)
   #expect(throws: DocumentImportError.imageRequiresImageImporter("photo.png")) {
@@ -678,6 +686,80 @@ func documentAttachments() throws {
   #expect(throws: DocumentImportError.fileNotFound("/nonexistent/file.txt")) {
     try DocumentAttachmentImporter.attachment(at: URL(fileURLWithPath: "/nonexistent/file.txt"))
   }
+}
+
+@Test("Document kinds prefer content and MIME type over file extensions")
+func documentAttachmentContentDetection() {
+  #expect(
+    DocumentAttachmentImporter.kind(
+      for: Data("%PDF-1.7\n".utf8), filename: "download.bin") == .pdf)
+  #expect(
+    DocumentAttachmentImporter.kind(
+      for: Data("<!doctype html><p>Hello</p>".utf8), filename: "download") == .html)
+  #expect(
+    DocumentAttachmentImporter.kind(
+      for: Data("<p>Hello</p>".utf8), filename: "download")
+      == .html)
+  #expect(
+    DocumentAttachmentImporter.kind(
+      for: Data("<p>Hello</p>".utf8), filename: "fragment.HTML") == .html)
+  #expect(
+    DocumentAttachmentImporter.kind(
+      for: Data("print('hello')\n".utf8), filename: "script.data", mimeType: "text/x-python")
+      == .text)
+}
+
+@Test("Copied imports avoid collisions and preserve a file already in place")
+func documentAttachmentCopy() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("document-copy-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+
+  let original = directory.appendingPathComponent("notes.html")
+  try Data("old".utf8).write(to: original)
+  let copied = try DocumentAttachmentImporter.copy(
+    data: Data("new".utf8), filename: "notes.html", into: directory)
+  #expect(copied.lastPathComponent == "notes-2.html")
+  #expect(try Data(contentsOf: original) == Data("old".utf8))
+  #expect(try Data(contentsOf: copied) == Data("new".utf8))
+
+  let sameFile = try DocumentAttachmentImporter.copy(
+    data: Data("ignored".utf8), filename: copied.lastPathComponent,
+    into: directory, sourceURL: copied)
+  #expect(sameFile == copied)
+  #expect(try Data(contentsOf: copied) == Data("new".utf8))
+}
+
+@Test("HTML can attach as source or convert to Markdown")
+func htmlDocumentAttachment() throws {
+  let data = Data(
+    """
+    <!doctype html><html><head><meta charset="utf-8"><title>Ignored</title><script>if (a < b) alert('&');</script></head>
+    <body><h1>Notes</h1><p>Hello <strong>world</strong>.</p><ul><li>One</li></ul></body></html>
+    """.utf8)
+  let source = try DocumentAttachmentImporter.attachment(data: data, filename: "notes.dat")
+  guard case .file(let sourceFile) = source.content else {
+    Issue.record("Expected HTML source")
+    return
+  }
+  #expect(sourceFile.name == "notes.dat")
+  #expect(sourceFile.mimeType == "text/html")
+  #expect(sourceFile.text?.contains("<strong>world</strong>") == true)
+
+  let markdown = try DocumentAttachmentImporter.attachment(
+    data: data, filename: "notes.html", htmlMode: .markdown)
+  #expect(markdown.name == "notes.md")
+  #expect(markdown.note == "converted from HTML to Markdown")
+  guard case .file(let markdownFile) = markdown.content else {
+    Issue.record("Expected converted HTML")
+    return
+  }
+  #expect(markdownFile.mimeType == "text/markdown")
+  #expect(markdownFile.text == "# Notes\n\nHello **world**.\n\n- One")
+
+  let utf16 = try #require("<p>Wide text</p>".data(using: .utf16))
+  #expect(try HTMLImporter.markdown(from: utf16) == "Wide text")
 }
 
 // MARK: - EPUB

@@ -7,6 +7,7 @@ public enum ChatExportFormat: String, CaseIterable, Sendable {
   case json
   /// The JSON envelope plus what the host knows about how the chat ran.
   case debug
+  case html
   case epub
   case docx
 
@@ -14,6 +15,7 @@ public enum ChatExportFormat: String, CaseIterable, Sendable {
     switch self {
     case .markdown: "md"
     case .json, .debug: "json"
+    case .html: "html"
     case .epub: "epub"
     case .docx: "docx"
     }
@@ -24,6 +26,7 @@ public enum ChatExportFormat: String, CaseIterable, Sendable {
     case .markdown: "Markdown"
     case .json: "JSON"
     case .debug: "Debug JSON"
+    case .html: "HTML"
     case .epub: "EPUB"
     case .docx: "Word"
     }
@@ -35,6 +38,7 @@ public enum ChatExportFormat: String, CaseIterable, Sendable {
     case "markdown", "md": self = .markdown
     case "json": self = .json
     case "debug", "debug-json", "debugjson": self = .debug
+    case "html", "htm": self = .html
     case "epub": self = .epub
     case "docx", "doc", "word": self = .docx
     default: return nil
@@ -213,6 +217,8 @@ public enum ChatExport {
       let envelope = ChatExportEnvelope(
         chat: chat, generator: generator, debug: format == .debug ? debug : nil)
       return try encoder.encode(envelope)
+    case .html:
+      return HTMLExport.data(for: document(for: chat, generator: generator))
     case .epub:
       return EPUBExport.data(for: document(for: chat, generator: generator))
     case .docx:

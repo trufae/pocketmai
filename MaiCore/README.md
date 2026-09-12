@@ -172,13 +172,15 @@ Visual mode needs an interactive terminal and, on macOS, version 15 or later.
 `/attach PATH` queues a document for the next message. Word files, EPUB books
 and PDFs are converted to Markdown (scanned PDF pages go through on-device OCR
 on Apple platforms), JSON files become an indented outline, and other text files are
-attached verbatim; images are attached at medium size, so use `/image` for other
+attached verbatim. HTML asks whether to keep its source, convert it to Markdown,
+or copy it into the working directory; scripts can make that explicit with
+`/attach source|markdown|copy PATH`. Images are attached at medium size, so use `/image` for other
 sizes or OCR. `/attach clear` drops everything queued. The converters live in
 the `MaiDocuments` module, which PocketMai links as well, so the app, the CLI,
 and its visual mode share one implementation. `MaiDocuments` needs PDFKit for
 PDFs, so PDF conversion is unavailable on Linux while Word, EPUB, JSON, and
 text work everywhere. The same module holds the exporters (`ChatExport`, `MarkdownExport`,
-`EPUBExport`, `DOCXExport`): they write from a small `ExportDocument` that each
+`HTMLExport`, `EPUBExport`, `DOCXExport`): they write from a small `ExportDocument` that each
 host builds from its own chat model, so `/export` here and the share sheet in
 PocketMai produce the same files.
 
@@ -318,7 +320,7 @@ turn runs is queued and joins the conversation at the agent's next model turn â€
 after the tool results it is about to read â€” so a running agent can be steered
 without stopping it. `/queue` lists what is waiting, `/queue push TEXT` adds
 without sending, `/queue pop` drops the newest, and `/queue drop` drops all.
-`/export markdown|json|debug|epub|docx [PATH]` saves the chat as a file, with
+`/export markdown|html|json|debug|epub|docx [PATH]` saves the chat as a file, with
 the same writers PocketMai uses (`MaiDocuments`): `debug` is the JSON envelope
 plus the tools and settings the chat runs with.
 `/export archive [PATH]` writes a portable `.pocketmai.json` archive containing

@@ -92,6 +92,11 @@ enum AudioTranscriptionService {
   ]
 
   static func isAudioFile(_ url: URL) -> Bool {
+    if let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType,
+      type.conforms(to: .audio)
+    {
+      return true
+    }
     let ext = url.pathExtension.lowercased()
     if audioExtensions.contains(ext) { return true }
     return UTType(filenameExtension: ext)?.conforms(to: .audio) == true
