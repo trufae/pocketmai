@@ -141,7 +141,8 @@ public actor AgentRuntime {
     agents[id] = agent
     // A named agent already running reads its edited definition at its next
     // safe boundary. Derived workers are refreshed from their live parent.
-    for (pid, var request) in liveRequests where request.agentID == id {
+    for pid in Array(liveRequests.keys) {
+      guard var request = liveRequests[pid], request.agentID == id else { continue }
       request.applyRuntimeSettings(from: agent)
       liveRequests[pid] = request
       await runBudgets[pid]?.update(limits: request.limits)
