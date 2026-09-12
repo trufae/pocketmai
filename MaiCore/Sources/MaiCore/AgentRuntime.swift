@@ -54,6 +54,22 @@ public actor AgentRuntime {
   private var providers: [ProviderID: any ChatProvider] = [:]
   private var tools: [String: any AgentTool] = [:]
   private var agents: [String: AgentDefinition] = [:]
+  /// The operational part of every request currently running. Transcripts
+  /// stay local to their run; hosts may replace these settings between model
+  /// and tool calls without cancelling the work already in flight.
+  private var liveRequests: [AgentPID: AgentRequest] = [:]
+  /// A nameless worker inherits its parent's live settings. Named agents keep
+  /// their own definition, including when that definition is edited mid-run.
+  private struct DerivedRun: Sendable {
+    var parent: AgentPID
+    var tools: Set<String>?
+    var delegates: Bool
+  }
+  private var derivedRuns: [AgentPID: DerivedRun] = [:]
+  private var runBudgets: [AgentPID: RunBudget] = [:]
+  /// Covers the tiny interval after a host starts a task but before the run
+  /// has installed its request in this actor.
+  private var pendingReconfigurations: [AgentPID: AgentRequest] = [:]
   private var registeredMCPs: [String: RegisteredMCP] = [:]
   private let approvalHandler: any ApprovalHandler
   /// Overrides for the delegation brief and the derived worker's instructions.
@@ -116,13 +132,49 @@ public actor AgentRuntime {
   public func register(
     agent: AgentDefinition,
     replacingExisting: Bool = false
-  ) throws {
+  ) async throws {
     let id = agent.id.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !id.isEmpty else { throw AgentRuntimeError.invalidAgentID }
     guard replacingExisting || agents[id] == nil else {
       throw AgentRuntimeError.agentAlreadyRegistered(id)
     }
     agents[id] = agent
+    // A named agent already running reads its edited definition at its next
+    // safe boundary. Derived workers are refreshed from their live parent.
+    for pid in Array(liveRequests.keys) {
+      guard var request = liveRequests[pid], request.agentID == id else { continue }
+      request.applyRuntimeSettings(from: agent)
+      liveRequests[pid] = request
+      await runBudgets[pid]?.update(limits: request.limits)
+    }
+    for pid in Array(derivedRuns.keys) {
+      guard let fallback = liveRequests[pid] else { continue }
+      let inherited = currentRequest(fallback, for: pid)
+      await runBudgets[pid]?.update(limits: inherited.limits)
+    }
+  }
+
+  /// Replaces the operational settings of a running process. The provider or
+  /// tool call already in flight is allowed to finish; the next call observes
+  /// the new provider, model, tools, generation options, limits and policies.
+  /// The run's messages and session identity are deliberately left alone.
+  @discardableResult
+  public func reconfigure(_ process: AgentPID, with request: AgentRequest) async -> Bool {
+    guard let info = await supervisor.info(process), !info.state.isTerminal
+    else { return false }
+    if var current = liveRequests[process] {
+      current.applyRuntimeSettings(from: request)
+      liveRequests[process] = current
+      await runBudgets[process]?.update(limits: current.limits)
+      for pid in Array(derivedRuns.keys) {
+        guard let fallback = liveRequests[pid] else { continue }
+        let inherited = currentRequest(fallback, for: pid)
+        await runBudgets[pid]?.update(limits: inherited.limits)
+      }
+    } else {
+      pendingReconfigurations[process] = request
+    }
+    return true
   }
 
   /// Installs the ledger every provider call reports into: tokens from the
@@ -326,17 +378,78 @@ public actor AgentRuntime {
     }
   }
 
+  /// Returns the newest settings for one run. Derived workers are rebuilt
+  /// from their parent so a `/set`, `/model`, or `/tools` change propagates
+  /// through the active tree without flattening named agents' own profiles.
+  private func currentRequest(_ fallback: AgentRequest, for pid: AgentPID) -> AgentRequest {
+    var current = liveRequests[pid] ?? fallback
+    if let derived = derivedRuns[pid], let parentFallback = liveRequests[derived.parent] {
+      let parent = currentRequest(parentFallback, for: derived.parent)
+      let narrowedTools: Set<String>
+      if let wanted = derived.tools {
+        let allowed = parent.toolNames.intersection(wanted)
+        narrowedTools = allowed.isEmpty ? parent.toolNames : allowed
+      } else {
+        narrowedTools = parent.toolNames
+      }
+      let definition = derivedWorker(
+        for: parent,
+        toolNames: narrowedTools,
+        delegates: derived.delegates)
+      current.applyRuntimeSettings(from: definition)
+    }
+    liveRequests[pid] = current
+    return current
+  }
+
+  private func subagentLimit(for pid: AgentPID, fallback: AgentRequest) -> Int {
+    currentRequest(fallback, for: pid).limits.maxSubagents
+  }
+
+  private func queuedInterruption(
+    for pid: AgentPID, fallback: AgentRequest, budget: RunBudget
+  ) async -> AgentRunInterruption? {
+    let request = currentRequest(fallback, for: pid)
+    await budget.update(limits: request.limits)
+    return await budget.exhausted()
+  }
+
+  private func clearLiveRequest(for pid: AgentPID) {
+    liveRequests[pid] = nil
+    derivedRuns[pid] = nil
+    runBudgets[pid] = nil
+    pendingReconfigurations[pid] = nil
+  }
+
   private func runInternal(
-    _ request: AgentRequest,
+    _ initialRequest: AgentRequest,
     runID: UUID,
     pid: AgentPID,
     parentRunID: UUID?,
     depth: Int,
     budget: RunBudget,
+    derivedFrom: DerivedRun? = nil,
+    registeredAgent: Bool = false,
     emit: @escaping AgentEventHandler
   ) async throws -> AgentResult {
     try Task.checkCancellation()
-    guard let provider = providers[request.provider] else {
+    if liveRequests[pid] == nil {
+      var installed = initialRequest
+      if registeredAgent, let definition = agents[initialRequest.agentID] {
+        installed.applyRuntimeSettings(from: definition)
+      }
+      if let pending = pendingReconfigurations.removeValue(forKey: pid) {
+        installed.applyRuntimeSettings(from: pending)
+      }
+      liveRequests[pid] = installed
+    }
+    if let derivedFrom { derivedRuns[pid] = derivedFrom }
+    runBudgets[pid] = budget
+    defer {
+      clearLiveRequest(for: pid)
+    }
+    var request = currentRequest(initialRequest, for: pid)
+    guard let initialProvider = providers[request.provider] else {
       throw AgentRuntimeError.providerNotRegistered(request.provider)
     }
 
@@ -346,29 +459,6 @@ public actor AgentRuntime {
       agentID: request.agentID,
       depth: depth,
       pid: pid)
-    let concreteDefinitions = try visibleDefinitions(for: request, depth: depth)
-    let definitions =
-      request.useToolProxy && !concreteDefinitions.isEmpty
-      ? ToolProxy.definitions(for: concreteDefinitions, exposing: request.proxyExposedTools)
-      : concreteDefinitions
-    let supportsNativeTools = provider.descriptor.capabilities.contains(.nativeToolCalling)
-    if request.toolCallingStrategy == .native, !definitions.isEmpty, !supportsNativeTools {
-      throw AgentRuntimeError.nativeToolCallingUnavailable(request.provider)
-    }
-    let textToolMode: ToolCallingMode?
-    switch request.toolCallingStrategy {
-    case .automatic:
-      textToolMode = definitions.isEmpty || supportsNativeTools ? nil : .json
-    case .native:
-      textToolMode = nil
-    case .text:
-      textToolMode = definitions.isEmpty ? nil : .text
-    case .xml:
-      textToolMode = definitions.isEmpty ? nil : .xml
-    case .json:
-      textToolMode = definitions.isEmpty ? nil : .json
-    }
-    let usesTextToolProtocol = textToolMode != nil
     var transcript = request.messages
     var totalUsage: TokenUsage?
     /// What the provider counted on the last call, for the autocompact
@@ -410,11 +500,39 @@ public actor AgentRuntime {
       return result
     }
 
-    await emit(.started(context, provider.descriptor))
+    await emit(.started(context, initialProvider.descriptor))
     await supervisor.note(pid, state: .running, transcript: transcript)
     while true {
       try Task.checkCancellation()
       try await holdWhilePaused(pid)
+      request = currentRequest(request, for: pid)
+      await budget.update(limits: request.limits)
+      guard let provider = providers[request.provider] else {
+        throw AgentRuntimeError.providerNotRegistered(request.provider)
+      }
+      let concreteDefinitions = try visibleDefinitions(for: request, depth: depth)
+      let definitions =
+        request.useToolProxy && !concreteDefinitions.isEmpty
+        ? ToolProxy.definitions(for: concreteDefinitions, exposing: request.proxyExposedTools)
+        : concreteDefinitions
+      let supportsNativeTools = provider.descriptor.capabilities.contains(.nativeToolCalling)
+      if request.toolCallingStrategy == .native, !definitions.isEmpty, !supportsNativeTools {
+        throw AgentRuntimeError.nativeToolCallingUnavailable(request.provider)
+      }
+      let textToolMode: ToolCallingMode?
+      switch request.toolCallingStrategy {
+      case .automatic:
+        textToolMode = definitions.isEmpty || supportsNativeTools ? nil : .json
+      case .native:
+        textToolMode = nil
+      case .text:
+        textToolMode = definitions.isEmpty ? nil : .text
+      case .xml:
+        textToolMode = definitions.isEmpty ? nil : .xml
+      case .json:
+        textToolMode = definitions.isEmpty ? nil : .json
+      }
+      let usesTextToolProtocol = textToolMode != nil
       // Edits the agent asked for with the context tools land first, so the
       // next turn already runs on the smaller conversation. A compaction the
       // agent left for the runtime to write is summarized here, the way
@@ -443,7 +561,7 @@ public actor AgentRuntime {
               totalUsage: &totalUsage, emit: emit)
             resolved.append(.compact(messageIDs: selection, summary: text))
           } catch is RunDeadlineExceeded {
-            return await pause(budget.timeInterruption)
+            return await pause(await budget.timeInterruption)
           } catch is CancellationError {
             throw CancellationError()
           } catch {
@@ -508,7 +626,7 @@ public actor AgentRuntime {
             await emit(.transcriptEdited(context, applied.report))
             await supervisor.note(pid, transcript: transcript)
           } catch is RunDeadlineExceeded {
-            return await pause(budget.timeInterruption)
+            return await pause(await budget.timeInterruption)
           } catch is CancellationError {
             throw CancellationError()
           } catch {
@@ -577,7 +695,7 @@ public actor AgentRuntime {
       } catch is RunDeadlineExceeded {
         // Time ran out inside the call. The reply is lost, but the transcript
         // is whole, so the pause is as clean as one at the top of the loop.
-        return await pause(budget.timeInterruption)
+        return await pause(await budget.timeInterruption)
       } catch is ProviderEmptyResponseError where repairsEmptyReply {
         // A model that answers a tool result with nothing at all is told what
         // is expected of it, as after a malformed call; retrying the same
@@ -720,11 +838,19 @@ public actor AgentRuntime {
       // last of them is in.
       let modelTurn = localModelTurns
       var results = [ToolResult?](repeating: nil, count: calls.count)
+      var definitionsByCall = [[ToolDefinition]](repeating: [], count: calls.count)
       try await withThrowingTaskGroup(of: (Int, ToolResult).self) { group in
         for (index, call) in calls.enumerated() {
           try Task.checkCancellation()
           try await holdWhilePaused(pid)
-          if budget.deadlinePassed {
+          // A prior sequential tool may have taken minutes. Refresh again for
+          // every call so commands typed while it ran affect the next one.
+          request = currentRequest(request, for: pid)
+          await budget.update(limits: request.limits)
+          let callRequest = request
+          let callDefinitions = try visibleDefinitions(for: callRequest, depth: depth)
+          definitionsByCall[index] = callDefinitions
+          if await budget.deadlinePassed {
             // Out of time between two calls: the rest are answered rather
             // than run, so the transcript stays sendable and the pause at
             // the top of the loop is clean.
@@ -738,11 +864,11 @@ public actor AgentRuntime {
             results[index] = result
             continue
           }
-          guard localToolCalls < request.limits.maxToolCalls, await budget.claimToolCall() else {
+          guard localToolCalls < callRequest.limits.maxToolCalls, await budget.claimToolCall() else {
             let result = ToolResult(
               callID: call.id,
               text:
-                "Error: the tool call budget for this run (\(request.limits.maxToolCalls)) is exhausted; this call was not executed. Answer with the information already gathered.",
+                "Error: the tool call budget for this run (\(callRequest.limits.maxToolCalls)) is exhausted; this call was not executed. Answer with the information already gathered.",
               isError: true)
             await emit(.toolFinished(context, result))
             results[index] = result
@@ -770,7 +896,7 @@ public actor AgentRuntime {
             continue
           }
           repeatedCalls[key] = repeats + 1
-          if Self.runsConcurrently(call, in: concreteDefinitions) {
+          if Self.runsConcurrently(call, in: callDefinitions) {
             let gate = LaunchGate()
             group.addTask {
               defer { gate.open() }
@@ -778,8 +904,8 @@ public actor AgentRuntime {
                 index,
                 try await self.execute(
                   call,
-                  definitions: concreteDefinitions,
-                  request: request,
+                  definitions: callDefinitions,
+                  request: callRequest,
                   context: context,
                   modelTurn: modelTurn,
                   depth: depth,
@@ -794,8 +920,8 @@ public actor AgentRuntime {
           } else {
             results[index] = try await execute(
               call,
-              definitions: concreteDefinitions,
-              request: request,
+              definitions: callDefinitions,
+              request: callRequest,
               context: context,
               modelTurn: modelTurn,
               depth: depth,
@@ -814,7 +940,7 @@ public actor AgentRuntime {
         // A call that changed something makes repeating an earlier call
         // reasonable again — the tests run after each fix are the common
         // case — so every other call's identical-call count starts over.
-        if !result.isError, Self.changesState(call, in: concreteDefinitions) {
+        if !result.isError, Self.changesState(call, in: definitionsByCall[index]) {
           let own = ToolCallKey(call)
           repeatedCalls = repeatedCalls.filter { $0.key == own }
         }
@@ -898,7 +1024,7 @@ public actor AgentRuntime {
     while true {
       let timing = StreamTimingRecorder()
       do {
-        let response = try await withDeadline(budget.deadline) {
+        let response = try await withDeadline(budget) {
           try await provider.complete(providerRequest) { event in
             timing.note(event)
             await onEvent(event)
@@ -912,18 +1038,48 @@ public actor AgentRuntime {
       } catch is ProviderEmptyResponseError where !retriesEmptyReply {
         throw ProviderEmptyReply()
       } catch {
-        guard attempt < retry.attempts else { throw error }
+        let delayStarted = ContinuousClock.now
+        let policy = liveRequests[pid]?.retry ?? retry
+        guard attempt < policy.attempts else { throw error }
         attempt += 1
         await emit(
           .retrying(
-            context, attempt: attempt, limit: retry.attempts, delaySeconds: retry.delaySeconds,
+            context, attempt: attempt, limit: policy.attempts, delaySeconds: policy.delaySeconds,
             error: error.localizedDescription))
         await supervisor.note(pid, activity: "retrying")
-        if retry.delaySeconds > 0 {
-          try await Task.sleep(for: .seconds(retry.delaySeconds))
-        }
-        if budget.deadlinePassed { throw RunDeadlineExceeded() }
+        let updatedPolicy = try await waitForRetry(
+          attempt: attempt,
+          started: delayStarted,
+          process: pid,
+          fallback: policy,
+          budget: budget)
+        // Lowering retry.attempts while the delay is in progress cancels the
+        // pending retry at once instead of making the run wait and call again.
+        guard attempt <= updatedPolicy.attempts else { throw error }
       }
+    }
+  }
+
+  /// Waits under the live retry policy. Changing retry.delay may shorten,
+  /// lengthen or remove a delay already in progress, and lowering the attempt
+  /// count stops a pending retry without an artificial wait.
+  private func waitForRetry(
+    attempt: Int,
+    started: ContinuousClock.Instant,
+    process pid: AgentPID,
+    fallback: AgentRetryPolicy,
+    budget: RunBudget
+  ) async throws -> AgentRetryPolicy {
+    while true {
+      let policy = liveRequests[pid]?.retry ?? fallback
+      if attempt > policy.attempts { return policy }
+      if await budget.deadlinePassed { throw RunDeadlineExceeded() }
+      if policy.delaySeconds <= 0
+        || ContinuousClock.now >= started + .seconds(policy.delaySeconds)
+      {
+        return policy
+      }
+      try await Task.sleep(for: .milliseconds(50))
     }
   }
 
@@ -1029,18 +1185,20 @@ public actor AgentRuntime {
   /// runtime, which turns it into a paused result.
   private struct RunDeadlineExceeded: Error {}
 
-  /// Runs `body`, or throws `RunDeadlineExceeded` once `deadline` passes and
-  /// cancels the body. No deadline runs the body as it is.
+  /// Runs `body`, or throws once the run's live deadline passes. Reading the
+  /// budget while waiting means raising, lowering or disabling maxSeconds
+  /// also affects a provider call already in flight.
   private func withDeadline<T: Sendable>(
-    _ deadline: ContinuousClock.Instant?,
+    _ budget: RunBudget,
     _ body: @escaping @Sendable () async throws -> T
   ) async throws -> T {
-    guard let deadline else { return try await body() }
     return try await withThrowingTaskGroup(of: T.self) { group in
       group.addTask { try await body() }
       group.addTask {
-        try await Task.sleep(until: deadline, clock: .continuous)
-        throw RunDeadlineExceeded()
+        while true {
+          if await budget.deadlinePassed { throw RunDeadlineExceeded() }
+          try await Task.sleep(for: .milliseconds(50))
+        }
       }
       defer { group.cancelAll() }
       guard let first = try await group.next() else { throw RunDeadlineExceeded() }
@@ -1256,6 +1414,7 @@ public actor AgentRuntime {
     }
 
     let definition: AgentDefinition
+    let derived: DerivedRun?
     if let requestedAgent = start.agent {
       guard request.subagentNames.contains(requestedAgent), var named = agents[requestedAgent],
         named.isEnabled
@@ -1266,6 +1425,7 @@ public actor AgentRuntime {
       }
       named.toolNames = start.narrowed(named.toolNames)
       definition = named
+      derived = nil
     } else if Self.canDeriveWorker(for: request) {
       // A parent that narrowed the child's tools and left the agent family
       // out said what the child may use: that child is a leaf and pays for
@@ -1273,6 +1433,7 @@ public actor AgentRuntime {
       let delegates = start.tools.map { $0.contains(where: AgentProcessTools.isAgentTool) } ?? true
       definition = derivedWorker(
         for: request, toolNames: start.narrowed(request.toolNames), delegates: delegates)
+      derived = parent.pid.map { DerivedRun(parent: $0, tools: start.tools, delegates: delegates) }
     } else {
       return await fail(
         call,
@@ -1335,26 +1496,46 @@ public actor AgentRuntime {
     // one line, or dropped — is the host's call, not the runtime's. The child
     // runs in a task of its own, so `agent_stop` kills a blocking child the
     // same way it kills a background one.
+    var liveChildRequest = childRequest
+    if start.agent != nil, let currentDefinition = agents[definition.id] {
+      liveChildRequest.applyRuntimeSettings(from: currentDefinition)
+    }
+    liveRequests[childPID] = liveChildRequest
+    if let derived { derivedRuns[childPID] = derived }
+    runBudgets[childPID] = childBudget
     let task = Task {
-      try await AgentProcessTools.run(
-        childPID,
-        supervisor: supervisor,
-        limit: request.limits.maxSubagents,
-        admitted: admitted,
-        background: !start.wait,
-        queueDeadline: childBudget.deadline.map {
-          AgentProcessTools.QueueDeadline(instant: $0, interruption: childBudget.timeInterruption)
-        },
-        onAdmitted: { await emit(.childStarted(parent, child: childContext)) }
-      ) {
-        try await self.runInternal(
-          childRequest,
-          runID: childRunID,
-          pid: childPID,
-          parentRunID: parent.runID,
-          depth: childDepth,
-          budget: childBudget,
-          emit: emit)
+      do {
+        let result = try await AgentProcessTools.run(
+          childPID,
+          supervisor: supervisor,
+          dynamicLimit: {
+            guard let parentPID = parent.pid else { return request.limits.maxSubagents }
+            return await self.subagentLimit(for: parentPID, fallback: request)
+          },
+          admitted: admitted,
+          background: !start.wait,
+          queueInterruption: {
+            await self.queuedInterruption(
+              for: childPID, fallback: childRequest, budget: childBudget)
+          },
+          onAdmitted: { await emit(.childStarted(parent, child: childContext)) }
+        ) {
+          try await self.runInternal(
+            childRequest,
+            runID: childRunID,
+            pid: childPID,
+            parentRunID: parent.runID,
+            depth: childDepth,
+            budget: childBudget,
+            derivedFrom: derived,
+            registeredAgent: start.agent != nil,
+            emit: emit)
+        }
+        await self.clearLiveRequest(for: childPID)
+        return result
+      } catch {
+        await self.clearLiveRequest(for: childPID)
+        throw error
       }
     }
     await supervisor.attach(task, to: childPID)
@@ -1681,24 +1862,26 @@ public enum AgentRuntimeError: LocalizedError, Equatable, Sendable {
 /// instance from that child's definition. Concurrency of children is the
 /// supervisor's business, since background children outlive the run.
 private actor RunBudget {
-  private let limits: AgentRunLimits
+  private var limits: AgentRunLimits
   private var modelTurns = 0
   private var toolCalls = 0
   private var tokens = 0
-  /// When `limits.maxSeconds` runs out, fixed at the start of the run.
-  nonisolated let deadline: ContinuousClock.Instant?
+  private let startedAt = ContinuousClock.now
 
   init(limits: AgentRunLimits) {
     self.limits = limits
-    deadline = limits.maxSeconds.map { ContinuousClock.now + .seconds($0) }
   }
 
-  nonisolated var deadlinePassed: Bool {
-    deadline.map { ContinuousClock.now >= $0 } ?? false
+  var deadlinePassed: Bool {
+    limits.maxSeconds.map { ContinuousClock.now >= startedAt + .seconds($0) } ?? false
   }
 
-  nonisolated var timeInterruption: AgentRunInterruption {
+  var timeInterruption: AgentRunInterruption {
     .time(limitSeconds: limits.maxSeconds ?? 0)
+  }
+
+  func update(limits: AgentRunLimits) {
+    self.limits = limits
   }
 
   /// Nil once a turn is claimed; otherwise the limit that stops the run.
@@ -1730,6 +1913,51 @@ private actor RunBudget {
 
   func record(tokens newTokens: Int) {
     tokens += max(0, newTokens)
+  }
+}
+
+private extension AgentRequest {
+  /// Copies only values that may change while a run is in progress. The
+  /// transcript, queued-message exclusions, process identity and chat session
+  /// belong to the run itself and are never replaced by reconfiguration.
+  mutating func applyRuntimeSettings(from other: AgentRequest) {
+    provider = other.provider
+    model = other.model
+    toolNames = other.toolNames
+    toolGroupNames = other.toolGroupNames
+    subagentNames = other.subagentNames
+    toolChoice = other.toolChoice
+    responseFormat = other.responseFormat
+    options = other.options
+    limits = other.limits
+    stream = other.stream
+    toolCallingStrategy = other.toolCallingStrategy
+    useToolProxy = other.useToolProxy
+    proxyExposedTools = other.proxyExposedTools
+    toolDelegation = other.toolDelegation
+    retry = other.retry
+    autocompact = other.autocompact
+    context = other.context
+  }
+
+  mutating func applyRuntimeSettings(from definition: AgentDefinition) {
+    provider = definition.provider
+    model = definition.model
+    toolNames = definition.toolNames
+    toolGroupNames = definition.toolGroupNames
+    subagentNames = definition.subagentNames
+    toolChoice = definition.toolChoice
+    responseFormat = definition.responseFormat
+    options = definition.options
+    limits = definition.limits
+    stream = definition.stream
+    toolCallingStrategy = definition.toolCallingStrategy
+    useToolProxy = definition.useToolProxy
+    proxyExposedTools = definition.proxyExposedTools
+    toolDelegation = definition.toolDelegation
+    retry = definition.retry
+    autocompact = definition.autocompact
+    context = definition.context
   }
 }
 

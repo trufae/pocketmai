@@ -2924,3 +2924,247 @@ func enabledAgentGroupExplainsLimits() async throws {
   #expect(result.transcript.flatMap(\.toolResults).first?.text.contains("limits.maxSubagents is 0") == true)
   #expect(await runtime.supervisor.processes().count == 1)
 }
+
+@Test("Queued live settings update provider, model, effort, tools and raised limits")
+func queuedRunningAgentReconfiguresWithoutRestarting() async throws {
+  let oldProvider = LiveSettingsProvider(
+    id: "live-old",
+    responses: [ProviderResponse(
+      message: AgentMessage(role: .assistant, content: [
+        .toolCall(ToolCall(id: "old", name: "old-tool", arguments: .object([:])))
+      ]),
+      stopReason: .toolCall)],
+    blockedRequest: 1)
+  let newProvider = LiveSettingsProvider(
+    id: "live-new",
+    responses: [ProviderResponse(message: .assistant("new settings"), stopReason: .stop)])
+  let runtime = AgentRuntime()
+  try await runtime.register(oldProvider)
+  try await runtime.register(newProvider)
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "old-tool", description: "Old")) { _, _ in
+      ToolOutput(text: "must not run")
+    })
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "new-tool", description: "New")) { _, _ in
+      ToolOutput(text: "new")
+    })
+
+  let pid = await runtime.allocateProcess(agentID: "main")
+  let initial = AgentRequest(
+    provider: "live-old",
+    model: "old-model",
+    messages: [.user("work")],
+    toolNames: ["old-tool"],
+    limits: AgentRunLimits(maxModelTurns: 1))
+  let task = Task { try await runtime.run(initial, process: pid) }
+  #expect(await oldProvider.waitForRequests(1))
+
+  var updated = initial
+  updated.provider = "live-new"
+  updated.model = "new-model"
+  updated.toolNames = ["new-tool"]
+  updated.options.reasoningEffort = ReasoningEffort.low.rawValue
+  updated.limits.maxModelTurns = 3
+  #expect(await runtime.reconfigure(pid, with: updated))
+  await oldProvider.releaseBlockedRequest()
+
+  let result = try await task.value
+  #expect(result.response.text == "new settings")
+  #expect(
+    result.transcript.flatMap(\.toolResults).contains {
+      $0.text == "Error: tool 'old-tool' is not available to this agent."
+    })
+  let request = try #require(await newProvider.requests.first)
+  #expect(request.model == "new-model")
+  #expect(request.options.reasoningEffort == ReasoningEffort.low.rawValue)
+  #expect(request.tools.map(\.name) == ["new-tool"])
+}
+
+@Test("Queued retry delay adopts live settings without waiting for the old delay")
+func queuedRetryDelayReconfiguresWithoutRestarting() async throws {
+  let provider = LiveSettingsProvider(
+    id: "live-retry",
+    responses: [ProviderResponse(message: .assistant("retried"), stopReason: .stop)],
+    failures: 1)
+  let runtime = AgentRuntime()
+  try await runtime.register(provider)
+  let pid = await runtime.allocateProcess(agentID: "main")
+  let initial = AgentRequest(
+    provider: "live-retry",
+    model: "fixture",
+    messages: [.user("retry")],
+    retry: AgentRetryPolicy(attempts: 1, delaySeconds: 30))
+  let task = Task { try await runtime.run(initial, process: pid) }
+  let watchdog = Task {
+    try? await Task.sleep(for: .seconds(2))
+    task.cancel()
+  }
+  #expect(await provider.waitForRequests(1))
+
+  var updated = initial
+  updated.retry.delaySeconds = 0
+  #expect(await runtime.reconfigure(pid, with: updated))
+
+  let result = try await task.value
+  watchdog.cancel()
+  #expect(result.response.text == "retried")
+  #expect(await provider.requests.count == 2)
+}
+
+@Test("agentToolGroup derived workers adopt live parent settings without restarting")
+func agentToolGroupDerivedSubagentReconfiguresWithParent() async throws {
+  let provider = LiveTreeProvider()
+  let runtime = AgentRuntime(approvalHandler: AllowAllApprovals())
+  try await runtime.register(provider)
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "old-tool", description: "Old")) { _, _ in
+      ToolOutput(text: "must not run")
+    })
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "new-tool", description: "New")) { _, _ in
+      ToolOutput(text: "new")
+    })
+
+  let pid = await runtime.allocateProcess(agentID: "main")
+  let initial = AgentRequest(
+    provider: "live-tree",
+    model: "old-model",
+    messages: [.user("delegate")],
+    toolNames: AgentRuntime.agentToolNames.union(["old-tool"]),
+    toolGroupNames: [AgentRuntime.agentToolGroup.id],
+    toolDelegation: .subagent)
+  let task = Task { try await runtime.run(initial, process: pid) }
+  #expect(await provider.waitForFirstChildRequest())
+
+  var updated = initial
+  updated.model = "new-model"
+  updated.toolNames = AgentRuntime.agentToolNames.union(["new-tool"])
+  updated.options.reasoningEffort = ReasoningEffort.high.rawValue
+  #expect(await runtime.reconfigure(pid, with: updated))
+  await provider.releaseBlockedRequest()
+
+  let result = try await task.value
+  #expect(result.response.text == "parent done")
+  let childRequests = await provider.childRequests
+  let parentRequests = await provider.parentRequests
+  #expect(childRequests.count == 2)
+  #expect(parentRequests.count == 2)
+  let refreshedChild = try #require(childRequests.last)
+  let refreshedParent = try #require(parentRequests.last)
+  #expect(refreshedChild.model == "new-model")
+  #expect(refreshedChild.options.reasoningEffort == ReasoningEffort.high.rawValue)
+  #expect(Set(refreshedChild.tools.map(\.name)).contains("new-tool"))
+  #expect(!Set(refreshedChild.tools.map(\.name)).contains("old-tool"))
+  #expect(refreshedParent.model == "new-model")
+}
+
+private actor LiveTreeProvider: ChatProvider {
+  nonisolated let descriptor = ProviderDescriptor(
+    id: "live-tree",
+    displayName: "Live tree",
+    capabilities: [.streaming, .nativeToolCalling])
+  private var firstChildReleased = false
+  private(set) var childRequests: [ProviderRequest] = []
+  private(set) var parentRequests: [ProviderRequest] = []
+
+  func complete(
+    _ request: ProviderRequest,
+    emit: @escaping ProviderEventHandler
+  ) async throws -> ProviderResponse {
+    let isChild = request.messages.contains {
+      $0.role == .user && $0.text.contains("## Task") && $0.text.contains("inspect")
+    }
+    if isChild {
+      childRequests.append(request)
+      if childRequests.count == 1 {
+        while !firstChildReleased { try await Task.sleep(for: .milliseconds(5)) }
+        return ProviderResponse(
+          message: AgentMessage(role: .assistant, content: [
+            .toolCall(ToolCall(id: "old", name: "old-tool", arguments: .object([:])))
+          ]),
+          stopReason: .toolCall)
+      }
+      await emit(.textDelta("child done"))
+      return ProviderResponse(message: .assistant("child done"), stopReason: .stop)
+    }
+
+    parentRequests.append(request)
+    if parentRequests.count == 1 {
+      return ProviderResponse(
+        message: AgentMessage(role: .assistant, content: [
+          .toolCall(ToolCall(
+            id: "start", name: AgentRuntime.agentStartToolName,
+            arguments: .object([
+              "task": .string("inspect"),
+              "output": .string("a short summary"),
+            ]))),
+        ]),
+        stopReason: .toolCall)
+    }
+    await emit(.textDelta("parent done"))
+    return ProviderResponse(message: .assistant("parent done"), stopReason: .stop)
+  }
+
+  func waitForFirstChildRequest() async -> Bool {
+    for _ in 0..<1_000 {
+      if !childRequests.isEmpty { return true }
+      try? await Task.sleep(for: .milliseconds(5))
+    }
+    return false
+  }
+
+  func releaseBlockedRequest() {
+    firstChildReleased = true
+  }
+}
+
+private actor LiveSettingsProvider: ChatProvider {
+  nonisolated let descriptor: ProviderDescriptor
+  private var responses: [ProviderResponse]
+  private let blockedRequest: Int?
+  private var failures: Int
+  private var blockedRequestReleased = false
+  private(set) var requests: [ProviderRequest] = []
+
+  init(
+    id: ProviderID,
+    responses: [ProviderResponse],
+    blockedRequest: Int? = nil,
+    failures: Int = 0
+  ) {
+    descriptor = ProviderDescriptor(
+      id: id, displayName: id.rawValue, capabilities: [.streaming, .nativeToolCalling])
+    self.responses = responses
+    self.blockedRequest = blockedRequest
+    self.failures = failures
+  }
+
+  func complete(
+    _ request: ProviderRequest,
+    emit: @escaping ProviderEventHandler
+  ) async throws -> ProviderResponse {
+    requests.append(request)
+    if failures > 0 {
+      failures -= 1
+      throw TestError.missingResponse
+    }
+    if let blockedRequest, requests.count == blockedRequest {
+      while !blockedRequestReleased { try await Task.sleep(for: .milliseconds(5)) }
+    }
+    guard !responses.isEmpty else { throw TestError.missingResponse }
+    let response = responses.removeFirst()
+    if !response.message.text.isEmpty { await emit(.textDelta(response.message.text)) }
+    return response
+  }
+
+  func waitForRequests(_ count: Int) async -> Bool {
+    for _ in 0..<1_000 {
+      if requests.count >= count { return true }
+      try? await Task.sleep(for: .milliseconds(5))
+    }
+    return false
+  }
+
+  func releaseBlockedRequest() { blockedRequestReleased = true }
+}

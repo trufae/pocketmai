@@ -1583,15 +1583,13 @@ struct MaiCLI {
     let title: String
     let messages: [AgentMessage]
     let agent: AgentDefinition
-    let configuration: MaiConfiguration?
     let directory: String
 
-    init(session: REPLSession, configuration: MaiConfiguration?) {
+    init(session: REPLSession) {
       chatID = session.id
       title = session.title
       messages = session.history.messages
       agent = session.profile.agentDefinition
-      self.configuration = configuration
       directory = FileManager.default.currentDirectoryPath
     }
   }
@@ -2041,9 +2039,8 @@ struct MaiCLI {
     }
 
     /// After a command ran under a turn: says how what it changed meets the
-    /// run. A run keeps its chat when the prompt moves to another, edits to
-    /// its chat are kept when its reply is folded in, and settings reach the
-    /// next turn because the running request copied them when it started.
+    /// run. Chat edits are merged when its reply lands; operational settings
+    /// are pushed into the live request and observed at its next safe boundary.
     func noteTurnEffects(since before: REPLCommandSnapshot) async {
       guard let turn = loop.activeTurn else { return }
       if session.id != before.chatID {
@@ -2064,11 +2061,12 @@ struct MaiCLI {
       }
       if FileManager.default.currentDirectoryPath != before.directory {
         await terminal.note("A turn is running; its tools now work in the new directory.")
-      } else if session.profile.agentDefinition != before.agent
-        || configuration != before.configuration
+      }
+      if session.profile.agentDefinition != before.agent, turn.chatID == session.id,
+        await runtime.reconfigure(turn.pid, with: chatRequest())
       {
         await terminal.note(
-          "A turn is running; it keeps the settings it started with. This change reaches the next turn."
+          "Updated the running agent; the operation already in flight finishes, and the next model or tool call uses these settings."
         )
       }
     }
@@ -2144,6 +2142,9 @@ struct MaiCLI {
     /// the question keeps waiting.
     func answerApproval(_ text: String) async -> Bool {
       if let editing = loop.editingApproval {
+        // Settings and inspection remain available while an edit prompt is
+        // open; only an ordinary line is interpreted as replacement JSON.
+        if text.hasPrefix("/") { return false }
         loop.editingApproval = nil
         if let data = text.data(using: .utf8),
           let value = try? JSONDecoder().decode(JSONValue.self, from: data),
@@ -2184,6 +2185,26 @@ struct MaiCLI {
       }
       loop.approvals.removeFirst()
       return true
+    }
+
+    /// Turning YOLO on while calls already wait for approval releases them as
+    /// well as future calls. Otherwise the setting is live but the run still
+    /// appears blocked on decisions made under the old value.
+    func releasePendingApprovalsIfYOLO() async {
+      guard await visual.approvalHandler.isYOLOEnabled() else { return }
+      if let editing = loop.editingApproval {
+        editing.reply.resume(with: .approve(arguments: editing.request.call.arguments))
+        loop.editingApproval = nil
+      }
+      let pending = loop.approvals
+      loop.approvals.removeAll()
+      for approval in pending {
+        approval.reply.resume(with: .approve(arguments: approval.request.call.arguments))
+      }
+      if !pending.isEmpty {
+        await terminal.note(
+          "approved \(pending.count) waiting tool call\(pending.count == 1 ? "" : "s"); YOLO mode is on")
+      }
     }
 
     func handleFocus(_ argument: String) async {
@@ -2356,7 +2377,7 @@ struct MaiCLI {
             continue
           }
           if name == "/prompts" {
-            let before = REPLCommandSnapshot(session: session, configuration: configuration)
+            let before = REPLCommandSnapshot(session: session)
             var outcome = PromptsCommandOutcome.handled
             await withTurnInterruptSetAside {
               outcome = await handlePromptsCommand(
@@ -2445,7 +2466,7 @@ struct MaiCLI {
           #endif
           // Every other command runs now. What it changes and the running
           // turn meet as noteTurnEffects describes, with a note, not a wait.
-          let before = REPLCommandSnapshot(session: session, configuration: configuration)
+          let before = REPLCommandSnapshot(session: session)
           if name == "/project" {
             await handleProjectCommand(
               argument,
@@ -2553,6 +2574,7 @@ struct MaiCLI {
             loop.exiting = true
             break events
           }
+          await releasePendingApprovalsIfYOLO()
           #if PMAI_HAS_VISUAL
             if text == "/visual", let snapshot = session.visualSnapshot {
               workspace = chatWorkspace(from: snapshot, focusedID: session.id, previous: workspace)
@@ -2719,8 +2741,12 @@ struct MaiCLI {
         await releaseIfIdle(workspace: workspace)
 
       case .approval(let request, let reply):
-        loop.approvals.append((request, reply))
-        await terminal.approvalRequest(request)
+        if await visual.approvalHandler.isYOLOEnabled() {
+          reply.resume(with: .approve(arguments: request.call.arguments))
+        } else {
+          loop.approvals.append((request, reply))
+          await terminal.approvalRequest(request)
+        }
         await refreshStatus()
 
       case .supervisor(let change):
