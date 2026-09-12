@@ -2,14 +2,21 @@ import Foundation
 
 /// Presentation only. It never changes generation options or stored reasoning.
 public enum ThinkingDisplay: String, Codable, CaseIterable, Identifiable, Sendable {
-  case status, line, three, full
+  case status, line, three, five, full
   public var id: String { rawValue }
-  public var lineCount: Int { self == .three ? 3 : 1 }
+  public var lineCount: Int {
+    switch self {
+    case .three: 3
+    case .five: 5
+    default: 1
+    }
+  }
   public var displayName: String {
     switch self {
     case .status: "Thinking…"
     case .line: "One scrolling line"
     case .three: "Three scrolling lines"
+    case .five: "Five scrolling lines"
     case .full: "Full text"
     }
   }

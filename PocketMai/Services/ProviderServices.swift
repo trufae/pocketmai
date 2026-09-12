@@ -537,6 +537,7 @@ enum PromptComposer {
     endpoint: OpenAIEndpoint,
     excludingMessageID: UUID? = nil,
     nativeContinuationMessages: [AgentMessage] = [],
+    hasTools: Bool = false,
     toolPrompt: String = "",
     toolPromptInContext: Bool = false,
     messageLimitOverride: Int? = nil
@@ -554,7 +555,7 @@ enum PromptComposer {
       limit: effectiveLimit,
       excludingMessageID: excludingMessageID)
     let echoReasoningContent = ReasoningEffort.requiresReasoningHistory(
-      model: model, provider: endpoint.name, baseURL: endpoint.baseURL)
+      model: model, provider: endpoint.name, baseURL: endpoint.baseURL, hasTools: hasTools)
     let includeImageAttachments = ProviderVisionSupport.openAICompatibleSupportsVision(
       model: model, endpoint: endpoint)
     let latestUserMessageID = limited.last(where: { $0.role == .user })?.id
@@ -1276,6 +1277,7 @@ enum OpenAICompatibleProvider {
       request.conversation.modelID.isEmpty ? endpoint.defaultModel : request.conversation.modelID
 
     func send(includeStreamUsage: Bool) async throws -> String {
+      let coreTools = request.nativeTools ?? []
       let messages = PromptComposer.openAIMessages(
         conversation: request.conversation,
         settings: request.settings,
@@ -1285,11 +1287,11 @@ enum OpenAICompatibleProvider {
         excludingMessageID: request.nativeContinuationMessages.isEmpty
           ? nil : request.assistantMessageID,
         nativeContinuationMessages: request.nativeContinuationMessages,
+        hasTools: !coreTools.isEmpty,
         toolPrompt: request.nativeTools == nil ? request.toolPrompt : "",
         toolPromptInContext: request.toolPromptInContext,
         messageLimitOverride: request.messageLimitOverride
       )
-      let coreTools = request.nativeTools ?? []
       let coreOptions = MaiCore.GenerationOptions(
         reasoningEffort: request.conversation.reasoningLevel.optionValue,
         includeStreamUsage: includeStreamUsage)

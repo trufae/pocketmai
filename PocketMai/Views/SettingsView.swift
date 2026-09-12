@@ -326,7 +326,7 @@ private struct SettingsLazyDisclosureGroup<Label: View, Content: View>: View {
 
 struct SettingsView: View {
   let store: AppStore
-  @AppStorage("thinkingDisplay") private var thinkingDisplay: ThinkingDisplay = .full
+  @AppStorage("thinkingDisplay") private var thinkingDisplay: ThinkingDisplay = .five
   @ObservedObject var storeObservation: AppStoreViewObservation
   @Environment(\.dismiss) private var dismiss
   @State private var showingToolFileImporter = false

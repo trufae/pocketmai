@@ -156,10 +156,18 @@ private actor EffortScriptedProvider: ChatProvider {
 @Test("Off is distinct from automatic and uses each provider's supported controls")
 func effortOffAndAuto() throws {
   for family: ReasoningEffort.APIFamily in [
-    .openAI, .openRouter, .deepSeek, .qwen, .ollama, .generic,
+    .openAI, .openRouter, .deepSeek, .qwen, .ollama, .kimi, .kimiLocal, .minimax, .gemma,
+    .gemini, .generic,
   ] {
     #expect(ReasoningEffort.automatic.requestFields(family: family, model: "qwen3").isEmpty)
   }
+  #expect(
+    ReasoningEffort.automatic.requestFields(family: .deepSeek, model: "deepseek-flash") == [
+      "thinking": .object(["type": .string("disabled")])
+    ])
+  #expect(
+    ReasoningEffort.automatic.requestFields(family: .deepSeek, model: "deepseek-v4-pro")
+      .isEmpty)
   #expect(ReasoningEffort(name: "off") == .disabled)
   #expect(
     ReasoningEffort.disabled.requestFields(family: .qwen, model: "qwen3") == [
@@ -176,6 +184,14 @@ func effortOffAndAuto() throws {
   #expect(
     ReasoningEffort.max.requestFields(family: .deepSeek, model: "deepseek-flash")[
       "reasoning_effort"] == .string("max"))
+  #expect(
+    ReasoningEffort.low.requestFields(family: .deepSeek, model: "deepseek-flash")[
+      "reasoning_effort"] == .string("low"))
+  for effort in [ReasoningEffort.medium, .high, .xhigh] {
+    #expect(
+      effort.requestFields(family: .deepSeek, model: "deepseek-flash")["reasoning_effort"]
+        == .string("high"))
+  }
   for model in ["gpt-5.1", "gpt-5.2", "gpt-5.4"] {
     #expect(
       ReasoningEffort.disabled.requestFields(family: .openAI, model: model)["reasoning_effort"]
@@ -192,6 +208,7 @@ func effortOffAndAuto() throws {
       == .string("low"))
   #expect(ReasoningEffort.disabled.limitation(model: "gpt-oss") != nil)
   #expect(ReasoningEffort.disabled.limitation(model: "qwen3") == nil)
+  #expect(ReasoningEffort.automatic.limitation(model: "deepseek-flash") != nil)
   let options = GenerationOptions(reasoningEffort: "off")
   let messages = ReasoningEffort.messages(
     [.system("Be useful."), .user("Hi")], options: options, model: "qwen3")
@@ -210,6 +227,64 @@ func effortOffAndAuto() throws {
   #expect(
     body.objectValue?["messages"]?.arrayValue?.last?.objectValue?["content"]?.stringValue?
       .hasSuffix("/no_think") == true)
+}
+
+@Test("DeepSeek Flash is non-thinking by default and explicit fields still win")
+func deepSeekFlashAutomaticRequest() throws {
+  let provider = OpenAICompatibleProvider(
+    configuration: .init(baseURL: URL(string: "https://api.deepseek.com/v1")!))
+
+  func body(options: GenerationOptions = .init()) throws -> [String: JSONValue] {
+    let request = try provider.makeURLRequest(
+      ProviderRequest(
+        model: "deepseek-flash", messages: [.user("Hi")], options: options, stream: false),
+      model: "deepseek-flash")
+    return try #require(
+      JSONDecoder().decode(JSONValue.self, from: try #require(request.httpBody)).objectValue)
+  }
+
+  #expect(try body()["thinking"] == .object(["type": .string("disabled")]))
+  let low = try body(options: GenerationOptions(reasoningEffort: "low"))
+  #expect(low["thinking"] == .object(["type": .string("enabled")]))
+  #expect(low["reasoning_effort"] == .string("low"))
+  #expect(
+    try body(options: GenerationOptions(additional: [
+      "thinking": .object(["type": .string("enabled")])
+    ]))["thinking"] == .object(["type": .string("enabled")]))
+  let customEffort = try body(options: GenerationOptions(additional: [
+    "reasoning_effort": .string("low")
+  ]))
+  #expect(customEffort["thinking"] == nil)
+  #expect(customEffort["reasoning_effort"] == .string("low"))
+}
+
+@Test("DeepSeek reasoning history is sent only with tools")
+func deepSeekReasoningHistoryFollowsTools() throws {
+  let provider = OpenAICompatibleProvider(
+    configuration: .init(baseURL: URL(string: "https://api.deepseek.com/v1")!))
+  let message = AgentMessage(
+    role: .assistant,
+    content: [.reasoning("old thought"), .text("answer")])
+
+  func sentMessage(tools: [ToolDefinition]) throws -> [String: JSONValue] {
+    let request = try provider.makeURLRequest(
+      ProviderRequest(
+        model: "deepseek-flash", messages: [message], tools: tools, stream: false),
+      model: "deepseek-flash")
+    let body = try JSONDecoder().decode(JSONValue.self, from: try #require(request.httpBody))
+    return try #require(body.objectValue?["messages"]?.arrayValue?.first?.objectValue)
+  }
+
+  #expect(try sentMessage(tools: [])["reasoning_content"] == nil)
+  #expect(
+    try sentMessage(tools: [ToolDefinition(name: "echo", description: "Echo")])[
+      "reasoning_content"] == .string("old thought"))
+  #expect(
+    !ReasoningEffort.requiresReasoningHistory(
+      model: "deepseek-flash", baseURL: "https://api.deepseek.com/v1", hasTools: false))
+  #expect(
+    ReasoningEffort.requiresReasoningHistory(
+      model: "deepseek-flash", baseURL: "https://api.deepseek.com/v1", hasTools: true))
 }
 
 @Test("Thinking presentation survives old configurations and leaves generation independent")

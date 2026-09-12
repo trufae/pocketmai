@@ -241,8 +241,7 @@ private struct StreamingMessageBubble: View {
 }
 
 private struct MessageBubbleContent: View, Equatable {
-  @AppStorage("thinkingDisplay") private var thinkingDisplay: ThinkingDisplay = .full
-  @State private var thinkingWidth: CGFloat = 280
+  @AppStorage("thinkingDisplay") private var thinkingDisplay: ThinkingDisplay = .five
   let message: ChatMessage
   let messageRenderKey: ChatMessageRenderKey
   var streamingOverride: String? = nil
@@ -337,50 +336,25 @@ private struct MessageBubbleContent: View, Equatable {
             onDelete: toolDeleteAction(
               for: entry, section: section, partID: partID, in: prepared))
         case .reasoning(_, let section):
-          if isStreaming && index == prepared.parts.count - 1
-            && thinkingDisplay != .full && showThinking
-          {
-            VStack(alignment: .leading, spacing: 2) {
-              if thinkingDisplay == .status {
-                Text("Thinking…").italic().foregroundStyle(.secondary)
-              } else {
-                let lines = ThinkingPreview.lines(
-                  section.content, count: thinkingDisplay.lineCount,
-                  width: max(
-                    1,
-                    Int(
-                      thinkingWidth
-                        / (UIFont.preferredFont(forTextStyle: .caption1).pointSize * 0.65))))
-                ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
-                  Text(line).font(.system(.caption, design: .monospaced)).italic().foregroundStyle(
-                    .secondary
-                  )
-                  .opacity(Double(index + 1) / Double(lines.count))
-                  .lineLimit(1)
-                }
-              }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .onGeometryChange(for: CGFloat.self) {
-              $0.size.width
-            } action: {
-              thinkingWidth = $0
-            }
-          } else {
-            FoldableMetaSection(
-              title: "Reasoning",
-              systemImage: "brain",
-              content: section.content,
-              monospaced: false,
-              dimmedContent: true,
-              initiallyExpanded: showThinking && thinkingDisplay == .full,
-              italicContent: true,
-              markdownAppearance: canRenderMarkdown ? appearance : nil,
-              renderImages: renderImages,
-              onDelete: hiddenSectionDeleteAction(
-                for: section, partID: part.id, in: prepared)
-            )
-          }
+          let compactDisplay = isStreaming && thinkingDisplay == .full ? .five : thinkingDisplay
+          FoldableMetaSection(
+            title: "Reasoning",
+            systemImage: "brain",
+            content: section.content,
+            monospaced: false,
+            detail: Self.reasoningSize(section.content),
+            collapsedStatus: showThinking && compactDisplay == .status && isStreaming
+              ? "Thinking…" : nil,
+            collapsedPreviewLines: showThinking && compactDisplay != .status
+              && compactDisplay != .full ? compactDisplay.lineCount : 0,
+            dimmedContent: true,
+            initiallyExpanded: showThinking && thinkingDisplay == .full && !isStreaming,
+            italicContent: true,
+            markdownAppearance: canRenderMarkdown ? appearance : nil,
+            renderImages: renderImages,
+            onDelete: hiddenSectionDeleteAction(
+              for: section, partID: part.id, in: prepared)
+          )
         case .transcript(_, let section):
           FoldableMetaSection(
             title: "Prompt Transcript",
@@ -414,6 +388,12 @@ private struct MessageBubbleContent: View, Equatable {
     .frame(maxWidth: 720, alignment: .leading)
     .padding(.leading, isUser ? 36 : 0)
     .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+  }
+
+  private static func reasoningSize(_ content: String) -> String {
+    let characters = content.count
+    let tokens = GenerationStats.estimatedTokenCount(forCharacterCount: characters)
+    return "\(ModelUsageFormat.tokens(tokens, estimated: true)) · \(ModelUsageFormat.count(characters)) chars"
   }
 
   @ViewBuilder
@@ -2624,6 +2604,9 @@ private struct FoldableMetaSection: View {
   let systemImage: String
   let content: String
   var monospaced: Bool
+  var detail: String? = nil
+  var collapsedStatus: String? = nil
+  var collapsedPreviewLines: Int = 0
   var dimmedContent: Bool = false
   var initiallyExpanded: Bool = false
   var italicContent: Bool = false
@@ -2632,12 +2615,16 @@ private struct FoldableMetaSection: View {
   var onDelete: (() -> Void)? = nil
 
   @State private var expanded: Bool = false
+  @State private var previewWidth: CGFloat = 280
 
   init(
     title: String,
     systemImage: String,
     content: String,
     monospaced: Bool,
+    detail: String? = nil,
+    collapsedStatus: String? = nil,
+    collapsedPreviewLines: Int = 0,
     dimmedContent: Bool = false,
     initiallyExpanded: Bool = false,
     italicContent: Bool = false,
@@ -2649,6 +2636,9 @@ private struct FoldableMetaSection: View {
     self.systemImage = systemImage
     self.content = content
     self.monospaced = monospaced
+    self.detail = detail
+    self.collapsedStatus = collapsedStatus
+    self.collapsedPreviewLines = max(0, collapsedPreviewLines)
     self.dimmedContent = dimmedContent
     self.initiallyExpanded = initiallyExpanded
     self.italicContent = italicContent
@@ -2671,6 +2661,13 @@ private struct FoldableMetaSection: View {
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
           Spacer(minLength: 8)
+          if let detail {
+            Text(detail)
+              .font(.caption2.monospacedDigit())
+              .foregroundStyle(.tertiary)
+              .lineLimit(1)
+              .minimumScaleFactor(0.75)
+          }
           Image(systemName: expanded ? "chevron.down" : "chevron.right")
             .imageScale(.small)
             .foregroundStyle(.tertiary)
@@ -2681,7 +2678,42 @@ private struct FoldableMetaSection: View {
         .contentShape(Rectangle())
       }
       .buttonStyle(.plain)
-      if expanded {
+      if !expanded, let collapsedStatus {
+        Divider().opacity(0.4)
+        Text(collapsedStatus)
+          .font(.caption.italic())
+          .foregroundStyle(.secondary)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.horizontal, 12)
+          .padding(.vertical, 8)
+      } else if !expanded, collapsedPreviewLines > 0 {
+        Divider().opacity(0.4)
+        let lines = ThinkingPreview.lines(
+          content, count: collapsedPreviewLines,
+          width: max(
+            1,
+            Int(
+              previewWidth
+                / (UIFont.preferredFont(forTextStyle: .caption1).pointSize * 0.65))))
+        VStack(alignment: .leading, spacing: 2) {
+          ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
+            Text(line)
+              .font(.system(.caption, design: .monospaced))
+              .italic()
+              .foregroundStyle(.secondary)
+              .opacity(Double(index + 1) / Double(lines.count))
+              .lineLimit(1)
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .onGeometryChange(for: CGFloat.self) {
+          $0.size.width
+        } action: {
+          previewWidth = $0
+        }
+      } else if expanded {
         Divider().opacity(0.4)
         Group {
           if let markdownAppearance, MarkdownParser.mayContainMarkdown(content) {

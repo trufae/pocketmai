@@ -1333,6 +1333,7 @@ enum AssistantToolLoop {
         nativeContinuationMessages: state.nativeContinuation(
           conversation: conversation,
           requestState: requestState),
+        hasTools: requestState.nativeTools?.isEmpty == false,
         toolPrompt: tailToolPrompt,
         toolPromptInContext: requestState.usesTextProtocol && !requestState.toolPrompt.isEmpty
       ).map(debugPromptMessage)
