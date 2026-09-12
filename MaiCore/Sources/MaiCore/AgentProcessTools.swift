@@ -348,9 +348,35 @@ public enum AgentProcessTools {
     onAdmitted: @escaping @Sendable () async -> Void = {},
     body: @escaping @Sendable () async throws -> AgentResult
   ) async throws -> AgentResult {
+    try await run(
+      pid,
+      supervisor: supervisor,
+      dynamicLimit: { limit },
+      admitted: admitted,
+      background: background,
+      queueDeadline: queueDeadline,
+      onAdmitted: onAdmitted,
+      body: body)
+  }
+
+  /// Runtime variant whose limit may change while a child is queued. Keeping
+  /// this beside the fixed public API avoids polling stale `/set` state.
+  static func run(
+    _ pid: AgentPID,
+    supervisor: AgentSupervisor,
+    dynamicLimit: @escaping @Sendable () async -> Int,
+    admitted: Bool,
+    background: Bool,
+    queueDeadline: QueueDeadline? = nil,
+    queueInterruption: (@Sendable () async -> AgentRunInterruption?)? = nil,
+    onAdmitted: @escaping @Sendable () async -> Void = {},
+    body: @escaping @Sendable () async throws -> AgentResult
+  ) async throws -> AgentResult {
     do {
       if !admitted {
-        try await awaitSlot(pid, supervisor: supervisor, limit: limit, deadline: queueDeadline)
+        try await awaitSlot(
+          pid, supervisor: supervisor, limit: dynamicLimit, deadline: queueDeadline,
+          interruption: queueInterruption)
         await onAdmitted()
       }
       let child = try await body()
@@ -429,10 +455,14 @@ public enum AgentProcessTools {
   private static func awaitSlot(
     _ pid: AgentPID,
     supervisor: AgentSupervisor,
-    limit: Int,
-    deadline: QueueDeadline?
+    limit: @escaping @Sendable () async -> Int,
+    deadline: QueueDeadline?,
+    interruption: (@Sendable () async -> AgentRunInterruption?)?
   ) async throws {
-    while !(await supervisor.admit(pid, limit: limit)) {
+    while !(await supervisor.admit(pid, limit: await limit())) {
+      if let interruption, let reason = await interruption() {
+        throw QueueDeadlineExceeded(message: "\(reason.summary) while queued")
+      }
       if let deadline, ContinuousClock.now >= deadline.instant {
         throw QueueDeadlineExceeded(message: "\(deadline.interruption.summary) while queued")
       }

@@ -2924,3 +2924,159 @@ func enabledAgentGroupExplainsLimits() async throws {
   #expect(result.transcript.flatMap(\.toolResults).first?.text.contains("limits.maxSubagents is 0") == true)
   #expect(await runtime.supervisor.processes().count == 1)
 }
+
+@Test("Queued live settings update provider, model, effort, tools and raised limits")
+func queuedRunningAgentReconfiguresWithoutRestarting() async throws {
+  let oldProvider = LiveSettingsProvider(
+    id: "live-old",
+    responses: [ProviderResponse(
+      message: AgentMessage(role: .assistant, content: [
+        .toolCall(ToolCall(id: "old", name: "old-tool", arguments: .object([:])))
+      ]),
+      stopReason: .toolCall)],
+    blockedRequest: 1)
+  let newProvider = LiveSettingsProvider(
+    id: "live-new",
+    responses: [ProviderResponse(message: .assistant("new settings"), stopReason: .stop)])
+  let runtime = AgentRuntime()
+  try await runtime.register(oldProvider)
+  try await runtime.register(newProvider)
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "old-tool", description: "Old")) { _, _ in
+      ToolOutput(text: "must not run")
+    })
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "new-tool", description: "New")) { _, _ in
+      ToolOutput(text: "new")
+    })
+
+  let pid = await runtime.allocateProcess(agentID: "main")
+  let initial = AgentRequest(
+    provider: "live-old",
+    model: "old-model",
+    messages: [.user("work")],
+    toolNames: ["old-tool"],
+    limits: AgentRunLimits(maxModelTurns: 1))
+  let task = Task { try await runtime.run(initial, process: pid) }
+  #expect(await oldProvider.waitForRequests(1))
+
+  var updated = initial
+  updated.provider = "live-new"
+  updated.model = "new-model"
+  updated.toolNames = ["new-tool"]
+  updated.options.reasoningEffort = ReasoningEffort.low.rawValue
+  updated.limits.maxModelTurns = 3
+  #expect(await runtime.reconfigure(pid, with: updated))
+  await oldProvider.releaseBlockedRequest()
+
+  let result = try await task.value
+  #expect(result.response.text == "new settings")
+  #expect(
+    result.transcript.flatMap(\.toolResults).contains {
+      $0.text == "Error: tool 'old-tool' is not available to this agent."
+    })
+  let request = try #require(await newProvider.requests.first)
+  #expect(request.model == "new-model")
+  #expect(request.options.reasoningEffort == ReasoningEffort.low.rawValue)
+  #expect(request.tools.map(\.name) == ["new-tool"])
+}
+
+@Test("agentToolGroup derived workers adopt live parent settings without restarting")
+func agentToolGroupDerivedSubagentReconfiguresWithParent() async throws {
+  let provider = LiveSettingsProvider(
+    id: "live-tree",
+    responses: [
+      ProviderResponse(
+        message: AgentMessage(role: .assistant, content: [
+          .toolCall(ToolCall(
+            id: "start", name: AgentRuntime.agentStartToolName,
+            arguments: .object(["task": .string("inspect")]))),
+        ]),
+        stopReason: .toolCall),
+      ProviderResponse(
+        message: AgentMessage(role: .assistant, content: [
+          .toolCall(ToolCall(id: "old", name: "old-tool", arguments: .object([:])))
+        ]),
+        stopReason: .toolCall),
+      ProviderResponse(message: .assistant("child done"), stopReason: .stop),
+      ProviderResponse(message: .assistant("parent done"), stopReason: .stop),
+    ],
+    blockedRequest: 2)
+  let runtime = AgentRuntime(approvalHandler: AllowAllApprovals())
+  try await runtime.register(provider)
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "old-tool", description: "Old")) { _, _ in
+      ToolOutput(text: "must not run")
+    })
+  try await runtime.register(
+    tool: ClosureTool(definition: ToolDefinition(name: "new-tool", description: "New")) { _, _ in
+      ToolOutput(text: "new")
+    })
+
+  let pid = await runtime.allocateProcess(agentID: "main")
+  let initial = AgentRequest(
+    provider: "live-tree",
+    model: "old-model",
+    messages: [.user("delegate")],
+    toolNames: AgentRuntime.agentToolNames.union(["old-tool"]),
+    toolGroupNames: [AgentRuntime.agentToolGroup.id],
+    toolDelegation: .subagent)
+  let task = Task { try await runtime.run(initial, process: pid) }
+  #expect(await provider.waitForRequests(2))
+
+  var updated = initial
+  updated.model = "new-model"
+  updated.toolNames = AgentRuntime.agentToolNames.union(["new-tool"])
+  updated.options.reasoningEffort = ReasoningEffort.high.rawValue
+  #expect(await runtime.reconfigure(pid, with: updated))
+  await provider.releaseBlockedRequest()
+
+  let result = try await task.value
+  #expect(result.response.text == "parent done")
+  let requests = await provider.requests
+  #expect(requests.count == 4)
+  #expect(requests[2].model == "new-model")
+  #expect(requests[2].options.reasoningEffort == ReasoningEffort.high.rawValue)
+  #expect(Set(requests[2].tools.map(\.name)).contains("new-tool"))
+  #expect(!Set(requests[2].tools.map(\.name)).contains("old-tool"))
+  #expect(requests[3].model == "new-model")
+}
+
+private actor LiveSettingsProvider: ChatProvider {
+  nonisolated let descriptor: ProviderDescriptor
+  private var responses: [ProviderResponse]
+  private let blockedRequest: Int?
+  private var blockedRequestReleased = false
+  private(set) var requests: [ProviderRequest] = []
+
+  init(id: ProviderID, responses: [ProviderResponse], blockedRequest: Int? = nil) {
+    descriptor = ProviderDescriptor(
+      id: id, displayName: id.rawValue, capabilities: [.streaming, .nativeToolCalling])
+    self.responses = responses
+    self.blockedRequest = blockedRequest
+  }
+
+  func complete(
+    _ request: ProviderRequest,
+    emit: @escaping ProviderEventHandler
+  ) async throws -> ProviderResponse {
+    requests.append(request)
+    if let blockedRequest, requests.count == blockedRequest {
+      while !blockedRequestReleased { try await Task.sleep(for: .milliseconds(5)) }
+    }
+    guard !responses.isEmpty else { throw TestError.missingResponse }
+    let response = responses.removeFirst()
+    if !response.message.text.isEmpty { await emit(.textDelta(response.message.text)) }
+    return response
+  }
+
+  func waitForRequests(_ count: Int) async -> Bool {
+    for _ in 0..<1_000 {
+      if requests.count >= count { return true }
+      try? await Task.sleep(for: .milliseconds(5))
+    }
+    return false
+  }
+
+  func releaseBlockedRequest() { blockedRequestReleased = true }
+}
